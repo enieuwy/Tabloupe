@@ -2,6 +2,8 @@ export default {
   ignoreFiles: [
     "AGENTS.md",
     "build.sh",
+    "deploy.sh",
+    ".env",
     "tests",
     "tests/**",
     "web-ext-artifacts",

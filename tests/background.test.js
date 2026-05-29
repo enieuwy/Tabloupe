@@ -54,6 +54,7 @@ function createHarness({ storage = {}, groups = [], tabs = [] } = {}) {
   const startupListeners = [];
   const clickedListeners = [];
   const buttonClickedListeners = [];
+  const messageListeners = [];
   const sockets = [];
 
   const browser = {
@@ -104,6 +105,7 @@ function createHarness({ storage = {}, groups = [], tabs = [] } = {}) {
     runtime: {
       onInstalled: { addListener: (listener) => installedListeners.push(listener) },
       onStartup: { addListener: (listener) => startupListeners.push(listener) },
+      onMessage: { addListener: (listener) => messageListeners.push(listener) },
       openOptionsPage: () => openedOptions.push(true),
     },
     notifications: {
@@ -183,7 +185,16 @@ function createHarness({ storage = {}, groups = [], tabs = [] } = {}) {
     startupListeners,
     clickedListeners,
     buttonClickedListeners,
+    messageListeners,
     sockets,
+    async sendMessage(message) {
+      for (const listener of messageListeners) {
+        const result = listener(message);
+        if (result && typeof result.then === "function") {
+          await result;
+        }
+      }
+    },
   };
 }
 
@@ -276,4 +287,27 @@ test("changing the active raw Focus mapping reapplies despite same raw ID dedupe
     assert.deepEqual(harness.storageData.expandedGroups, ["Other"]);
     assert.deepEqual(harness.storageData.collapsedGroups, ["Work"]);
   });
+});
+
+test("apply-current-focus message force-reapplies last seen Focus", async () => {
+  const fixture = twoGroups();
+  const harness = createHarness(fixture);
+  await settle();
+
+  // First apply Work focus via WebSocket message
+  await harness.context.handleMessage({ data: JSON.stringify({ focus: "com.apple.focus.work" }) });
+  assert.equal(harness.storageData.lastAction, "applied");
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
+
+  // Manually uncollapse Other to simulate user action
+  harness.groupState.find((group) => group.title === "Other").collapsed = false;
+
+  // Send apply-current-focus message — should force-reapply Work and collapse Other again
+  await harness.sendMessage({ type: "apply-current-focus" });
+  await settle();
+
+  assert.equal(harness.storageData.lastAction, "applied");
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
 });

@@ -210,6 +210,41 @@ label span {
   margin: 0;
 }
 
+.callout {
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+}
+
+.callout-warning {
+  background: #fff8e0;
+  border: 1px solid #e6c200;
+  color: #5c4b00;
+}
+
+.callout strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 1rem;
+}
+
+.callout p {
+  color: inherit;
+  margin-bottom: 12px;
+  font-size: 0.9rem;
+}
+
+.callout button {
+  background: #e6c200;
+  color: #3d3200;
+  font-size: 0.85rem;
+  padding: 6px 14px;
+}
+
+.callout button:hover {
+  background: #d4b200;
+}
+
 .visually-hidden {
   clip: rect(0 0 0 0);
   clip-path: inset(50%);
@@ -259,6 +294,25 @@ label span {
 
   button.secondary:hover {
     background: #5b5b66;
+  }
+
+  .callout-warning {
+    background: #3d3200;
+    border-color: #8a7300;
+    color: #ffe066;
+  }
+
+  .callout p {
+    color: #e6d27a;
+  }
+
+  .callout button {
+    background: #8a7300;
+    color: #fff8e0;
+  }
+
+  .callout button:hover {
+    background: #a38800;
   }
 }
 

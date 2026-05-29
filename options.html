@@ -17,6 +17,12 @@
       <a href="about:addons">Open add-on logs</a>
     </header>
 
+    <div id="unmapped-callout" class="callout callout-warning" hidden>
+      <strong>Unmapped Focus detected</strong>
+      <p>The Focus ID <code id="callout-focus-id"></code> has no tab group mapping. Add one below or click “Map it now” to pre-fill the form.</p>
+      <button id="callout-map-btn" type="button">Map it now</button>
+    </div>
+
     <form id="mappings-form">
       <section class="card">
         <div class="section-heading">
@@ -69,6 +75,7 @@
       <div class="section-heading">
         <h2>Diagnostics</h2>
         <p>Read-only state from the background script.</p>
+        <button id="apply-now" type="button" class="secondary">Apply current Focus now</button>
       </div>
       <dl>
         <div>

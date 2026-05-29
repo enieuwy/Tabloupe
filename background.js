@@ -130,6 +130,16 @@ function start() {
 browser.runtime.onInstalled.addListener(start);
 browser.runtime.onStartup.addListener(start);
 
+browser.runtime.onMessage.addListener((message) => {
+  if (message && message.type === "apply-current-focus") {
+    return browser.storage.local.get("lastFocusSeen").then((stored) => {
+      const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
+      return applyRawFocus(rawId, { force: true });
+    });
+  }
+  return false;
+});
+
 browser.notifications.onClicked.addListener((notificationId) => {
   if (notificationId.startsWith(OPTIONS_NOTIFICATION_PREFIX)) {
     browser.runtime.openOptionsPage();
