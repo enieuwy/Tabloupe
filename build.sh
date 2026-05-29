@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # Automatically bumps version, loads API keys, and signs the Firefox extension.
 
 # 1. Load secrets from .env
