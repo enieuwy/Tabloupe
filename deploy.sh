@@ -249,17 +249,16 @@ verify_session() {
 
   local recovery_file="$SESSION_DIR/recovery.jsonlz4"
 
-  if [[ ! -f "$recovery_file" ]]; then
-    warn "  ⚠ recovery.jsonlz4 not yet written — waiting 5 more seconds…"
-    sleep 5
-  fi
-
-  if [[ ! -f "$recovery_file" ]]; then
-    warn "  ⚠ recovery.jsonlz4 still not found — cannot verify session"
-    POST_WINDOWS=0
-    POST_TABS=0
-    return
-  fi
+  local elapsed=0
+  while [[ ! -f "$recovery_file" ]]; do
+    if (( elapsed >= 15 )); then
+      warn "  ⚠ recovery.jsonlz4 still not found — cannot verify session"
+      warn "    Session backup: $SNAPSHOT_DIR"
+      exit 1
+    fi
+    sleep 1
+    (( elapsed++ ))
+  done
 
   local counts
   counts="$(count_session_tabs "$recovery_file")"
