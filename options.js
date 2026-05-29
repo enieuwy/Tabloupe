@@ -195,10 +195,11 @@ function renderMappings() {
     if (state.lastFocusSeen === id) {
       badges.append(makeBadge("currently active", "active"));
     }
-    if (hasMapping && !hasSeen) {
+    if (hasMapping && draftMappings[id] === "") {
+      badges.append(makeBadge("ignored", ""));
+    } else if (hasMapping && !hasSeen) {
       badges.append(makeBadge("not yet seen", "warning"));
-    }
-    if (!hasMapping && hasSeen) {
+    } else if (!hasMapping && hasSeen) {
       badges.append(makeBadge("unmapped", "warning"));
     }
     if (badges.childElementCount > 0) {
@@ -209,7 +210,7 @@ function renderMappings() {
     input.type = "text";
     input.setAttribute("list", "firefox-groups");
     input.autocomplete = "off";
-    input.placeholder = "Firefox tab group title";
+    input.placeholder = "Tab group title (empty = ignore)";
     input.value = hasMapping ? draftMappings[id] : "";
     input.addEventListener("input", () => {
       draftMappings[id] = input.value;
@@ -298,10 +299,8 @@ function buildMappingsForSave() {
   const output = {};
   for (const [id, title] of Object.entries(draftMappings)) {
     const normalizedId = id.trim();
-    const normalizedTitle = typeof title === "string" ? title.trim() : "";
-    if (normalizedId && normalizedTitle) {
-      output[normalizedId] = normalizedTitle;
-    }
+    if (!normalizedId) continue;
+    output[normalizedId] = typeof title === "string" ? title.trim() : "";
   }
   return output;
 }

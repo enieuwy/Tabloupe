@@ -5,7 +5,13 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROFILES_INI="$HOME/Library/Application Support/Firefox/profiles.ini"
-PROFILE_REL_PATH=$(awk -F '=' '/^\[Profile/ {in_prof=1} /^\[/ && !/^\[Profile/ {in_prof=0} in_prof && /^Path=/ {path=$2} in_prof && /^Default=1/ {print path; exit}' "$PROFILES_INI" 2>/dev/null || true)
+# Extract from Install block first
+PROFILE_REL_PATH=$(awk -F '=' '/^\[Install/ {in_install=1} /^\[/ && !/^\[Install/ {in_install=0} in_install && /^Default=/ {print $2; exit}' "$PROFILES_INI" 2>/dev/null || true)
+if [[ -z "$PROFILE_REL_PATH" ]]; then
+  # Fallback to legacy Default=1
+  PROFILE_REL_PATH=$(awk -F '=' '/^\[Profile/ {in_prof=1} /^\[/ && !/^\[Profile/ {in_prof=0} in_prof && /^Path=/ {path=$2} in_prof && /^Default=1/ {print path; exit}' "$PROFILES_INI" 2>/dev/null || true)
+fi
+
 if [[ -n "$PROFILE_REL_PATH" ]]; then
   PROFILE_DIR="$HOME/Library/Application Support/Firefox/$PROFILE_REL_PATH"
 else
@@ -218,82 +224,7 @@ install_xpi() {
   success "  ✓ Installed to $dest"
 }
 
-# ─── Step 5: Restart Firefox ───────────────────────────────────────────────────
-
-restart_firefox() {
-  header "Restart Firefox"
-
-  # Graceful quit
-  if pgrep -ix "firefox" &>/dev/null || pgrep -ix "firefox-bin" &>/dev/null; then
-    info "  Quitting ${FIREFOX_APP} gracefully…"
-    osascript -e "tell application \"${FIREFOX_APP}\" to quit" 2>/dev/null || true
-
-    local elapsed=0
-    while pgrep -ix "firefox" &>/dev/null || pgrep -ix "firefox-bin" &>/dev/null; do
-      if (( elapsed >= FIREFOX_QUIT_TIMEOUT )); then
-        die "${FIREFOX_APP} did not exit within ${FIREFOX_QUIT_TIMEOUT}s — aborting (session backup: $SNAPSHOT_DIR)"
-      fi
-      sleep 1
-      (( elapsed++ ))
-    done
-    success "  ✓ ${FIREFOX_APP} exited after ${elapsed}s"
-  else
-    info "  ${FIREFOX_APP} is not running"
-  fi
-
-  # Brief pause for file handles to flush
-  sleep 2
-
-  # Relaunch
-  info "  Launching ${FIREFOX_APP}…"
-  open -a "${FIREFOX_APP}"
-  sleep "$FIREFOX_START_WAIT"
-  success "  ✓ ${FIREFOX_APP} started"
-}
-
-# ─── Step 6: Verify session ────────────────────────────────────────────────────
-
-POST_WINDOWS=0
-POST_TABS=0
-
-verify_session() {
-  header "Verify session"
-
-  local recovery_file="$SESSION_DIR/recovery.jsonlz4"
-
-  local elapsed=0
-  while [[ ! -f "$recovery_file" ]]; do
-    if (( elapsed >= 15 )); then
-      warn "  ⚠ recovery.jsonlz4 still not found — cannot verify session"
-      warn "    Session backup: $SNAPSHOT_DIR"
-      exit 1
-    fi
-    sleep 1
-    (( elapsed++ ))
-  done
-
-  local counts
-  counts="$(count_session_tabs "$recovery_file")"
-  POST_WINDOWS="$(echo "$counts" | awk '{print $1}')"
-  POST_TABS="$(echo "$counts" | awk '{print $2}')"
-
-  info "  Post-restart: ${POST_WINDOWS} window(s), ${POST_TABS} tab(s)"
-
-  local threshold=$(( PRE_TABS - 2 ))
-  if (( PRE_TABS > 0 && POST_TABS < threshold )); then
-    echo ""
-    warn "  ⚠ WARNING: Tab count dropped significantly!"
-    warn "    Before: $PRE_TABS tabs  →  After: $POST_TABS tabs"
-    warn "    Session backup: $SNAPSHOT_DIR"
-    warn "    Restore manually by copying files back to:"
-    warn "      $SESSION_DIR"
-    exit 1
-  fi
-
-  success "  ✓ Session looks healthy"
-}
-
-# ─── Step 7: Summary ───────────────────────────────────────────────────────────
+# ─── Step 5: Summary (dry-run only) ────────────────────────────────────────────
 
 print_summary() {
   header "Deploy summary"
@@ -302,15 +233,10 @@ print_summary() {
   echo -e "  ${BOLD}Version:${NC}        ${NEW_VERSION}"
   echo -e "  ${BOLD}XPI:${NC}            ${XPI_PATH}"
   echo -e "  ${BOLD}Session backup:${NC} ${SNAPSHOT_DIR}"
-  echo -e "  ${BOLD}Tabs before:${NC}    ${PRE_TABS}"
-  echo -e "  ${BOLD}Tabs after:${NC}     ${POST_TABS}"
+  echo -e "  ${BOLD}Tabs snapshot:${NC}  ${PRE_WINDOWS} window(s), ${PRE_TABS} tab(s)"
   echo ""
 
-  if $DRY_RUN; then
-    success "  ✅ Dry run complete — no changes deployed"
-  else
-    success "  ✅ Deploy complete"
-  fi
+  success "  ✅ Dry run complete — no changes deployed"
 }
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
@@ -320,7 +246,7 @@ main() {
   echo -e "${BLUE}$(date)${NC}"
 
   if $DRY_RUN; then
-    info "Mode: --dry-run (checks + build only, no install/restart)"
+    info "Mode: --dry-run (checks + build only, no install)"
   fi
   if $SKIP_BUILD; then
     info "Mode: --skip-build (using latest existing XPI)"
@@ -336,11 +262,23 @@ main() {
     exit 0
   fi
 
-  # Full deploy
+  # Install but do NOT restart Firefox
   install_xpi
-  restart_firefox
-  verify_session
-  print_summary
+
+  header "Next steps"
+  echo ""
+  echo -e "  ${BOLD}Version:${NC}        ${NEW_VERSION}"
+  echo -e "  ${BOLD}XPI:${NC}            ${XPI_PATH}"
+  echo -e "  ${BOLD}Session backup:${NC} ${SNAPSHOT_DIR}"
+  echo -e "  ${BOLD}Tabs snapshot:${NC}  ${PRE_WINDOWS} window(s), ${PRE_TABS} tab(s)"
+  echo ""
+  echo -e "  ${YELLOW}To activate the new version:${NC}"
+  echo -e "    1. Open ${BOLD}about:addons${NC} in Firefox"
+  echo -e "    2. Click ⚙️ → ${BOLD}Install Add-on From File...${NC}"
+  echo -e "    3. Select: ${BOLD}${XPI_PATH}${NC}"
+  echo -e "    4. Firefox will replace the old version automatically"
+  echo ""
+  success "  ✅ Build and install complete — activate manually in Firefox"
 }
 
 main

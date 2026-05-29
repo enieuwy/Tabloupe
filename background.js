@@ -39,9 +39,13 @@ function clearReconnectTimer() {
 
 function scheduleReconnect() {
   clearReconnectTimer();
+  const delay = reconnectDelay;
   reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_MS);
-  browser.alarms.create("reconnect", { delayInMinutes: reconnectDelay / 60000 });
-  reconnectTimer = setTimeout(connect, reconnectDelay);
+  // setTimeout is the primary mechanism; the alarm is a fallback in case
+  // Firefox suspends this background page's JS timers (unlikely with
+  // persistent:true, but defensive for future event-page migration).
+  browser.alarms.create("reconnect", { delayInMinutes: delay / 60000 });
+  reconnectTimer = setTimeout(connect, delay);
 }
 
 async function recordSeen(rawId) {

@@ -142,7 +142,11 @@ function createHarness({ storage = {}, groups = [], tabs = [] } = {}) {
     },
     tabs: {
       async query(query) {
-        return clone(tabState.filter((tab) => tab.groupId === query.groupId));
+        return clone(tabState.filter((tab) => {
+          if (query.groupId !== undefined && tab.groupId !== query.groupId) return false;
+          // windowId filtering is a no-op in tests (all tabs share the same implicit window)
+          return true;
+        }));
       },
       async update(id, patch) {
         const tab = tabState.find((candidate) => candidate.id === id);
