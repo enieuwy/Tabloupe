@@ -269,10 +269,29 @@ function renderDiagnostics() {
   document.getElementById("diag-action-details").textContent = details.length > 0 ? details.join("; ") : "—";
 }
 
+function renderCallout() {
+  const callout = document.getElementById("unmapped-callout");
+  const codeEl = document.getElementById("callout-focus-id");
+
+  const showCallout =
+    state.lastAction === "unmapped_focus_id" &&
+    typeof state.unmappedFocusId === "string" &&
+    state.unmappedFocusId.length > 0 &&
+    !hasOwn(draftMappings, state.unmappedFocusId);
+
+  if (showCallout) {
+    codeEl.textContent = state.unmappedFocusId;
+    callout.hidden = false;
+  } else {
+    callout.hidden = true;
+  }
+}
+
 function render() {
   renderDatalist();
   renderMappings();
   renderDiagnostics();
+  renderCallout();
 }
 
 function buildMappingsForSave() {
@@ -374,6 +393,26 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   document.getElementById("discard").addEventListener("click", discardChanges);
   document.getElementById("add-mapping").addEventListener("click", addCustomMapping);
+
+  document.getElementById("apply-now").addEventListener("click", () => {
+    browser.runtime.sendMessage({ type: "apply-current-focus" })
+      .then(() => setStatus("Reapplied current Focus", "ok"))
+      .catch((error) => {
+        console.error("Apply current Focus failed:", error);
+        setStatus("Apply failed. See extension console.", "error");
+      });
+  });
+
+  document.getElementById("callout-map-btn").addEventListener("click", () => {
+    const rawId = state.unmappedFocusId;
+    if (!rawId) return;
+    const idInput = document.getElementById("new-focus-id");
+    const titleInput = document.getElementById("new-group-title");
+    idInput.value = rawId;
+    titleInput.value = "";
+    titleInput.focus();
+    idInput.scrollIntoView({ behavior: "smooth", block: "center" });
+  });
 
   browser.storage.onChanged.addListener((changes, areaName) => {
     if (areaName === "local") {
