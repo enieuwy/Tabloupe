@@ -58,6 +58,16 @@ function createHarness({ storage = {}, groups = [], tabs = [] } = {}) {
   const sockets = [];
 
   const browser = {
+    alarms: {
+      create: () => {},
+      clear: () => {},
+      onAlarm: {
+        addListener: () => {}
+      }
+    },
+    windows: {
+      WINDOW_ID_CURRENT: -2
+    },
     storage: {
       local: {
         async get(keys) {

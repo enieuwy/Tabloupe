@@ -4,13 +4,21 @@ set -euo pipefail
 # ─── Configuration ──────────────────────────────────────────────────────────────
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROFILE_DIR="$HOME/Library/Application Support/Firefox/Profiles/2t2po2ct.default-release"
+PROFILES_INI="$HOME/Library/Application Support/Firefox/profiles.ini"
+PROFILE_REL_PATH=$(awk -F '=' '/^\[Profile/ {in_prof=1} /^\[/ && !/^\[Profile/ {in_prof=0} in_prof && /^Path=/ {path=$2} in_prof && /^Default=1/ {print path; exit}' "$PROFILES_INI" 2>/dev/null || true)
+if [[ -n "$PROFILE_REL_PATH" ]]; then
+  PROFILE_DIR="$HOME/Library/Application Support/Firefox/$PROFILE_REL_PATH"
+else
+  PROFILE_DIR="$HOME/Library/Application Support/Firefox/Profiles/2t2po2ct.default-release"
+fi
+
 EXTENSION_FILENAME="focus-tab-groups@local.xpi"
 EXTENSIONS_DIR="$PROFILE_DIR/extensions"
 SESSION_DIR="$PROFILE_DIR/sessionstore-backups"
 BACKUP_ROOT="/tmp/focus_tab_groups_firefox_session_backup"
 VENV_DIR="/tmp/focus_restore_lz4"
 XPI_DIR="$REPO_DIR/web-ext-artifacts"
+FIREFOX_APP="${FIREFOX_APP:-Firefox}"
 
 FIREFOX_QUIT_TIMEOUT=15  # seconds to wait for Firefox to exit
 FIREFOX_START_WAIT=5     # seconds to wait after launching Firefox
@@ -101,10 +109,12 @@ preflight_checks() {
 
   # Python venv with lz4
   if [[ ! -x "$VENV_DIR/bin/python3" ]]; then
-    die "Python venv not found at $VENV_DIR (need lz4 package)"
+    info "  Creating Python venv for lz4 at $VENV_DIR..."
+    python3 -m venv "$VENV_DIR"
   fi
   if ! "$VENV_DIR/bin/python3" -c "import lz4.block" 2>/dev/null; then
-    die "lz4 package not installed in $VENV_DIR"
+    info "  Installing lz4 in venv..."
+    "$VENV_DIR/bin/python3" -m pip install lz4 --quiet
   fi
   success "  ✓ lz4 venv ready"
 
@@ -214,31 +224,31 @@ restart_firefox() {
   header "Restart Firefox"
 
   # Graceful quit
-  if pgrep -x firefox &>/dev/null; then
-    info "  Quitting Firefox gracefully…"
-    osascript -e 'tell application "Firefox" to quit' 2>/dev/null || true
+  if pgrep -ix "firefox" &>/dev/null || pgrep -ix "firefox-bin" &>/dev/null; then
+    info "  Quitting ${FIREFOX_APP} gracefully…"
+    osascript -e "tell application \"${FIREFOX_APP}\" to quit" 2>/dev/null || true
 
     local elapsed=0
-    while pgrep -x firefox &>/dev/null; do
+    while pgrep -ix "firefox" &>/dev/null || pgrep -ix "firefox-bin" &>/dev/null; do
       if (( elapsed >= FIREFOX_QUIT_TIMEOUT )); then
-        die "Firefox did not exit within ${FIREFOX_QUIT_TIMEOUT}s — aborting (session backup: $SNAPSHOT_DIR)"
+        die "${FIREFOX_APP} did not exit within ${FIREFOX_QUIT_TIMEOUT}s — aborting (session backup: $SNAPSHOT_DIR)"
       fi
       sleep 1
       (( elapsed++ ))
     done
-    success "  ✓ Firefox exited after ${elapsed}s"
+    success "  ✓ ${FIREFOX_APP} exited after ${elapsed}s"
   else
-    info "  Firefox is not running"
+    info "  ${FIREFOX_APP} is not running"
   fi
 
   # Brief pause for file handles to flush
   sleep 2
 
   # Relaunch
-  info "  Launching Firefox…"
-  open -a Firefox
+  info "  Launching ${FIREFOX_APP}…"
+  open -a "${FIREFOX_APP}"
   sleep "$FIREFOX_START_WAIT"
-  success "  ✓ Firefox started"
+  success "  ✓ ${FIREFOX_APP} started"
 }
 
 # ─── Step 6: Verify session ────────────────────────────────────────────────────

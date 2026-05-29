@@ -1,5 +1,6 @@
 const WS_URL = "ws://127.0.0.1:8767";
-const RECONNECT_MS = 3000;
+const MIN_RECONNECT_MS = 1000;
+const MAX_RECONNECT_MS = 30000;
 const OPTIONS_NOTIFICATION_PREFIX = "focus-unmapped-";
 
 const DEFAULT_FOCUS_MAPPINGS = Object.freeze({
@@ -13,6 +14,7 @@ const DEFAULT_FOCUS_MAPPINGS = Object.freeze({
 
 let lastDispatchedRawId;
 let socket = null;
+let reconnectDelay = MIN_RECONNECT_MS;
 let reconnectTimer = null;
 let messageQueue = Promise.resolve();
 
@@ -32,11 +34,14 @@ function clearReconnectTimer() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  browser.alarms.clear("reconnect");
 }
 
 function scheduleReconnect() {
   clearReconnectTimer();
-  reconnectTimer = setTimeout(connect, RECONNECT_MS);
+  reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_MS);
+  browser.alarms.create("reconnect", { delayInMinutes: reconnectDelay / 60000 });
+  reconnectTimer = setTimeout(connect, reconnectDelay);
 }
 
 async function recordSeen(rawId) {
@@ -66,6 +71,7 @@ function mappedFocus(rawId, focusMappings) {
   }
 
   const mappedTitle = focusMappings[rawId];
+  if (mappedTitle === "") return ""; // Explicitly ignored
   return typeof mappedTitle === "string" && mappedTitle.length > 0 ? mappedTitle : null;
 }
 
@@ -73,12 +79,12 @@ async function applyRawFocus(rawId, { force = false } = {}) {
   if (!force && rawId === lastDispatchedRawId) {
     return;
   }
+  lastDispatchedRawId = rawId;
 
   const stored = await browser.storage.local.get("focusMappings");
   const focusMappings = isRecord(stored.focusMappings) ? stored.focusMappings : {};
   const focusName = mappedFocus(rawId, focusMappings);
 
-  lastDispatchedRawId = rawId;
   await applyFocus(focusName, { rawId });
 }
 
@@ -99,7 +105,10 @@ async function connect() {
   const ws = new WebSocket(WS_URL);
   socket = ws;
 
-  ws.onopen = () => clearReconnectTimer();
+  ws.onopen = () => {
+    reconnectDelay = MIN_RECONNECT_MS;
+    clearReconnectTimer();
+  };
   ws.onmessage = (event) => {
     messageQueue = messageQueue
       .then(() => handleMessage(event))
@@ -111,8 +120,8 @@ async function connect() {
   ws.onclose = () => {
     if (socket === ws) {
       socket = null;
+      scheduleReconnect();
     }
-    scheduleReconnect();
   };
   ws.onerror = () => ws.close();
 }
@@ -127,8 +136,9 @@ function start() {
     });
 }
 
-browser.runtime.onInstalled.addListener(start);
-browser.runtime.onStartup.addListener(start);
+// Initialization is handled by invoking start() at script evaluation.
+// Do not bind to onInstalled/onStartup to prevent duplicate execution
+// since this is a persistent background page.
 
 browser.runtime.onMessage.addListener((message) => {
   if (message && message.type === "apply-current-focus") {
@@ -213,6 +223,12 @@ async function applyFocus(focusName, { rawId }) {
     `${group.title} (${group.collapsed ? "collapsed" : "expanded"})`
   ).join("\n");
 
+  if (focusName === "") {
+    await updateBadge("", null);
+    await browser.storage.local.set({ lastAction: "ignored" });
+    return;
+  }
+
   if (focusName === null && rawId === null) {
     await updateBadge("", null);
     for (const group of allGroups) {
@@ -279,12 +295,24 @@ async function applyFocus(focusName, { rawId }) {
   // Activate a tab inside the target group BEFORE collapsing others.
   let activated = false;
   for (const group of matching) {
-    const tabs = await browser.tabs.query({ groupId: group.id });
+    const tabs = await browser.tabs.query({ groupId: group.id, windowId: browser.windows.WINDOW_ID_CURRENT });
     if (tabs.length > 0) {
-      const target = tabs.find((tab) => !tab.active) || tabs[0];
+      const target = tabs.find((tab) => tab.active) || tabs[0];
       await browser.tabs.update(target.id, { active: true });
       activated = true;
       break;
+    }
+  }
+
+  if (!activated) {
+    for (const group of matching) {
+      const tabs = await browser.tabs.query({ groupId: group.id });
+      if (tabs.length > 0) {
+        const target = tabs.find((tab) => tab.active) || tabs[0];
+        await browser.tabs.update(target.id, { active: true });
+        activated = true;
+        break;
+      }
     }
   }
 
@@ -301,19 +329,18 @@ async function applyFocus(focusName, { rawId }) {
     return;
   }
 
-  // Expand matching groups.
-  for (const group of matching) {
-    if (group.collapsed) {
-      await browser.tabGroups.update(group.id, { collapsed: false });
-    }
-  }
-
-  // Collapse all others.
-  for (const group of others) {
-    if (!group.collapsed) {
-      await browser.tabGroups.update(group.id, { collapsed: true });
-    }
-  }
+  await Promise.all([
+    ...matching.map(async (group) => {
+      if (group.collapsed) {
+        await browser.tabGroups.update(group.id, { collapsed: false });
+      }
+    }),
+    ...others.map(async (group) => {
+      if (!group.collapsed) {
+        await browser.tabGroups.update(group.id, { collapsed: true });
+      }
+    })
+  ]);
 
   await updateBadge(focusName.substring(0, 1).toUpperCase(), "#00C853"); // Green
 
@@ -333,6 +360,10 @@ async function applyFocus(focusName, { rawId }) {
   });
 }
 
-// ── Start ──────────────────────────────────────────────────
+browser.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "reconnect") {
+    connect();
+  }
+});
 
 start();
