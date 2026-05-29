@@ -1,6 +1,7 @@
 const WS_URL = "ws://127.0.0.1:8767";
 const MIN_RECONNECT_MS = 1000;
 const MAX_RECONNECT_MS = 30000;
+const MIN_RECONNECT_ALARM_MINUTES = 1;
 const OPTIONS_NOTIFICATION_PREFIX = "focus-unmapped-";
 
 const DEFAULT_FOCUS_MAPPINGS = Object.freeze({
@@ -20,6 +21,16 @@ let messageQueue = Promise.resolve();
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function enqueueFocusWork(task) {
+  const queued = messageQueue.then(task, task);
+  messageQueue = queued.catch(() => {});
+  return queued;
 }
 
 async function ensureDefaultMappings() {
@@ -42,9 +53,11 @@ function scheduleReconnect() {
   const delay = reconnectDelay;
   reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_MS);
   // setTimeout is the primary mechanism; the alarm is a fallback in case
-  // Firefox suspends this background page's JS timers (unlikely with
-  // persistent:true, but defensive for future event-page migration).
-  browser.alarms.create("reconnect", { delayInMinutes: delay / 60000 });
+  // Firefox suspends the background page. Firefox alarms are minute-granular,
+  // so keep the timer fast and only use the alarm as a conservative wake-up.
+  browser.alarms.create("reconnect", {
+    delayInMinutes: Math.max(delay / 60000, MIN_RECONNECT_ALARM_MINUTES),
+  });
   reconnectTimer = setTimeout(connect, delay);
 }
 
@@ -74,6 +87,10 @@ function mappedFocus(rawId, focusMappings) {
     return null;
   }
 
+  if (!hasOwn(focusMappings, rawId)) {
+    return null;
+  }
+
   const mappedTitle = focusMappings[rawId];
   if (mappedTitle === "") return ""; // Explicitly ignored
   return typeof mappedTitle === "string" && mappedTitle.length > 0 ? mappedTitle : null;
@@ -83,13 +100,15 @@ async function applyRawFocus(rawId, { force = false } = {}) {
   if (!force && rawId === lastDispatchedRawId) {
     return;
   }
-  lastDispatchedRawId = rawId;
 
   const stored = await browser.storage.local.get("focusMappings");
   const focusMappings = isRecord(stored.focusMappings) ? stored.focusMappings : {};
   const focusName = mappedFocus(rawId, focusMappings);
 
-  await applyFocus(focusName, { rawId });
+  const applied = await applyFocus(focusName, { rawId });
+  if (applied !== false) {
+    lastDispatchedRawId = rawId;
+  }
 }
 
 async function handleMessage(event) {
@@ -114,11 +133,9 @@ async function connect() {
     clearReconnectTimer();
   };
   ws.onmessage = (event) => {
-    messageQueue = messageQueue
-      .then(() => handleMessage(event))
-      .catch((error) => {
-        console.error("Focus message error:", error);
-      });
+    enqueueFocusWork(() => handleMessage(event)).catch((error) => {
+      console.error("Focus message error:", error);
+    });
   };
 
   ws.onclose = () => {
@@ -146,10 +163,12 @@ function start() {
 
 browser.runtime.onMessage.addListener((message) => {
   if (message && message.type === "apply-current-focus") {
-    return browser.storage.local.get("lastFocusSeen").then((stored) => {
-      const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
-      return applyRawFocus(rawId, { force: true });
-    });
+    return enqueueFocusWork(() =>
+      browser.storage.local.get("lastFocusSeen").then((stored) => {
+        const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
+        return applyRawFocus(rawId, { force: true });
+      })
+    );
   }
   return false;
 });
@@ -175,8 +194,8 @@ browser.storage.onChanged.addListener((changes, areaName) => {
     return;
   }
 
-  browser.storage.local.get("lastFocusSeen")
-    .then((stored) => {
+  enqueueFocusWork(() =>
+    browser.storage.local.get("lastFocusSeen").then((stored) => {
       const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
       lastDispatchedRawId = undefined;
       if (rawId !== null) {
@@ -184,9 +203,9 @@ browser.storage.onChanged.addListener((changes, areaName) => {
       }
       return undefined;
     })
-    .catch((error) => {
-      console.error("Focus mapping refresh error:", error);
-    });
+  ).catch((error) => {
+    console.error("Focus mapping refresh error:", error);
+  });
 });
 
 // ── Tab group logic ────────────────────────────────────────
@@ -216,10 +235,66 @@ async function notify(options, notificationId) {
   }
 }
 
+const CLEAR_ACTION_DIAGNOSTICS = Object.freeze({
+  unmappedFocusId: null,
+  missingGroup: null,
+  emptyGroup: null,
+  expandedGroups: [],
+  collapsedGroups: [],
+  updateFailures: [],
+});
+
+function groupLabel(group) {
+  const title = typeof group.title === "string" && group.title.length > 0 ? group.title : `#${group.id}`;
+  return typeof group.windowId === "number" ? `${title} (window ${group.windowId})` : title;
+}
+
+async function setGroupCollapsed(group, collapsed) {
+  if (group.collapsed === collapsed) {
+    return null;
+  }
+
+  try {
+    await browser.tabGroups.update(group.id, { collapsed });
+    group.collapsed = collapsed;
+    return null;
+  } catch (error) {
+    console.error("Tab group update error:", group.id, group.title, error);
+    return groupLabel(group);
+  }
+}
+
+async function setGroupsCollapsed(groups, collapsed) {
+  const failures = await Promise.all(groups.map((group) => setGroupCollapsed(group, collapsed)));
+  return failures.filter((failure) => failure !== null);
+}
+
+async function activateMatchingGroups(groups) {
+  let activated = false;
+  const failures = [];
+
+  for (const group of groups) {
+    const tabs = await browser.tabs.query({ groupId: group.id });
+    if (tabs.length === 0) {
+      continue;
+    }
+
+    const target = tabs.find((tab) => tab.active) || tabs[0];
+    try {
+      await browser.tabs.update(target.id, { active: true });
+      activated = true;
+    } catch (error) {
+      console.error("Tab activation error:", group.id, group.title, error);
+      failures.push(groupLabel(group));
+    }
+  }
+
+  return { activated, failures };
+}
+
 async function applyFocus(focusName, { rawId }) {
   const allGroups = await browser.tabGroups.query({});
   await browser.storage.local.set({
-    lastFocusSeen: rawId,
     groupTitles: allGroups.map((group) => group.title),
   });
 
@@ -229,30 +304,36 @@ async function applyFocus(focusName, { rawId }) {
 
   if (focusName === "") {
     await updateBadge("", null);
-    await browser.storage.local.set({ lastAction: "ignored" });
-    return;
+    await browser.storage.local.set({
+      ...CLEAR_ACTION_DIAGNOSTICS,
+      lastAction: "ignored",
+    });
+    return true;
   }
 
   if (focusName === null && rawId === null) {
     await updateBadge("", null);
-    for (const group of allGroups) {
-      if (group.collapsed) {
-        await browser.tabGroups.update(group.id, { collapsed: false });
-      }
-    }
-    await browser.storage.local.set({ lastAction: "expanded_all" });
+    const updateFailures = await setGroupsCollapsed(allGroups, false);
+    await browser.storage.local.set({
+      ...CLEAR_ACTION_DIAGNOSTICS,
+      lastAction: updateFailures.length === 0 ? "expanded_all" : "expanded_all_with_errors",
+      updateFailures,
+    });
     await notify({
       type: "basic",
       title: "Focus Tab Groups",
-      message: `Focus off — expanded all ${allGroups.length} groups${groupList ? `:\n${groupList}` : ""}`,
+      message: `Focus off — ${
+        updateFailures.length === 0 ? `expanded all ${allGroups.length} groups` : "some groups could not be expanded"
+      }${groupList ? `:\n${groupList}` : ""}${updateFailures.length === 0 ? "" : `\nFailed: ${updateFailures.join(", ")}`}`,
     });
-    return;
+    return updateFailures.length === 0;
   }
 
   if (focusName === null && rawId !== null) {
     await updateBadge("?", "#D50000"); // Red for unmapped
     const notificationId = `${OPTIONS_NOTIFICATION_PREFIX}${rawId}`;
     await browser.storage.local.set({
+      ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "unmapped_focus_id",
       unmappedFocusId: rawId,
     });
@@ -261,17 +342,20 @@ async function applyFocus(focusName, { rawId }) {
       title: "Focus Tab Groups",
       message: `Unmapped Focus mode ${rawId} — click this notification to open Focus Tab Groups options and assign it`,
     }, notificationId);
-    return;
+    return true;
   }
 
   if (allGroups.length === 0) {
-    await browser.storage.local.set({ lastAction: "no_groups" });
+    await browser.storage.local.set({
+      ...CLEAR_ACTION_DIAGNOSTICS,
+      lastAction: "no_groups",
+    });
     await notify({
       type: "basic",
       title: "Focus Tab Groups",
       message: "No tab groups found in Firefox",
     });
-    return;
+    return true;
   }
 
   const matching = allGroups.filter((group) => group.title === focusName);
@@ -279,49 +363,43 @@ async function applyFocus(focusName, { rawId }) {
 
   if (matching.length === 0) {
     await updateBadge("!", "#FF9800"); // Orange for missing group
-    for (const group of allGroups) {
-      if (group.collapsed) {
-        await browser.tabGroups.update(group.id, { collapsed: false });
-      }
-    }
+    const updateFailures = await setGroupsCollapsed(allGroups, false);
     await browser.storage.local.set({
+      ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "no_matching_group",
       missingGroup: focusName,
+      updateFailures,
     });
     await notify({
       type: "basic",
       title: "Focus Tab Groups",
       message: `No group called "${focusName}" found.\n\nYour groups:\n${groupList}`,
     });
-    return;
+    return updateFailures.length === 0;
   }
 
-  // Activate a tab inside the target group BEFORE collapsing others.
-  let activated = false;
-  for (const group of matching) {
-    const tabs = await browser.tabs.query({ groupId: group.id, windowId: browser.windows.WINDOW_ID_CURRENT });
-    if (tabs.length > 0) {
-      const target = tabs.find((tab) => tab.active) || tabs[0];
-      await browser.tabs.update(target.id, { active: true });
-      activated = true;
-      break;
-    }
-  }
+  // Activate a tab inside every target group before collapsing other groups.
+  // Firefox rejects collapsing a group that contains its window's active tab;
+  // activating matching groups first prevents one window from aborting the batch.
+  const activation = await activateMatchingGroups(matching);
 
-  if (!activated) {
-    for (const group of matching) {
-      const tabs = await browser.tabs.query({ groupId: group.id });
-      if (tabs.length > 0) {
-        const target = tabs.find((tab) => tab.active) || tabs[0];
-        await browser.tabs.update(target.id, { active: true });
-        activated = true;
-        break;
-      }
-    }
-  }
-
-  if (!activated) {
+  if (activation.failures.length > 0) {
     await browser.storage.local.set({
+      ...CLEAR_ACTION_DIAGNOSTICS,
+      lastAction: "activation_failed",
+      updateFailures: activation.failures,
+    });
+    await notify({
+      type: "basic",
+      title: "Focus Tab Groups",
+      message: `Could not activate every "${focusName}" tab group — not changing groups\nFailed: ${activation.failures.join(", ")}`,
+    });
+    return false;
+  }
+
+  if (!activation.activated) {
+    await browser.storage.local.set({
+      ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "matching_group_empty",
       emptyGroup: focusName,
     });
@@ -330,38 +408,39 @@ async function applyFocus(focusName, { rawId }) {
       title: "Focus Tab Groups",
       message: `"${focusName}" group is empty — not changing anything`,
     });
-    return;
+    return true;
   }
 
-  await Promise.all([
-    ...matching.map(async (group) => {
-      if (group.collapsed) {
-        await browser.tabGroups.update(group.id, { collapsed: false });
-      }
-    }),
-    ...others.map(async (group) => {
-      if (!group.collapsed) {
-        await browser.tabGroups.update(group.id, { collapsed: true });
-      }
-    })
+  const [expandFailures, collapseFailures] = await Promise.all([
+    setGroupsCollapsed(matching, false),
+    setGroupsCollapsed(others, true),
   ]);
+  const updateFailures = expandFailures.concat(collapseFailures);
+  const lastAction = updateFailures.length === 0 ? "applied" : "applied_with_errors";
 
-  await updateBadge(focusName.substring(0, 1).toUpperCase(), "#00C853"); // Green
+  await updateBadge(
+    updateFailures.length === 0 ? focusName.substring(0, 1).toUpperCase() : "!",
+    updateFailures.length === 0 ? "#00C853" : "#FF9800",
+  );
 
   const expanded = matching.map((group) => group.title).join(", ");
   const collapsed = others.map((group) => group.title).join(", ") || "(none)";
+  const failureText = updateFailures.length === 0 ? "" : `\nFailed: ${updateFailures.join(", ")}`;
 
   await browser.storage.local.set({
-    lastAction: "applied",
+    ...CLEAR_ACTION_DIAGNOSTICS,
+    lastAction,
     expandedGroups: matching.map((group) => group.title),
     collapsedGroups: others.map((group) => group.title),
+    updateFailures,
   });
 
   await notify({
     type: "basic",
     title: `Focus: ${focusName}`,
-    message: `Expanded: ${expanded}\nCollapsed: ${collapsed}`,
+    message: `Expanded: ${expanded}\nCollapsed: ${collapsed}${failureText}`,
   });
+  return updateFailures.length === 0;
 }
 
 browser.alarms.onAlarm.addListener((alarm) => {
