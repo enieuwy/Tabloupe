@@ -119,7 +119,9 @@ preflight_checks() {
 
   # Unit tests
   info "  Running tests…"
-  node --test "$REPO_DIR/tests/background.test.js"
+  if ! node --test; then
+    die "Tests failed"
+  fi
   success "  ✓ Tests passed"
 
   # Lint
