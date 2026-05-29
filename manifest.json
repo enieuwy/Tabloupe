@@ -1,19 +1,34 @@
 {
-  "manifest_version": 3,
+  "manifest_version": 2,
   "name": "Focus Tab Groups",
-  "version": "1.0.0",
+  "version": "1.0.6",
   "description": "Collapses and expands Firefox tab groups based on macOS Focus mode via mac-command-centre.",
   "browser_specific_settings": {
     "gecko": {
-      "id": "focus-tab-groups@local"
+      "id": "focus-tab-groups@local",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
     }
   },
-  "permissions": ["tabGroups", "tabs", "storage", "notifications", "alarms"],
-  "host_permissions": ["ws://127.0.0.1/*"],
-  "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:8767;"
+  "permissions": [
+    "tabGroups",
+    "tabs",
+    "storage",
+    "notifications",
+    "ws://127.0.0.1/*"
+  ],
+  "content_security_policy": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:8767;",
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "background": {
-    "scripts": ["background.js"]
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": true
   }
 }

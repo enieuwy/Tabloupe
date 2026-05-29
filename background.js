@@ -1,64 +1,111 @@
 const WS_URL = "ws://127.0.0.1:8767";
 const RECONNECT_MS = 3000;
-const RECONNECT_ALARM = "focus-reconnect";
+const OPTIONS_NOTIFICATION_PREFIX = "focus-unmapped-";
 
-let lastFocus = null;
-let lastFocusLoad = null;
+const DEFAULT_FOCUS_MAPPINGS = Object.freeze({
+  "com.apple.focus.work": "Work",
+  "com.apple.focus.personal-time": "Personal",
+  "com.apple.donotdisturb.mode.default": "Do Not Disturb",
+  "com.apple.sleep.sleep-mode": "Sleep",
+  "com.apple.donotdisturb.mode.graduationcapfill": "Study",
+  "com.apple.focus.reduce-interruptions": "Reduce Interruptions",
+});
+
+let lastDispatchedRawId;
 let socket = null;
 let reconnectTimer = null;
+let messageQueue = Promise.resolve();
 
-function loadLastFocus() {
-  if (!lastFocusLoad) {
-    lastFocusLoad = browser.storage.local.get("lastFocusSeen")
-      .then((stored) => {
-        if (typeof stored.lastFocusSeen === "string") {
-          lastFocus = stored.lastFocusSeen;
-        }
-      })
-      .catch((e) => {
-        console.error("Stored focus read error:", e);
-      });
-  }
-  return lastFocusLoad;
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function clearReconnect() {
+async function ensureDefaultMappings() {
+  const stored = await browser.storage.local.get("focusMappings");
+  if (!isRecord(stored.focusMappings)) {
+    await browser.storage.local.set({ focusMappings: { ...DEFAULT_FOCUS_MAPPINGS } });
+  }
+}
+
+function clearReconnectTimer() {
   if (reconnectTimer !== null) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
-  browser.alarms.clear(RECONNECT_ALARM);
 }
 
 function scheduleReconnect() {
-  clearReconnect();
+  clearReconnectTimer();
   reconnectTimer = setTimeout(connect, RECONNECT_MS);
-  browser.alarms.create(RECONNECT_ALARM, { delayInMinutes: RECONNECT_MS / 60000 });
+}
+
+async function recordSeen(rawId) {
+  if (rawId === null) {
+    await browser.storage.local.set({ lastFocusSeen: null });
+    return;
+  }
+
+  const now = Date.now();
+  const stored = await browser.storage.local.get("seenFocusIds");
+  const seenFocusIds = isRecord(stored.seenFocusIds) ? { ...stored.seenFocusIds } : {};
+  const previous = isRecord(seenFocusIds[rawId]) ? seenFocusIds[rawId] : {};
+  seenFocusIds[rawId] = {
+    firstSeen: typeof previous.firstSeen === "number" ? previous.firstSeen : now,
+    lastSeen: now,
+  };
+
+  await browser.storage.local.set({
+    lastFocusSeen: rawId,
+    seenFocusIds,
+  });
+}
+
+function mappedFocus(rawId, focusMappings) {
+  if (rawId === null) {
+    return null;
+  }
+
+  const mappedTitle = focusMappings[rawId];
+  return typeof mappedTitle === "string" && mappedTitle.length > 0 ? mappedTitle : null;
+}
+
+async function applyRawFocus(rawId, { force = false } = {}) {
+  if (!force && rawId === lastDispatchedRawId) {
+    return;
+  }
+
+  const stored = await browser.storage.local.get("focusMappings");
+  const focusMappings = isRecord(stored.focusMappings) ? stored.focusMappings : {};
+  const focusName = mappedFocus(rawId, focusMappings);
+
+  lastDispatchedRawId = rawId;
+  await applyFocus(focusName, { rawId });
+}
+
+async function handleMessage(event) {
+  const msg = JSON.parse(event.data);
+  const rawId = msg && typeof msg.focus === "string" ? msg.focus : null;
+
+  await recordSeen(rawId);
+  await applyRawFocus(rawId);
 }
 
 async function connect() {
-  await loadLastFocus();
-
   if (socket && socket.readyState !== WebSocket.CLOSED) {
     return;
   }
 
-  clearReconnect();
+  clearReconnectTimer();
   const ws = new WebSocket(WS_URL);
   socket = ws;
 
-  ws.onopen = () => clearReconnect();
-  ws.onmessage = async (event) => {
-    try {
-      const msg = JSON.parse(event.data);
-      const focus = typeof msg.focus === "string" ? msg.focus : "none";
-      if (focus !== lastFocus) {
-        lastFocus = focus;
-        await applyFocus(focus);
-      }
-    } catch (e) {
-      console.error("Parse error:", e);
-    }
+  ws.onopen = () => clearReconnectTimer();
+  ws.onmessage = (event) => {
+    messageQueue = messageQueue
+      .then(() => handleMessage(event))
+      .catch((error) => {
+        console.error("Focus message error:", error);
+      });
   };
 
   ws.onclose = () => {
@@ -70,53 +117,120 @@ async function connect() {
   ws.onerror = () => ws.close();
 }
 
-browser.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === RECONNECT_ALARM) {
-    connect();
+function start() {
+  ensureDefaultMappings()
+    .catch((error) => {
+      console.error("Default focus mapping seed error:", error);
+    })
+    .finally(() => {
+      connect();
+    });
+}
+
+browser.runtime.onInstalled.addListener(start);
+browser.runtime.onStartup.addListener(start);
+
+browser.notifications.onClicked.addListener((notificationId) => {
+  if (notificationId.startsWith(OPTIONS_NOTIFICATION_PREFIX)) {
+    browser.runtime.openOptionsPage();
+    browser.notifications.clear(notificationId);
   }
 });
 
-
-// ── Tab group logic ────────────────────────────────────────
-
-async function applyFocus(focusName) {
-  const allGroups = await browser.tabGroups.query({});
-  await browser.storage.local.set({
-    lastFocusSeen: focusName,
-    groupTitles: allGroups.map((group) => group.title),
+if (browser.notifications.onButtonClicked) {
+  browser.notifications.onButtonClicked.addListener((notificationId) => {
+    if (notificationId.startsWith(OPTIONS_NOTIFICATION_PREFIX)) {
+      browser.runtime.openOptionsPage();
+      browser.notifications.clear(notificationId);
+    }
   });
+}
 
-  if (allGroups.length === 0) {
-    browser.notifications.create({
-      type: "basic",
-      title: "Focus Tab Groups",
-      message: `No tab groups found in Firefox`
-    });
+browser.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || !changes.focusMappings) {
     return;
   }
 
-  const groupList = allGroups.map(g =>
-    `${g.title} (${g.collapsed ? "collapsed" : "expanded"})`
+  browser.storage.local.get("lastFocusSeen")
+    .then((stored) => {
+      const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
+      lastDispatchedRawId = undefined;
+      if (rawId !== null) {
+        return applyRawFocus(rawId, { force: true });
+      }
+      return undefined;
+    })
+    .catch((error) => {
+      console.error("Focus mapping refresh error:", error);
+    });
+});
+
+// ── Tab group logic ────────────────────────────────────────
+
+async function notify(options, notificationId) {
+  try {
+    if (notificationId) {
+      await browser.notifications.create(notificationId, options);
+    } else {
+      await browser.notifications.create(options);
+    }
+  } catch (error) {
+    console.error("Notification error:", error);
+  }
+}
+
+async function applyFocus(focusName, { rawId }) {
+  const allGroups = await browser.tabGroups.query({});
+  await browser.storage.local.set({
+    lastFocusSeen: rawId,
+    groupTitles: allGroups.map((group) => group.title),
+  });
+
+  const groupList = allGroups.map((group) =>
+    `${group.title} (${group.collapsed ? "collapsed" : "expanded"})`
   ).join("\n");
 
-  // "none" → expand everything
-  if (focusName === "none") {
+  if (focusName === null && rawId === null) {
     for (const group of allGroups) {
       if (group.collapsed) {
         await browser.tabGroups.update(group.id, { collapsed: false });
       }
     }
     await browser.storage.local.set({ lastAction: "expanded_all" });
-    browser.notifications.create({
+    await notify({
       type: "basic",
       title: "Focus Tab Groups",
-      message: `Focus off — expanded all ${allGroups.length} groups:\n${groupList}`
+      message: `Focus off — expanded all ${allGroups.length} groups${groupList ? `:\n${groupList}` : ""}`,
     });
     return;
   }
 
-  const matching = allGroups.filter(g => g.title === focusName);
-  const others = allGroups.filter(g => g.title !== focusName);
+  if (focusName === null && rawId !== null) {
+    const notificationId = `${OPTIONS_NOTIFICATION_PREFIX}${rawId}`;
+    await browser.storage.local.set({
+      lastAction: "unmapped_focus_id",
+      unmappedFocusId: rawId,
+    });
+    await notify({
+      type: "basic",
+      title: "Focus Tab Groups",
+      message: `Unmapped Focus mode ${rawId} — click this notification to open Focus Tab Groups options and assign it`,
+    }, notificationId);
+    return;
+  }
+
+  if (allGroups.length === 0) {
+    await browser.storage.local.set({ lastAction: "no_groups" });
+    await notify({
+      type: "basic",
+      title: "Focus Tab Groups",
+      message: "No tab groups found in Firefox",
+    });
+    return;
+  }
+
+  const matching = allGroups.filter((group) => group.title === focusName);
+  const others = allGroups.filter((group) => group.title !== focusName);
 
   if (matching.length === 0) {
     for (const group of allGroups) {
@@ -128,10 +242,10 @@ async function applyFocus(focusName) {
       lastAction: "no_matching_group",
       missingGroup: focusName,
     });
-    browser.notifications.create({
+    await notify({
       type: "basic",
       title: "Focus Tab Groups",
-      message: `No group called "${focusName}" found.\n\nYour groups:\n${groupList}`
+      message: `No group called "${focusName}" found.\n\nYour groups:\n${groupList}`,
     });
     return;
   }
@@ -141,7 +255,7 @@ async function applyFocus(focusName) {
   for (const group of matching) {
     const tabs = await browser.tabs.query({ groupId: group.id });
     if (tabs.length > 0) {
-      const target = tabs.find(t => !t.active) || tabs[0];
+      const target = tabs.find((tab) => !tab.active) || tabs[0];
       await browser.tabs.update(target.id, { active: true });
       activated = true;
       break;
@@ -153,30 +267,30 @@ async function applyFocus(focusName) {
       lastAction: "matching_group_empty",
       emptyGroup: focusName,
     });
-    browser.notifications.create({
+    await notify({
       type: "basic",
       title: "Focus Tab Groups",
-      message: `"${focusName}" group is empty — not changing anything`
+      message: `"${focusName}" group is empty — not changing anything`,
     });
     return;
   }
 
-  // Expand matching groups
+  // Expand matching groups.
   for (const group of matching) {
     if (group.collapsed) {
       await browser.tabGroups.update(group.id, { collapsed: false });
     }
   }
 
-  // Collapse all others
+  // Collapse all others.
   for (const group of others) {
     if (!group.collapsed) {
       await browser.tabGroups.update(group.id, { collapsed: true });
     }
   }
 
-  const expanded = matching.map(g => g.title).join(", ");
-  const collapsed = others.map(g => g.title).join(", ") || "(none)";
+  const expanded = matching.map((group) => group.title).join(", ");
+  const collapsed = others.map((group) => group.title).join(", ") || "(none)";
 
   await browser.storage.local.set({
     lastAction: "applied",
@@ -184,13 +298,13 @@ async function applyFocus(focusName) {
     collapsedGroups: others.map((group) => group.title),
   });
 
-  browser.notifications.create({
+  await notify({
     type: "basic",
     title: `Focus: ${focusName}`,
-    message: `Expanded: ${expanded}\nCollapsed: ${collapsed}`
+    message: `Expanded: ${expanded}\nCollapsed: ${collapsed}`,
   });
 }
 
 // ── Start ──────────────────────────────────────────────────
 
-connect();
+start();
