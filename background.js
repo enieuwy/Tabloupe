@@ -177,6 +177,19 @@ browser.storage.onChanged.addListener((changes, areaName) => {
 
 // ── Tab group logic ────────────────────────────────────────
 
+async function updateBadge(text, color) {
+  try {
+    if (browser.browserAction) {
+      await browser.browserAction.setBadgeText({ text });
+      if (color) {
+        await browser.browserAction.setBadgeBackgroundColor({ color });
+      }
+    }
+  } catch (error) {
+    console.error("Badge error:", error);
+  }
+}
+
 async function notify(options, notificationId) {
   try {
     if (notificationId) {
@@ -201,6 +214,7 @@ async function applyFocus(focusName, { rawId }) {
   ).join("\n");
 
   if (focusName === null && rawId === null) {
+    await updateBadge("", null);
     for (const group of allGroups) {
       if (group.collapsed) {
         await browser.tabGroups.update(group.id, { collapsed: false });
@@ -216,6 +230,7 @@ async function applyFocus(focusName, { rawId }) {
   }
 
   if (focusName === null && rawId !== null) {
+    await updateBadge("?", "#D50000"); // Red for unmapped
     const notificationId = `${OPTIONS_NOTIFICATION_PREFIX}${rawId}`;
     await browser.storage.local.set({
       lastAction: "unmapped_focus_id",
@@ -243,6 +258,7 @@ async function applyFocus(focusName, { rawId }) {
   const others = allGroups.filter((group) => group.title !== focusName);
 
   if (matching.length === 0) {
+    await updateBadge("!", "#FF9800"); // Orange for missing group
     for (const group of allGroups) {
       if (group.collapsed) {
         await browser.tabGroups.update(group.id, { collapsed: false });
@@ -298,6 +314,8 @@ async function applyFocus(focusName, { rawId }) {
       await browser.tabGroups.update(group.id, { collapsed: true });
     }
   }
+
+  await updateBadge(focusName.substring(0, 1).toUpperCase(), "#00C853"); // Green
 
   const expanded = matching.map((group) => group.title).join(", ");
   const collapsed = others.map((group) => group.title).join(", ") || "(none)";
