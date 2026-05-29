@@ -128,6 +128,19 @@ test("add custom mapping updates DOM and is dirty", async () => {
   assert.match(document.getElementById("status").textContent, /Unsaved changes/);
 });
 
+test("add custom mapping allows empty title for ignore mappings", async () => {
+  const { document } = createHarness();
+  await settle();
+
+  document.getElementById("new-focus-id").value = "com.apple.ignore";
+  document.getElementById("new-group-title").value = "";
+  document.getElementById("add-mapping").click();
+
+  const row = document.querySelector("#mappings-body tr");
+  assert.equal(row.querySelector("code").textContent, "com.apple.ignore");
+  assert.equal(row.querySelector("input[type='text']").value, "");
+  assert.match(row.textContent, /ignored/);
+});
 test("save mappings writes to storage and clears dirty state", async () => {
   const { window, document, storageData } = createHarness();
   await settle();
@@ -199,4 +212,21 @@ test("apply-now button sends message", async () => {
 
   assert.equal(messages.length, 1);
   assert.equal(messages[0].type, "apply-current-focus");
+});
+
+test("diagnostics render failed tab-group updates", async () => {
+  const { document } = createHarness({
+    storage: {
+      lastAction: "applied_with_errors",
+      expandedGroups: ["Work"],
+      collapsedGroups: ["Other"],
+      updateFailures: ["Other"],
+    },
+  });
+  await settle();
+
+  const details = document.getElementById("diag-action-details").textContent;
+  assert.match(details, /expanded: Work/);
+  assert.match(details, /collapsed: Other/);
+  assert.match(details, /failed updates: Other/);
 });

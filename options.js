@@ -18,6 +18,7 @@ const STORAGE_KEYS = [
   "emptyGroup",
   "expandedGroups",
   "collapsedGroups",
+  "updateFailures",
 ];
 
 const state = {
@@ -32,6 +33,7 @@ const state = {
   emptyGroup: null,
   expandedGroups: [],
   collapsedGroups: [],
+  updateFailures: [],
 };
 
 let draftMappings = {};
@@ -112,7 +114,7 @@ async function loadAll() {
   state.emptyGroup = typeof stored.emptyGroup === "string" ? stored.emptyGroup : null;
   state.expandedGroups = normalizeStringArray(stored.expandedGroups);
   state.collapsedGroups = normalizeStringArray(stored.collapsedGroups);
-
+  state.updateFailures = normalizeStringArray(stored.updateFailures);
   if (!dirty) {
     draftMappings = { ...state.focusMappings };
   }
@@ -267,6 +269,9 @@ function renderDiagnostics() {
   if (state.collapsedGroups.length > 0) {
     details.push(`collapsed: ${state.collapsedGroups.join(", ")}`);
   }
+  if (state.updateFailures.length > 0) {
+    details.push(`failed updates: ${state.updateFailures.join(", ")}`);
+  }
   document.getElementById("diag-action-details").textContent = details.length > 0 ? details.join("; ") : "—";
 }
 
@@ -311,8 +316,8 @@ function addCustomMapping() {
   const id = idInput.value.trim();
   const title = titleInput.value.trim();
 
-  if (!id || !title) {
-    setStatus("Enter both a Focus ID and a Firefox group title.", "error");
+  if (!id) {
+    setStatus("Enter a Focus ID. Leave the group title empty to ignore it.", "error");
     return;
   }
 
@@ -374,6 +379,9 @@ function applyStorageChange(changes) {
   }
   if (changes.collapsedGroups) {
     state.collapsedGroups = normalizeStringArray(changes.collapsedGroups.newValue);
+  }
+  if (changes.updateFailures) {
+    state.updateFailures = normalizeStringArray(changes.updateFailures.newValue);
   }
   render();
 }

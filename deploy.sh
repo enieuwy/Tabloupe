@@ -5,29 +5,12 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROFILES_INI="$HOME/Library/Application Support/Firefox/profiles.ini"
-# Extract from Install block first
-PROFILE_REL_PATH=$(awk -F '=' '/^\[Install/ {in_install=1} /^\[/ && !/^\[Install/ {in_install=0} in_install && /^Default=/ {print $2; exit}' "$PROFILES_INI" 2>/dev/null || true)
-if [[ -z "$PROFILE_REL_PATH" ]]; then
-  # Fallback to legacy Default=1
-  PROFILE_REL_PATH=$(awk -F '=' '/^\[Profile/ {in_prof=1} /^\[/ && !/^\[Profile/ {in_prof=0} in_prof && /^Path=/ {path=$2} in_prof && /^Default=1/ {print path; exit}' "$PROFILES_INI" 2>/dev/null || true)
-fi
-
-if [[ -n "$PROFILE_REL_PATH" ]]; then
-  PROFILE_DIR="$HOME/Library/Application Support/Firefox/$PROFILE_REL_PATH"
-else
-  PROFILE_DIR="$HOME/Library/Application Support/Firefox/Profiles/2t2po2ct.default-release"
-fi
-
-EXTENSION_FILENAME="focus-tab-groups@local.xpi"
-EXTENSIONS_DIR="$PROFILE_DIR/extensions"
-SESSION_DIR="$PROFILE_DIR/sessionstore-backups"
 BACKUP_ROOT="/tmp/focus_tab_groups_firefox_session_backup"
 VENV_DIR="/tmp/focus_restore_lz4"
 XPI_DIR="$REPO_DIR/web-ext-artifacts"
-FIREFOX_APP="${FIREFOX_APP:-Firefox}"
 
-FIREFOX_QUIT_TIMEOUT=15  # seconds to wait for Firefox to exit
-FIREFOX_START_WAIT=5     # seconds to wait after launching Firefox
+PROFILE_DIR=""
+SESSION_DIR=""
 
 # ─── Colours ────────────────────────────────────────────────────────────────────
 
@@ -75,23 +58,68 @@ die() {
   exit 1
 }
 
+detect_profile_dir() {
+  python3 - "$PROFILES_INI" <<'PY'
+import configparser
+import sys
+from pathlib import Path
+
+profiles_ini = Path(sys.argv[1])
+if not profiles_ini.exists():
+    sys.exit(0)
+
+parser = configparser.ConfigParser()
+parser.read(profiles_ini)
+root = profiles_ini.parent
+
+def resolved_path(value, is_relative):
+    path = Path(value).expanduser()
+    return root / value if is_relative and not path.is_absolute() else path
+
+def resolve(section):
+    value = parser.get(section, "Path", fallback=parser.get(section, "Default", fallback="")).strip()
+    if not value:
+        return None
+    is_relative = parser.get(section, "IsRelative", fallback="1").strip() != "0"
+    return resolved_path(value, is_relative)
+
+for section in parser.sections():
+    if section.startswith("Install"):
+        value = parser.get(section, "Default", fallback="").strip()
+        if value:
+            print(resolved_path(value, True))
+            sys.exit(0)
+
+for section in parser.sections():
+    if section.startswith("Profile") and parser.get(section, "Default", fallback="0").strip() == "1":
+        path = resolve(section)
+        if path is not None:
+            print(path)
+            sys.exit(0)
+PY
+}
+
 # Count tabs in a recovery.jsonlz4 file. Outputs "windows tabs" on stdout.
 count_session_tabs() {
   local lz4_file="$1"
-  "$VENV_DIR/bin/python3" -c "
-import lz4.block, json, sys
+  "$VENV_DIR/bin/python3" - "$lz4_file" <<'PY'
+import json
+import sys
+from pathlib import Path
 
-with open('$lz4_file', 'rb') as f:
-    magic = f.read(8)          # skip mozLz4a0\\0 header
-    raw = lz4.block.decompress(f.read())
+import lz4.block
+
+with Path(sys.argv[1]).open("rb") as handle:
+    handle.read(8)  # skip mozLz4a0\0 header
+    raw = lz4.block.decompress(handle.read())
 
 data = json.loads(raw)
-windows = data.get('windows', [])
+windows = data.get("windows", [])
 num_windows = len(windows)
-num_tabs = sum(len(w.get('tabs', [])) for w in windows)
+num_tabs = sum(len(window.get("tabs", [])) for window in windows)
 
 print(num_windows, num_tabs)
-"
+PY
 }
 
 # ─── Step 1: Pre-flight checks ─────────────────────────────────────────────────
@@ -112,6 +140,13 @@ preflight_checks() {
     die "web-ext is not available via npx"
   fi
   success "  ✓ web-ext available"
+
+  PROFILE_DIR="$(detect_profile_dir)"
+  if [[ -z "$PROFILE_DIR" || ! -d "$PROFILE_DIR" ]]; then
+    die "Firefox profile not found from $PROFILES_INI"
+  fi
+  SESSION_DIR="$PROFILE_DIR/sessionstore-backups"
+  success "  ✓ Firefox profile: $PROFILE_DIR"
 
   # Python venv with lz4
   if [[ ! -x "$VENV_DIR/bin/python3" ]]; then
@@ -135,7 +170,7 @@ preflight_checks() {
 
   # Unit tests
   info "  Running tests…"
-  if ! node --test; then
+  if ! (cd "$REPO_DIR" && node --test); then
     die "Tests failed"
   fi
   success "  ✓ Tests passed"
@@ -164,7 +199,21 @@ snapshot_session() {
     die "Session backup dir not found: $SESSION_DIR"
   fi
 
-  cp -a "$SESSION_DIR"/* "$SNAPSHOT_DIR"/
+  python3 - "$SESSION_DIR" "$SNAPSHOT_DIR" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+
+for child in source.iterdir():
+    target = destination / child.name
+    if child.is_dir():
+        shutil.copytree(child, target, dirs_exist_ok=True)
+    else:
+        shutil.copy2(child, target)
+PY
   success "  ✓ Session files copied to $SNAPSHOT_DIR"
 
   local recovery_file="$SNAPSHOT_DIR/recovery.jsonlz4"
@@ -177,8 +226,7 @@ snapshot_session() {
 
   local counts
   counts="$(count_session_tabs "$recovery_file")"
-  PRE_WINDOWS="$(echo "$counts" | awk '{print $1}')"
-  PRE_TABS="$(echo "$counts" | awk '{print $2}')"
+  read -r PRE_WINDOWS PRE_TABS <<< "$counts"
 
   info "  Snapshot: ${PRE_WINDOWS} window(s), ${PRE_TABS} tab(s)"
   info "  Path:     $SNAPSHOT_DIR"
@@ -201,28 +249,34 @@ build_and_sign() {
   fi
 
   # Find the latest XPI by modification time
-  XPI_PATH="$(ls -t "$XPI_DIR"/*.xpi 2>/dev/null | head -n1)" || true
+  XPI_PATH="$(python3 - "$XPI_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+artifact_dir = Path(sys.argv[1])
+files = sorted(artifact_dir.glob("*.xpi"), key=lambda path: path.stat().st_mtime, reverse=True)
+print(files[0] if files else "")
+PY
+)"
   if [[ -z "$XPI_PATH" || ! -f "$XPI_PATH" ]]; then
     die "No .xpi found in $XPI_DIR"
   fi
 
   # Extract version from manifest
-  NEW_VERSION="$(python3 -c "import json; print(json.load(open('$REPO_DIR/manifest.json'))['version'])")"
+  NEW_VERSION="$(python3 - "$REPO_DIR/manifest.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+with Path(sys.argv[1]).open() as handle:
+    print(json.load(handle)["version"])
+PY
+)"
 
   info "  XPI:     $XPI_PATH"
   info "  Version: $NEW_VERSION"
 }
 
-# ─── Step 4: Install XPI ───────────────────────────────────────────────────────
-
-install_xpi() {
-  header "Install XPI"
-
-  local dest="$EXTENSIONS_DIR/$EXTENSION_FILENAME"
-  mkdir -p "$EXTENSIONS_DIR"
-  cp "$XPI_PATH" "$dest"
-  success "  ✓ Installed to $dest"
-}
 
 # ─── Step 5: Summary (dry-run only) ────────────────────────────────────────────
 
@@ -246,7 +300,7 @@ main() {
   echo -e "${BLUE}$(date)${NC}"
 
   if $DRY_RUN; then
-    info "Mode: --dry-run (checks + build only, no install)"
+    info "Mode: --dry-run (checks + build only, no manual-install prompt)"
   fi
   if $SKIP_BUILD; then
     info "Mode: --skip-build (using latest existing XPI)"
@@ -262,9 +316,8 @@ main() {
     exit 0
   fi
 
-  # Install but do NOT restart Firefox
-  install_xpi
-
+  # Do not copy into the Firefox profile. Standard Firefox requires the user
+  # to install the signed XPI through about:addons so it can validate the add-on.
   header "Next steps"
   echo ""
   echo -e "  ${BOLD}Version:${NC}        ${NEW_VERSION}"
@@ -278,7 +331,7 @@ main() {
   echo -e "    3. Select: ${BOLD}${XPI_PATH}${NC}"
   echo -e "    4. Firefox will replace the old version automatically"
   echo ""
-  success "  ✅ Build and install complete — activate manually in Firefox"
+  success "  ✅ Build complete — activate manually in Firefox"
 }
 
 main
