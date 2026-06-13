@@ -75,6 +75,8 @@ function createHarness({
   const sockets = [];
   const alarms = [];
   const clearedAlarms = [];
+  const sentMessages = [];
+  const groupCreations = [];
   const timers = new Map();
   const consoleErrors = [];
   const testConsole = {
@@ -216,16 +218,33 @@ function createHarness({
         tabUpdates.push({ id, patch: clone(patch) });
         return clone(tab);
       },
+      async group({ tabIds }) {
+        const id = groupState.reduce((max, group) => Math.max(max, group.id), 0) + 1;
+        for (const tabId of tabIds) {
+          const tab = tabState.find((candidate) => candidate.id === tabId);
+          if (tab) {
+            tab.groupId = id;
+          }
+        }
+        groupState.push({ id, title: "", collapsed: false });
+        groupCreations.push({ id, tabIds: clone(tabIds) });
+        return id;
+      },
     },
   };
 
   class FakeWebSocket {
     static CLOSED = 3;
+    static OPEN = 1;
 
     constructor(url) {
       this.url = url;
       this.readyState = 1;
       sockets.push(this);
+    }
+
+    send(data) {
+      sentMessages.push(JSON.parse(data));
     }
 
     close() {
@@ -273,6 +292,8 @@ function createHarness({
     buttonClickedListeners,
     messageListeners,
     sockets,
+    sentMessages,
+    groupCreations,
     alarms,
     clearedAlarms,
     timers,
@@ -618,4 +639,176 @@ test("partial activation failure blocks group changes and remains retryable", as
   assert.equal(harness.storageData.lastAction, "applied");
   assert.equal(harness.groupState.find((group) => group.id === 1).collapsed, false);
   assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, false);
+});
+
+// ── AI tab grouping ────────────────────────────────────────
+
+function ungroupedTabs() {
+  return [
+    { id: 10, url: "https://a.com", title: "Alpha", groupId: -1, active: false },
+    { id: 11, url: "https://b.com", title: "Beta", groupId: -1, active: false },
+    { id: 12, url: "https://c.com", title: "Gamma", groupId: -1, active: false },
+  ];
+}
+
+// Invokes the background runtime message handler and, when `response` is given,
+// injects a matching daemon reply so the in-flight request resolves.
+async function driveGrouping(harness, message, response) {
+  const promise = harness.messageListeners[0](message);
+  await settle();
+  if (response !== undefined) {
+    const sent = harness.sentMessages.find((frame) => frame.type === "groupTabs");
+    assert.ok(sent, "a groupTabs frame was sent to the daemon");
+    harness.sockets[0].onmessage({
+      data: JSON.stringify({ type: "groupTabsResult", id: sent.id, ...response }),
+    });
+  }
+  return promise;
+}
+
+test("AI preview maps daemon clusters back to tab ids and assigns distinct colors", async () => {
+  const harness = createHarness({ storage: { aiGroupingEnabled: true }, tabs: ungroupedTabs() });
+  await settle();
+
+  const result = await driveGrouping(harness, { type: "ai-group-preview" }, {
+    ok: true,
+    groups: [
+      { topic: "Pair", tabIndices: [0, 1] },
+      { topic: "Solo", tabIndices: [2] },
+    ],
+  });
+
+  const sent = harness.sentMessages.find((frame) => frame.type === "groupTabs");
+  assert.equal(sent.schemaVersion, 1);
+  assert.equal(sent.tabs.length, 3);
+  assert.deepEqual(sent.tabs[0], { index: 0, title: "Alpha", url: "https://a.com" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.groups.length, 2);
+  assert.equal(result.groups[0].topic, "Pair");
+  assert.equal(result.groups[0].tabs.map((tab) => tab.id).join(","), "10,11");
+  assert.equal(result.groups[1].tabs[0].title, "Gamma");
+  assert.notEqual(result.groups[0].color, result.groups[1].color);
+  assert.ok(["blue", "cyan", "green", "orange", "pink", "purple", "red", "yellow"].includes(result.groups[0].color));
+});
+
+test("AI preview sends only ungrouped, non-pinned web tabs", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true },
+    tabs: [
+      { id: 10, url: "https://a.com", title: "Alpha", groupId: -1 },
+      { id: 11, url: "https://b.com", title: "Beta", groupId: -1 },
+      { id: 12, url: "https://c.com", title: "Pinned", groupId: -1, pinned: true },
+      { id: 13, url: "about:config", title: "About", groupId: -1 },
+      { id: 14, url: "https://d.com", title: "Grouped", groupId: 5 },
+    ],
+  });
+  await settle();
+
+  await driveGrouping(harness, { type: "ai-group-preview" }, { ok: true, groups: [{ topic: "X", tabIndices: [0, 1] }] });
+
+  const sent = harness.sentMessages.find((frame) => frame.type === "groupTabs");
+  assert.deepEqual(sent.tabs.map((tab) => tab.url), ["https://a.com", "https://b.com"]);
+});
+
+test("AI preview refuses when the feature is disabled", async () => {
+  const harness = createHarness({ storage: { aiGroupingEnabled: false }, tabs: ungroupedTabs() });
+  await settle();
+
+  const result = await driveGrouping(harness, { type: "ai-group-preview" }, undefined);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "disabled");
+  assert.equal(harness.sentMessages.filter((frame) => frame.type === "groupTabs").length, 0);
+});
+
+test("AI preview needs at least two groupable tabs", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true },
+    tabs: [{ id: 10, url: "https://a.com", title: "Alpha", groupId: -1 }],
+  });
+  await settle();
+
+  const result = await driveGrouping(harness, { type: "ai-group-preview" }, undefined);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "not_enough_tabs");
+  assert.equal(harness.sentMessages.filter((frame) => frame.type === "groupTabs").length, 0);
+});
+
+test("AI preview surfaces a daemon failure verbatim", async () => {
+  const harness = createHarness({ storage: { aiGroupingEnabled: true }, tabs: ungroupedTabs() });
+  await settle();
+
+  const result = await driveGrouping(harness, { type: "ai-group-preview" }, {
+    ok: false,
+    error: "apple_intelligence_disabled",
+    message: "Turn on Apple Intelligence in System Settings.",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "apple_intelligence_disabled");
+  assert.match(result.message, /Apple Intelligence/);
+});
+
+test("AI preview fails cleanly when the socket drops mid-request", async () => {
+  const harness = createHarness({ storage: { aiGroupingEnabled: true }, tabs: ungroupedTabs() });
+  await settle();
+
+  const promise = harness.messageListeners[0]({ type: "ai-group-preview" });
+  await settle();
+  harness.sockets[0].close();
+  const result = await promise;
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "daemon_disconnected");
+});
+
+test("AI apply creates titled, colored groups via tabs.group", async () => {
+  const harness = createHarness({ storage: { aiGroupingEnabled: true }, tabs: ungroupedTabs() });
+  await settle();
+
+  const groups = [
+    { topic: "Work", color: "blue", tabs: [{ id: 10 }, { id: 11 }] },
+    { topic: "Play", color: "green", tabs: [{ id: 12 }] },
+  ];
+  const result = await harness.messageListeners[0]({ type: "ai-group-apply", groups });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.applied.join(","), "Work,Play");
+  assert.equal(harness.groupCreations.length, 2);
+  const work = harness.groupState.find((group) => group.title === "Work");
+  assert.ok(work);
+  assert.equal(work.color, "blue");
+  assert.equal(harness.tabState.find((tab) => tab.id === 10).groupId, work.id);
+  assert.equal(harness.tabState.find((tab) => tab.id === 11).groupId, work.id);
+});
+
+test("AI apply refuses when the feature is disabled", async () => {
+  const harness = createHarness({ storage: { aiGroupingEnabled: false }, tabs: ungroupedTabs() });
+  await settle();
+
+  const result = await harness.messageListeners[0]({
+    type: "ai-group-apply",
+    groups: [{ topic: "X", color: "blue", tabs: [{ id: 10 }] }],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "disabled");
+  assert.equal(harness.groupCreations.length, 0);
+});
+
+test("grouping responses are not mistaken for focus updates", async () => {
+  const harness = createHarness(twoGroups());
+  await settle();
+
+  harness.sockets[0].onmessage({
+    data: JSON.stringify({ type: "groupTabsResult", id: "unknown", ok: true, groups: [] }),
+  });
+  await settle();
+  assert.equal(harness.storageData.lastFocusSeen, undefined);
+  assert.equal(harness.storageData.lastAction, undefined);
+
+  await harness.context.handleMessage({ data: JSON.stringify({ focus: "com.apple.focus.work" }) });
+  assert.equal(harness.storageData.lastAction, "applied");
 });

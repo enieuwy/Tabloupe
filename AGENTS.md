@@ -3,6 +3,14 @@
 ## Architecture
 - **Daemon:** `mac-command-centre` (Swift) listens for macOS Focus mode changes via `DistributedNotificationCenter`, reads the active ID from `Assertions.json`, maps it to a tab group string, and broadcasts it over a `ws://127.0.0.1:8767` WebSocket.
 - **Client:** `focus-tab-groups` (Firefox Extension) maintains a persistent WebSocket connection and calls the `tabGroups` API to collapse/expand groups matching the string.
+- **Bidirectional bus:** The WebSocket carries two flows. Daemon→client: Focus broadcasts (`{ "focus": "<rawId>" }`). Client→daemon: AI tab-grouping requests (`{ "type": "groupTabs", … }`) answered with `{ "type": "groupTabsResult", … }`. `WebSocketServer` was broadcast-only until this; it now also `receiveMessage`s and routes inbound frames via `requestHandler`. (WireGuard/Audio commands still arrive via the file-drop control directory, not the socket — a browser can't write there.)
+
+## AI Tab Grouping
+- **What:** Clusters the current window's ungrouped tabs into named topic groups (like Safari 27's automatic tab groups). Opt-in, preview-before-apply — never silent, never touches existing manual groups or pinned/privileged (`about:`, `moz-extension:`) tabs.
+- **Where the AI runs:** On-device in the daemon via Apple's FoundationModels framework (`TabGrouping/TabClusterer.swift`, `FoundationModelsTabClusterer`) — the same on-device model class behind Safari's feature. Nothing leaves the Mac. Requires macOS 26+; gated with `#if canImport(FoundationModels)` + `@available(macOS 26.0, *)` so the daemon still builds/runs on macOS 14. `SystemLanguageModel.default.availability` is checked per request; when unavailable the client gets `ok:false` + a stable `error` code (e.g. `apple_intelligence_disabled`).
+- **Contract:** Client sends `[{ index, title, url }]`; daemon returns `[{ topic, tabIndices }]`. The model only proposes topics + membership — the client owns presentation (assigns tab-group colors round-robin) and re-maps indices to concrete tab ids. Both `TabGroupingSanitizer` (daemon) and `mapProposalToGroups` (client) defensively drop out-of-range/duplicate indices and empty groups.
+- **Apply path:** `background.js` `applyTabGrouping` calls `browser.tabs.group({tabIds})` then `browser.tabGroups.update(groupId, {title, color})` (Firefox 139+). Generated groups are ordinary tab groups, so they participate in Focus collapse/expand automatically.
+- **UX:** Options page has an enable toggle (`aiGroupingEnabled` in `storage.local`), "Preview groups" (`ai-group-preview` → proposal list), and "Apply these groups" (`ai-group-apply`). Both handlers refuse when disabled. No new manifest permissions: reuses the existing `tabs`/`tabGroups` perms and the already-allowed `ws://127.0.0.1:8767` connection.
 
 ## Extension Deployment & Updates
 - **Standard Firefox enforces extension signing.** You cannot simply load an unsigned local extension permanently unless you use Developer Edition/Nightly.

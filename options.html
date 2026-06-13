@@ -71,6 +71,28 @@
       </div>
     </form>
 
+    <section class="card ai-grouping">
+      <div class="section-heading">
+        <h2>AI tab grouping</h2>
+        <p>Cluster your ungrouped tabs into named topic groups using Apple's on-device model through mac-command-centre — like Safari's automatic tab groups. Nothing leaves your Mac.</p>
+      </div>
+      <label class="toggle">
+        <input id="ai-enabled" type="checkbox">
+        <span>Enable AI tab grouping</span>
+      </label>
+      <div class="actions">
+        <button id="ai-preview" type="button">Preview groups</button>
+        <span id="ai-status" role="status" aria-live="polite"></span>
+      </div>
+      <div id="ai-preview-result" hidden>
+        <ul id="ai-preview-list" class="ai-preview-list"></ul>
+        <div class="actions">
+          <button id="ai-apply" type="button">Apply these groups</button>
+          <button id="ai-discard" type="button" class="secondary">Dismiss</button>
+        </div>
+      </div>
+    </section>
+
     <section class="card diagnostics">
       <div class="section-heading">
         <h2>Diagnostics</h2>

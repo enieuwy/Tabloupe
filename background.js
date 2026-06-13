@@ -3,6 +3,12 @@ const MIN_RECONNECT_MS = 1000;
 const MAX_RECONNECT_MS = 30000;
 const MIN_RECONNECT_ALARM_MINUTES = 1;
 const OPTIONS_NOTIFICATION_PREFIX = "focus-unmapped-";
+const GROUPING_TIMEOUT_MS = 30000;
+const AI_GROUPING_ENABLED_KEY = "aiGroupingEnabled";
+const GROUPABLE_URL = /^https?:\/\//i;
+// Firefox tab-group colors. Assigned round-robin so adjacent groups differ;
+// the model only proposes topics + members, never presentation.
+const TAB_GROUP_COLORS = ["blue", "cyan", "green", "orange", "pink", "purple", "red", "yellow"];
 
 const DEFAULT_FOCUS_MAPPINGS = Object.freeze({
   "com.apple.focus.work": "Work",
@@ -18,6 +24,8 @@ let socket = null;
 let reconnectDelay = MIN_RECONNECT_MS;
 let reconnectTimer = null;
 let messageQueue = Promise.resolve();
+let groupingRequestSeq = 0;
+const pendingGroupingRequests = new Map();
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -133,6 +141,9 @@ async function connect() {
     clearReconnectTimer();
   };
   ws.onmessage = (event) => {
+    if (tryResolveGroupingResponse(event)) {
+      return;
+    }
     enqueueFocusWork(() => handleMessage(event)).catch((error) => {
       console.error("Focus message error:", error);
     });
@@ -141,6 +152,7 @@ async function connect() {
   ws.onclose = () => {
     if (socket === ws) {
       socket = null;
+      rejectPendingGrouping(new Error("daemon_disconnected"));
       scheduleReconnect();
     }
   };
@@ -169,6 +181,12 @@ browser.runtime.onMessage.addListener((message) => {
         return applyRawFocus(rawId, { force: true });
       })
     );
+  }
+  if (message && message.type === "ai-group-preview") {
+    return handleGroupPreview();
+  }
+  if (message && message.type === "ai-group-apply") {
+    return handleGroupApply(message.groups);
   }
   return false;
 });
@@ -441,6 +459,232 @@ async function applyFocus(focusName, { rawId }) {
     message: `Expanded: ${expanded}\nCollapsed: ${collapsed}${failureText}`,
   });
   return updateFailures.length === 0;
+}
+
+// ── AI tab grouping ────────────────────────────────────────
+// Sends ungrouped-tab metadata to mac-command-centre, which clusters them with
+// Apple's on-device model (FoundationModels) and returns named topic groups.
+
+function nextGroupingRequestId() {
+  groupingRequestSeq += 1;
+  return `g${groupingRequestSeq}-${Date.now()}`;
+}
+
+function tryResolveGroupingResponse(event) {
+  let msg;
+  try {
+    msg = JSON.parse(event.data);
+  } catch (error) {
+    return false;
+  }
+  if (!isRecord(msg) || msg.type !== "groupTabsResult") {
+    return false;
+  }
+  resolveGroupingResponse(msg);
+  return true;
+}
+
+function resolveGroupingResponse(msg) {
+  if (typeof msg.id !== "string") {
+    return;
+  }
+  const pending = pendingGroupingRequests.get(msg.id);
+  if (!pending) {
+    return;
+  }
+  clearTimeout(pending.timer);
+  pendingGroupingRequests.delete(msg.id);
+  pending.resolve(msg);
+}
+
+function rejectPendingGrouping(error) {
+  const entries = Array.from(pendingGroupingRequests.values());
+  pendingGroupingRequests.clear();
+  for (const entry of entries) {
+    clearTimeout(entry.timer);
+    entry.reject(error);
+  }
+}
+
+function requestTabGrouping(tabsPayload) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("daemon_disconnected"));
+  }
+  const id = nextGroupingRequestId();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingGroupingRequests.delete(id);
+      reject(new Error("grouping_timeout"));
+    }, GROUPING_TIMEOUT_MS);
+    pendingGroupingRequests.set(id, { resolve, reject, timer });
+    try {
+      socket.send(JSON.stringify({ type: "groupTabs", schemaVersion: 1, id, tabs: tabsPayload }));
+    } catch (error) {
+      clearTimeout(timer);
+      pendingGroupingRequests.delete(id);
+      reject(error);
+    }
+  });
+}
+
+function isUngroupedTab(tab) {
+  // Firefox reports groupId === -1 for tabs that are not in any group.
+  return tab.groupId === undefined || tab.groupId === null || tab.groupId === -1;
+}
+
+async function collectGroupableTabs() {
+  const tabs = await browser.tabs.query({ windowId: browser.windows.WINDOW_ID_CURRENT });
+  // Only touch ungrouped, non-pinned web tabs so existing manual groups and
+  // privileged pages (about:, moz-extension:, …) are never disturbed.
+  return tabs.filter((tab) =>
+    !tab.pinned &&
+    isUngroupedTab(tab) &&
+    typeof tab.url === "string" &&
+    GROUPABLE_URL.test(tab.url)
+  );
+}
+
+function mapProposalToGroups(proposalGroups, candidates) {
+  if (!Array.isArray(proposalGroups)) {
+    return [];
+  }
+  const groups = [];
+  let colorIndex = 0;
+  for (const proposal of proposalGroups) {
+    if (!isRecord(proposal) || typeof proposal.topic !== "string") {
+      continue;
+    }
+    const topic = proposal.topic.trim();
+    if (topic === "") {
+      continue;
+    }
+    const indices = Array.isArray(proposal.tabIndices) ? proposal.tabIndices : [];
+    const tabs = [];
+    for (const index of indices) {
+      const tab = candidates[index];
+      if (tab && typeof tab.id === "number") {
+        tabs.push({ id: tab.id, title: typeof tab.title === "string" && tab.title !== "" ? tab.title : tab.url });
+      }
+    }
+    if (tabs.length === 0) {
+      continue;
+    }
+    groups.push({
+      topic,
+      color: TAB_GROUP_COLORS[colorIndex % TAB_GROUP_COLORS.length],
+      tabs,
+    });
+    colorIndex += 1;
+  }
+  return groups;
+}
+
+function describeGroupingError(code) {
+  switch (code) {
+    case "daemon_disconnected":
+      return "Not connected to mac-command-centre.";
+    case "grouping_timeout":
+      return "The on-device model took too long to respond.";
+    default:
+      return "Could not reach the AI tab grouping service.";
+  }
+}
+
+async function computeTabGrouping() {
+  const candidates = await collectGroupableTabs();
+  if (candidates.length < 2) {
+    return { ok: false, error: "not_enough_tabs", message: "Open at least 2 ungrouped tabs to organize." };
+  }
+
+  const payload = candidates.map((tab, index) => ({
+    index,
+    title: typeof tab.title === "string" ? tab.title : "",
+    url: tab.url,
+  }));
+
+  let response;
+  try {
+    response = await requestTabGrouping(payload);
+  } catch (error) {
+    return { ok: false, error: error.message || "grouping_failed", message: describeGroupingError(error.message) };
+  }
+
+  if (!isRecord(response) || response.ok !== true) {
+    return {
+      ok: false,
+      error: (response && response.error) || "grouping_failed",
+      message: (response && response.message) || "Could not organize tabs.",
+    };
+  }
+
+  const groups = mapProposalToGroups(response.groups, candidates);
+  if (groups.length === 0) {
+    return { ok: false, error: "empty_result", message: "No groups were returned for these tabs." };
+  }
+  return { ok: true, groups };
+}
+
+async function applyTabGrouping(groups) {
+  const applied = [];
+  const failures = [];
+  for (const group of groups) {
+    const tabIds = group.tabs.map((tab) => tab.id).filter((id) => typeof id === "number");
+    if (tabIds.length === 0) {
+      continue;
+    }
+    const color = TAB_GROUP_COLORS.includes(group.color) ? group.color : TAB_GROUP_COLORS[0];
+    try {
+      const groupId = await browser.tabs.group({ tabIds });
+      await browser.tabGroups.update(groupId, { title: group.topic, color });
+      applied.push(group.topic);
+    } catch (error) {
+      console.error("AI tab group apply error:", group.topic, error);
+      failures.push(group.topic);
+    }
+  }
+  return { applied, failures };
+}
+
+async function aiGroupingEnabled() {
+  const stored = await browser.storage.local.get(AI_GROUPING_ENABLED_KEY);
+  return stored[AI_GROUPING_ENABLED_KEY] === true;
+}
+
+async function handleGroupPreview() {
+  if (!(await aiGroupingEnabled())) {
+    return { ok: false, error: "disabled", message: "AI tab grouping is turned off in options." };
+  }
+  return computeTabGrouping();
+}
+
+async function handleGroupApply(groups) {
+  if (!(await aiGroupingEnabled())) {
+    return { ok: false, error: "disabled", message: "AI tab grouping is turned off in options." };
+  }
+  const normalized = Array.isArray(groups)
+    ? groups
+        .filter((group) => isRecord(group) && typeof group.topic === "string" && Array.isArray(group.tabs))
+        .map((group) => ({
+          topic: group.topic,
+          color: group.color,
+          tabs: group.tabs.filter((tab) => isRecord(tab) && typeof tab.id === "number"),
+        }))
+    : [];
+  if (normalized.length === 0) {
+    return { ok: false, error: "no_groups", message: "Nothing to apply." };
+  }
+
+  const outcome = await applyTabGrouping(normalized);
+  const ok = outcome.failures.length === 0;
+  await updateBadge(ok ? "AI" : "!", ok ? "#00C853" : "#FF9800");
+  await notify({
+    type: "basic",
+    title: "AI Tab Groups",
+    message: ok
+      ? `Created ${outcome.applied.length} group(s): ${outcome.applied.join(", ")}`
+      : `Created ${outcome.applied.length}; failed: ${outcome.failures.join(", ")}`,
+  });
+  return { ok, applied: outcome.applied, failures: outcome.failures };
 }
 
 browser.alarms.onAlarm.addListener((alarm) => {
