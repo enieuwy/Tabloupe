@@ -528,8 +528,9 @@ function requestTabGrouping(tabsPayload) {
 }
 
 function isUngroupedTab(tab) {
-  // Firefox reports groupId === -1 for tabs that are not in any group.
-  return tab.groupId === undefined || tab.groupId === null || tab.groupId === -1;
+  // Firefox (139+) reports groupId === -1 for tabs not in any group. Fail closed:
+  // an unknown group state is treated as grouped and left untouched.
+  return tab.groupId === -1;
 }
 
 async function collectGroupableTabs() {
@@ -549,6 +550,7 @@ function mapProposalToGroups(proposalGroups, candidates) {
     return [];
   }
   const groups = [];
+  const seen = new Set();
   let colorIndex = 0;
   for (const proposal of proposalGroups) {
     if (!isRecord(proposal) || typeof proposal.topic !== "string") {
@@ -561,8 +563,12 @@ function mapProposalToGroups(proposalGroups, candidates) {
     const indices = Array.isArray(proposal.tabIndices) ? proposal.tabIndices : [];
     const tabs = [];
     for (const index of indices) {
+      if (!Number.isInteger(index) || index < 0 || index >= candidates.length || seen.has(index)) {
+        continue;
+      }
       const tab = candidates[index];
       if (tab && typeof tab.id === "number") {
+        seen.add(index);
         tabs.push({ id: tab.id, title: typeof tab.title === "string" && tab.title !== "" ? tab.title : tab.url });
       }
     }
@@ -661,17 +667,20 @@ async function handleGroupApply(groups) {
   if (!(await aiGroupingEnabled())) {
     return { ok: false, error: "disabled", message: "AI tab grouping is turned off in options." };
   }
-  const normalized = Array.isArray(groups)
-    ? groups
-        .filter((group) => isRecord(group) && typeof group.topic === "string" && Array.isArray(group.tabs))
-        .map((group) => ({
-          topic: group.topic,
-          color: group.color,
-          tabs: group.tabs.filter((tab) => isRecord(tab) && typeof tab.id === "number"),
-        }))
-    : [];
+  // Re-validate against live tab state: between preview and apply a tab may have
+  // been closed, pinned, manually grouped, or navigated off http(s). Only group
+  // ids that are still groupable right now.
+  const groupableIds = new Set((await collectGroupableTabs()).map((tab) => tab.id));
+  const normalized = (Array.isArray(groups) ? groups : [])
+    .filter((group) => isRecord(group) && typeof group.topic === "string" && Array.isArray(group.tabs))
+    .map((group) => ({
+      topic: group.topic,
+      color: group.color,
+      tabs: group.tabs.filter((tab) => isRecord(tab) && typeof tab.id === "number" && groupableIds.has(tab.id)),
+    }))
+    .filter((group) => group.tabs.length > 0);
   if (normalized.length === 0) {
-    return { ok: false, error: "no_groups", message: "Nothing to apply." };
+    return { ok: false, error: "no_groups", message: "Those tabs are no longer available to group." };
   }
 
   const outcome = await applyTabGrouping(normalized);

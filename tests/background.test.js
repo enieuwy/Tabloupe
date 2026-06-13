@@ -812,3 +812,55 @@ test("grouping responses are not mistaken for focus updates", async () => {
   await harness.context.handleMessage({ data: JSON.stringify({ focus: "com.apple.focus.work" }) });
   assert.equal(harness.storageData.lastAction, "applied");
 });
+
+test("AI preview rejects with grouping_timeout when the daemon never replies", async () => {
+  const harness = createHarness({ storage: { aiGroupingEnabled: true }, tabs: ungroupedTabs() });
+  await settle();
+
+  const promise = harness.messageListeners[0]({ type: "ai-group-preview" });
+  await settle();
+  const entry = [...harness.timers.entries()].find(([, timer]) => timer.delay === 30000);
+  assert.ok(entry, "grouping timeout timer scheduled");
+  harness.runTimer(entry[0]);
+  const result = await promise;
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "grouping_timeout");
+});
+
+test("AI preview drops out-of-range and cross-group duplicate indices", async () => {
+  const harness = createHarness({ storage: { aiGroupingEnabled: true }, tabs: ungroupedTabs() });
+  await settle();
+
+  const result = await driveGrouping(harness, { type: "ai-group-preview" }, {
+    ok: true,
+    groups: [
+      { topic: "A", tabIndices: [0, 0, 99] },
+      { topic: "B", tabIndices: [0, 1] },
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.groups.length, 2);
+  assert.equal(result.groups[0].tabs.map((tab) => tab.id).join(","), "10");
+  assert.equal(result.groups[1].tabs.map((tab) => tab.id).join(","), "11");
+});
+
+test("AI apply skips tabs that became ungroupable after preview", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true },
+    tabs: [
+      { id: 10, url: "https://a.com", title: "A", groupId: -1 },
+      { id: 11, url: "https://b.com", title: "B", groupId: -1 },
+    ],
+  });
+  await settle();
+
+  harness.tabState.find((tab) => tab.id === 11).pinned = true; // pinned after preview
+  const groups = [{ topic: "Work", color: "blue", tabs: [{ id: 10 }, { id: 11 }] }];
+  const result = await harness.messageListeners[0]({ type: "ai-group-apply", groups });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.groupCreations.length, 1);
+  assert.equal(harness.groupCreations[0].tabIds.join(","), "10");
+});
