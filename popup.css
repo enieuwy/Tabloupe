@@ -1,0 +1,128 @@
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  width: 320px;
+  padding: 12px 14px 14px;
+  font: 13px/1.4 system-ui, sans-serif;
+  background: Canvas;
+  color: CanvasText;
+}
+
+.popup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.toggle input {
+  margin: 0;
+}
+
+.summary {
+  margin: 0 0 8px;
+  color: GrayText;
+}
+
+.groups {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 8px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.group {
+  border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+  border-left-width: 4px;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.group h2 {
+  margin: 0 0 4px;
+  font-size: 13px;
+}
+
+.group ul {
+  margin: 0;
+  padding-left: 16px;
+  color: GrayText;
+  font-size: 12px;
+}
+
+.group li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status {
+  margin: 0 0 8px;
+  min-height: 1em;
+  color: GrayText;
+}
+
+.status.error {
+  color: #d70022;
+}
+
+.status.ok {
+  color: #008787;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+button {
+  flex: 1 1 auto;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: #0060df;
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #0250bb;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.secondary {
+  background: color-mix(in srgb, CanvasText 12%, transparent);
+  color: CanvasText;
+}
+
+.options-link {
+  display: inline-block;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #0060df;
+}
