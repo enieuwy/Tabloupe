@@ -26,6 +26,11 @@ let reconnectTimer = null;
 let messageQueue = Promise.resolve();
 let groupingRequestSeq = 0;
 const pendingGroupingRequests = new Map();
+// Per-window cache of the last preview so the ephemeral popup can show a result
+// instantly on reopen (and survive being closed mid-compute). Cleared on apply,
+// dismiss, window close, or TTL expiry.
+const PROPOSAL_TTL_MS = 5 * 60 * 1000;
+const lastProposalByWindow = new Map();
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -182,14 +187,26 @@ browser.runtime.onMessage.addListener((message) => {
       })
     );
   }
+  if (message && message.type === "ai-group-state") {
+    return handleGroupState(message.windowId);
+  }
   if (message && message.type === "ai-group-preview") {
-    return handleGroupPreview();
+    return handleGroupPreview(message.windowId);
   }
   if (message && message.type === "ai-group-apply") {
-    return handleGroupApply(message.groups);
+    return handleGroupApply(message.windowId, message.groups);
+  }
+  if (message && message.type === "ai-group-clear") {
+    return Promise.resolve(handleGroupClear(message.windowId));
   }
   return false;
 });
+
+if (browser.windows && browser.windows.onRemoved) {
+  browser.windows.onRemoved.addListener((windowId) => {
+    lastProposalByWindow.delete(windowId);
+  });
+}
 
 browser.notifications.onClicked.addListener((notificationId) => {
   if (notificationId.startsWith(OPTIONS_NOTIFICATION_PREFIX)) {
@@ -533,8 +550,9 @@ function isUngroupedTab(tab) {
   return tab.groupId === -1;
 }
 
-async function collectGroupableTabs() {
-  const tabs = await browser.tabs.query({ windowId: browser.windows.WINDOW_ID_CURRENT });
+async function collectGroupableTabs(windowId) {
+  const targetWindow = typeof windowId === "number" ? windowId : browser.windows.WINDOW_ID_CURRENT;
+  const tabs = await browser.tabs.query({ windowId: targetWindow });
   // Only touch ungrouped, non-pinned web tabs so existing manual groups and
   // privileged pages (about:, moz-extension:, …) are never disturbed.
   return tabs.filter((tab) =>
@@ -596,8 +614,8 @@ function describeGroupingError(code) {
   }
 }
 
-async function computeTabGrouping() {
-  const candidates = await collectGroupableTabs();
+async function computeTabGrouping(windowId) {
+  const candidates = await collectGroupableTabs(windowId);
   if (candidates.length < 2) {
     return { ok: false, error: "not_enough_tabs", message: "Open at least 2 ungrouped tabs to organize." };
   }
@@ -656,21 +674,52 @@ async function aiGroupingEnabled() {
   return stored[AI_GROUPING_ENABLED_KEY] === true;
 }
 
-async function handleGroupPreview() {
-  if (!(await aiGroupingEnabled())) {
-    return { ok: false, error: "disabled", message: "AI tab grouping is turned off in options." };
+function cachedProposal(windowId) {
+  const entry = lastProposalByWindow.get(windowId);
+  if (!entry) {
+    return null;
   }
-  return computeTabGrouping();
+  if (Date.now() - entry.ts > PROPOSAL_TTL_MS) {
+    lastProposalByWindow.delete(windowId);
+    return null;
+  }
+  return entry.groups;
 }
 
-async function handleGroupApply(groups) {
+async function handleGroupState(windowId) {
+  const [enabled, candidates] = await Promise.all([
+    aiGroupingEnabled(),
+    collectGroupableTabs(windowId),
+  ]);
+  return { enabled, groupableCount: candidates.length, proposal: cachedProposal(windowId) };
+}
+
+function handleGroupClear(windowId) {
+  if (typeof windowId === "number") {
+    lastProposalByWindow.delete(windowId);
+  }
+  return { ok: true };
+}
+
+async function handleGroupPreview(windowId) {
   if (!(await aiGroupingEnabled())) {
-    return { ok: false, error: "disabled", message: "AI tab grouping is turned off in options." };
+    return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
+  }
+  const result = await computeTabGrouping(windowId);
+  if (result.ok && typeof windowId === "number") {
+    lastProposalByWindow.set(windowId, { groups: result.groups, ts: Date.now() });
+  }
+  return result;
+}
+
+async function handleGroupApply(windowId, groups) {
+  if (!(await aiGroupingEnabled())) {
+    return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
   }
   // Re-validate against live tab state: between preview and apply a tab may have
   // been closed, pinned, manually grouped, or navigated off http(s). Only group
   // ids that are still groupable right now.
-  const groupableIds = new Set((await collectGroupableTabs()).map((tab) => tab.id));
+  const groupableIds = new Set((await collectGroupableTabs(windowId)).map((tab) => tab.id));
   const normalized = (Array.isArray(groups) ? groups : [])
     .filter((group) => isRecord(group) && typeof group.topic === "string" && Array.isArray(group.tabs))
     .map((group) => ({
@@ -685,6 +734,9 @@ async function handleGroupApply(groups) {
 
   const outcome = await applyTabGrouping(normalized);
   const ok = outcome.failures.length === 0;
+  if (ok && typeof windowId === "number") {
+    lastProposalByWindow.delete(windowId);
+  }
   await updateBadge(ok ? "AI" : "!", ok ? "#00C853" : "#FF9800");
   await notify({
     type: "basic",

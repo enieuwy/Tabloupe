@@ -864,3 +864,92 @@ test("AI apply skips tabs that became ungroupable after preview", async () => {
   assert.equal(harness.groupCreations.length, 1);
   assert.equal(harness.groupCreations[0].tabIds.join(","), "10");
 });
+
+test("ai-group-state reports enabled flag, groupable count, and no initial proposal", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true },
+    tabs: [
+      { id: 10, url: "https://a.com", title: "A", groupId: -1, windowId: 3 },
+      { id: 11, url: "https://b.com", title: "B", groupId: -1, windowId: 3 },
+      { id: 12, url: "about:config", title: "C", groupId: -1, windowId: 3 },
+    ],
+  });
+  await settle();
+
+  const state = await harness.messageListeners[0]({ type: "ai-group-state", windowId: 3 });
+  assert.equal(state.enabled, true);
+  assert.equal(state.groupableCount, 2); // about: page excluded
+  assert.equal(state.proposal, null);
+});
+
+test("preview caches the proposal per window and apply clears it", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true },
+    tabs: [
+      { id: 10, url: "https://a.com", title: "A", groupId: -1, windowId: 5 },
+      { id: 11, url: "https://b.com", title: "B", groupId: -1, windowId: 5 },
+    ],
+  });
+  await settle();
+
+  const preview = await driveGrouping(harness, { type: "ai-group-preview", windowId: 5 }, {
+    ok: true,
+    groups: [{ topic: "T", tabIndices: [0, 1] }],
+  });
+  assert.equal(preview.ok, true);
+
+  // The proposal is now cached for window 5...
+  const cached = await harness.messageListeners[0]({ type: "ai-group-state", windowId: 5 });
+  assert.ok(cached.proposal);
+  assert.equal(cached.proposal[0].topic, "T");
+
+  // ...but not for a different window.
+  const other = await harness.messageListeners[0]({ type: "ai-group-state", windowId: 9 });
+  assert.equal(other.proposal, null);
+
+  // Applying clears the cache for that window.
+  const apply = await harness.messageListeners[0]({ type: "ai-group-apply", windowId: 5, groups: cached.proposal });
+  assert.equal(apply.ok, true);
+  const afterApply = await harness.messageListeners[0]({ type: "ai-group-state", windowId: 5 });
+  assert.equal(afterApply.proposal, null);
+});
+
+test("ai-group-clear drops the cached proposal", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true },
+    tabs: [
+      { id: 10, url: "https://a.com", title: "A", groupId: -1, windowId: 5 },
+      { id: 11, url: "https://b.com", title: "B", groupId: -1, windowId: 5 },
+    ],
+  });
+  await settle();
+
+  await driveGrouping(harness, { type: "ai-group-preview", windowId: 5 }, {
+    ok: true,
+    groups: [{ topic: "T", tabIndices: [0, 1] }],
+  });
+  const cleared = await harness.messageListeners[0]({ type: "ai-group-clear", windowId: 5 });
+  assert.equal(cleared.ok, true);
+
+  const state = await harness.messageListeners[0]({ type: "ai-group-state", windowId: 5 });
+  assert.equal(state.proposal, null);
+});
+
+test("preview targets the requested window only", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true },
+    tabs: [
+      { id: 10, url: "https://a.com", title: "A", groupId: -1, windowId: 5 },
+      { id: 11, url: "https://b.com", title: "B", groupId: -1, windowId: 5 },
+      { id: 20, url: "https://c.com", title: "C", groupId: -1, windowId: 6 },
+    ],
+  });
+  await settle();
+
+  await driveGrouping(harness, { type: "ai-group-preview", windowId: 5 }, {
+    ok: true,
+    groups: [{ topic: "T", tabIndices: [0, 1] }],
+  });
+  const sent = harness.sentMessages.find((frame) => frame.type === "groupTabs");
+  assert.deepEqual(sent.tabs.map((tab) => tab.url), ["https://a.com", "https://b.com"]);
+});

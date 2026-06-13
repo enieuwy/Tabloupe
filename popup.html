@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+  <script defer src="popup.js"></script>
+</head>
+<body>
+  <header class="popup-header">
+    <h1>AI Tab Groups</h1>
+    <label class="toggle">
+      <input id="ai-enabled" type="checkbox">
+      <span>Enabled</span>
+    </label>
+  </header>
+
+  <p id="ai-summary" class="summary"></p>
+
+  <div id="ai-groups" class="groups" hidden></div>
+
+  <p id="ai-status" class="status" role="status" aria-live="polite"></p>
+
+  <div class="actions">
+    <button id="ai-apply" type="button" hidden>Apply</button>
+    <button id="ai-regroup" type="button" class="secondary" hidden>Regroup</button>
+    <button id="ai-dismiss" type="button" class="secondary" hidden>Dismiss</button>
+    <button id="ai-organize" type="button" hidden>Organize tabs</button>
+  </div>
+
+  <a id="ai-options" href="#" class="options-link">Open options</a>
+</body>
+</html>

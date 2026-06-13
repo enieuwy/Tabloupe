@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Focus Tab Groups",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Collapses and expands Firefox tab groups based on macOS Focus mode via mac-command-centre.",
   "browser_specific_settings": {
     "gecko": {
@@ -27,7 +27,8 @@
     "open_in_tab": true
   },
   "browser_action": {
-    "default_title": "Focus Tab Groups"
+    "default_title": "Focus Tab Groups",
+    "default_popup": "popup.html"
   },
   "background": {
     "scripts": [
