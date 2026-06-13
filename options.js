@@ -19,6 +19,7 @@ const STORAGE_KEYS = [
   "expandedGroups",
   "collapsedGroups",
   "updateFailures",
+  "aiGroupingEnabled",
 ];
 
 const state = {
@@ -34,10 +35,12 @@ const state = {
   expandedGroups: [],
   collapsedGroups: [],
   updateFailures: [],
+  aiGroupingEnabled: false,
 };
 
 let draftMappings = {};
 let dirty = false;
+let aiPreviewGroups = null;
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -115,6 +118,7 @@ async function loadAll() {
   state.expandedGroups = normalizeStringArray(stored.expandedGroups);
   state.collapsedGroups = normalizeStringArray(stored.collapsedGroups);
   state.updateFailures = normalizeStringArray(stored.updateFailures);
+  state.aiGroupingEnabled = stored.aiGroupingEnabled === true;
   if (!dirty) {
     draftMappings = { ...state.focusMappings };
   }
@@ -298,6 +302,122 @@ function render() {
   renderMappings();
   renderDiagnostics();
   renderCallout();
+  renderAiGrouping();
+}
+
+const TAB_GROUP_COLOR_HEX = {
+  blue: "#0a84ff",
+  cyan: "#22b8cf",
+  green: "#34c759",
+  orange: "#ff9f0a",
+  pink: "#ff2d92",
+  purple: "#bf5af2",
+  red: "#ff3b30",
+  yellow: "#ffd60a",
+};
+
+function setAiStatus(message, kind = "") {
+  const el = document.getElementById("ai-status");
+  el.textContent = message;
+  el.className = kind;
+}
+
+function renderAiGrouping() {
+  const enabledBox = document.getElementById("ai-enabled");
+  if (enabledBox) {
+    enabledBox.checked = state.aiGroupingEnabled === true;
+  }
+  const previewBtn = document.getElementById("ai-preview");
+  if (previewBtn) {
+    previewBtn.disabled = state.aiGroupingEnabled !== true;
+  }
+}
+
+function renderAiPreview() {
+  const container = document.getElementById("ai-preview-result");
+  const list = document.getElementById("ai-preview-list");
+  list.textContent = "";
+  if (!Array.isArray(aiPreviewGroups) || aiPreviewGroups.length === 0) {
+    container.hidden = true;
+    return;
+  }
+  for (const group of aiPreviewGroups) {
+    const item = document.createElement("li");
+    item.className = "ai-group";
+    const hex = TAB_GROUP_COLOR_HEX[group.color];
+    if (hex) {
+      item.style.borderLeftColor = hex;
+    }
+    const heading = document.createElement("h3");
+    heading.textContent = `${group.topic} (${group.tabs.length})`;
+    item.appendChild(heading);
+    const tabList = document.createElement("ul");
+    for (const tab of group.tabs) {
+      const tabItem = document.createElement("li");
+      tabItem.textContent = tab.title;
+      tabList.appendChild(tabItem);
+    }
+    item.appendChild(tabList);
+    list.appendChild(item);
+  }
+  container.hidden = false;
+}
+
+async function toggleAiGrouping(enabled) {
+  await browser.storage.local.set({ aiGroupingEnabled: enabled === true });
+}
+
+async function previewAiGroups() {
+  setAiStatus("Organizing tabs…");
+  aiPreviewGroups = null;
+  renderAiPreview();
+  let result;
+  try {
+    result = await browser.runtime.sendMessage({ type: "ai-group-preview" });
+  } catch (error) {
+    console.error("AI preview failed:", error);
+    setAiStatus("Preview failed. See extension console.", "error");
+    return;
+  }
+  if (!result || result.ok !== true) {
+    setAiStatus((result && result.message) || "Could not organize tabs.", "error");
+    return;
+  }
+  aiPreviewGroups = result.groups;
+  renderAiPreview();
+  setAiStatus(`Proposed ${result.groups.length} group(s). Review, then apply.`, "ok");
+}
+
+async function applyAiGroups() {
+  if (!Array.isArray(aiPreviewGroups) || aiPreviewGroups.length === 0) {
+    return;
+  }
+  setAiStatus("Applying…");
+  let result;
+  try {
+    result = await browser.runtime.sendMessage({ type: "ai-group-apply", groups: aiPreviewGroups });
+  } catch (error) {
+    console.error("AI apply failed:", error);
+    setAiStatus("Apply failed. See extension console.", "error");
+    return;
+  }
+  if (!result || result.ok !== true) {
+    const failed = (result && result.failures) || [];
+    setAiStatus((result && result.message) || `Some groups failed: ${failed.join(", ")}`, "error");
+    return;
+  }
+  aiPreviewGroups = null;
+  renderAiPreview();
+  setAiStatus(`Created ${result.applied.length} group(s).`, "ok");
+  refreshFirefoxGroups().catch((error) => {
+    console.error("Firefox tab group refresh failed:", error);
+  });
+}
+
+function dismissAiPreview() {
+  aiPreviewGroups = null;
+  renderAiPreview();
+  setAiStatus("");
 }
 
 function buildMappingsForSave() {
@@ -383,6 +503,9 @@ function applyStorageChange(changes) {
   if (changes.updateFailures) {
     state.updateFailures = normalizeStringArray(changes.updateFailures.newValue);
   }
+  if (changes.aiGroupingEnabled) {
+    state.aiGroupingEnabled = changes.aiGroupingEnabled.newValue === true;
+  }
   render();
 }
 
@@ -420,6 +543,22 @@ document.addEventListener("DOMContentLoaded", () => {
     titleInput.focus();
     idInput.scrollIntoView({ behavior: "smooth", block: "center" });
   });
+
+  document.getElementById("ai-enabled").addEventListener("change", (event) => {
+    toggleAiGrouping(event.target.checked).catch((error) => {
+      console.error("AI toggle failed:", error);
+    });
+  });
+
+  document.getElementById("ai-preview").addEventListener("click", () => {
+    previewAiGroups();
+  });
+
+  document.getElementById("ai-apply").addEventListener("click", () => {
+    applyAiGroups();
+  });
+
+  document.getElementById("ai-discard").addEventListener("click", dismissAiPreview);
 
   browser.storage.onChanged.addListener((changes, areaName) => {
     if (areaName === "local") {
