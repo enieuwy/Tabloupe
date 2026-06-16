@@ -1,14 +1,34 @@
 :root {
   color-scheme: light dark;
+  font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+
+  --bg: #ffffff;
+  --fg: #15141a;
+  --muted: #5b5b66;
+  --faint: #8f8f9d;
+  --surface: #f4f4f8;
+  --surface-2: #e7e7ef;
+  --border: #e2e2ea;
+  --accent: #0060df;
+  --accent-hover: #0250bb;
+  --accent-fg: #ffffff;
+  --accent-text: #0060df;
+  --ok: #007a7a;
+  --danger: #d70022;
+  --radius: 10px;
+  --radius-sm: 7px;
+}
+
+* {
+  box-sizing: border-box;
 }
 
 body {
   margin: 0;
   width: 320px;
-  padding: 12px 14px 14px;
-  font: 13px/1.4 system-ui, sans-serif;
-  background: Canvas;
-  color: CanvasText;
+  padding: 14px;
+  background: var(--bg);
+  color: var(--fg);
 }
 
 .popup-header {
@@ -16,12 +36,14 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-bottom: 8px;
+  margin-bottom: 12px;
 }
 
 h1 {
   margin: 0;
   font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
 }
 
 .toggle {
@@ -29,44 +51,62 @@ h1 {
   align-items: center;
   gap: 6px;
   font-size: 12px;
+  color: var(--muted);
   cursor: pointer;
   white-space: nowrap;
+  user-select: none;
 }
 
 .toggle input {
   margin: 0;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .summary {
-  margin: 0 0 8px;
-  color: GrayText;
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.groups[hidden] {
+  display: none;
 }
 
 .groups {
   display: grid;
   gap: 8px;
-  margin-bottom: 8px;
-  max-height: 320px;
+  margin-bottom: 10px;
+  max-height: 340px;
   overflow-y: auto;
+  scrollbar-width: thin;
 }
 
 .group {
-  border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
-  border-left-width: 4px;
-  border-radius: 8px;
-  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--border);
+  border-radius: var(--radius);
+  padding: 9px 11px;
 }
 
 .group h2 {
-  margin: 0 0 4px;
-  font-size: 13px;
+  margin: 0 0 5px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg);
 }
 
 .group ul {
   margin: 0;
-  padding-left: 16px;
-  color: GrayText;
-  font-size: 12px;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 2px;
+  color: var(--muted);
+  font-size: 11.5px;
 }
 
 .group li {
@@ -76,17 +116,18 @@ h1 {
 }
 
 .status {
-  margin: 0 0 8px;
+  margin: 0 0 10px;
   min-height: 1em;
-  color: GrayText;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .status.error {
-  color: #d70022;
+  color: var(--danger);
 }
 
 .status.ok {
-  color: #008787;
+  color: var(--ok);
 }
 
 .actions {
@@ -97,17 +138,20 @@ h1 {
 
 button {
   flex: 1 1 auto;
-  padding: 7px 10px;
-  border: 0;
-  border-radius: 6px;
-  background: #0060df;
-  color: #fff;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-fg);
+  font: inherit;
   font-size: 13px;
+  font-weight: 600;
   cursor: pointer;
+  transition: background 0.12s ease;
 }
 
 button:hover:not(:disabled) {
-  background: #0250bb;
+  background: var(--accent-hover);
 }
 
 button:disabled {
@@ -116,13 +160,45 @@ button:disabled {
 }
 
 button.secondary {
-  background: color-mix(in srgb, CanvasText 12%, transparent);
-  color: CanvasText;
+  background: var(--surface-2);
+  color: var(--fg);
+  border-color: var(--border);
+}
+
+button.secondary:hover:not(:disabled) {
+  background: var(--border);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .options-link {
   display: inline-block;
-  margin-top: 10px;
+  margin-top: 12px;
   font-size: 12px;
-  color: #0060df;
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+.options-link:hover {
+  text-decoration: underline;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1b22;
+    --fg: #fbfbfe;
+    --muted: #c0bfca;
+    --faint: #8a8896;
+    --surface: #2b2a33;
+    --surface-2: #42414d;
+    --border: #42414d;
+    --accent: #0a84ff;
+    --accent-hover: #2b95ff;
+    --accent-text: #7cc4ff;
+    --ok: #54d6c9;
+    --danger: #ff7aa8;
+  }
 }
