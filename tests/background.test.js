@@ -422,6 +422,59 @@ test("mapped raw Focus ID records raw diagnostics and applies mapped tab group",
   assert.deepEqual(harness.storageData.collapsedGroups, ["Other"]);
 });
 
+test("focusCatalog envelope caches the id -> {name, icon, color} table", async () => {
+  const harness = createHarness(twoGroups());
+  await settle();
+
+  await harness.context.handleMessage({ data: JSON.stringify({
+    type: "focusCatalog",
+    schemaVersion: 1,
+    ts: 0,
+    payload: { entries: {
+      "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#c678dd" },
+      "com.apple.focus.custom": { name: "Custom", icon: "target", color: null },
+    } },
+  }) });
+
+  assert.deepEqual(harness.storageData.focusCatalog["com.apple.focus.work"], { name: "Work", icon: "briefcase", color: "#c678dd" });
+  assert.equal(harness.storageData.focusCatalog["com.apple.focus.custom"].name, "Custom");
+});
+
+test("enriched focus object applies grouping and caches its catalog entry", async () => {
+  const harness = createHarness(twoGroups());
+  await settle();
+
+  await harness.context.handleMessage({ data: JSON.stringify({
+    type: "focus",
+    schemaVersion: 1,
+    ts: 0,
+    payload: { focus: { id: "com.apple.focus.work", name: "Work", icon: "briefcase", color: "#c678dd" } },
+  }) });
+
+  assert.equal(harness.storageData.lastFocusSeen, "com.apple.focus.work");
+  assert.equal(harness.storageData.lastAction, "applied");
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, false);
+  assert.equal(harness.storageData.focusCatalog["com.apple.focus.work"].name, "Work");
+  const titles = harness.notifications.map((args) => (args.length === 2 ? args[1] : args[0]).title);
+  assert.ok(titles.includes("Focus: Work"), `expected a "Focus: Work" notification, got ${JSON.stringify(titles)}`);
+});
+
+test("the success notification names the Focus from the cached catalog for a bare id", async () => {
+  const harness = createHarness({
+    ...twoGroups(),
+    storage: {
+      focusMappings: { ...DEFAULT_MAPPINGS },
+      focusCatalog: { "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#c678dd" } },
+    },
+  });
+  await settle();
+
+  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: "com.apple.focus.work" } }) });
+
+  const titles = harness.notifications.map((args) => (args.length === 2 ? args[1] : args[0]).title);
+  assert.ok(titles.includes("Focus: Work"), `expected a "Focus: Work" notification, got ${JSON.stringify(titles)}`);
+});
+
 test("null Focus expands every tab group", async () => {
   const harness = createHarness({
     groups: [

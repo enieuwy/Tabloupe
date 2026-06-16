@@ -149,18 +149,69 @@ async function applyRawFocus(rawId, { force = false } = {}) {
     lastDispatchedRawId = rawId;
   }
 }
+// MCC owns the Focus catalog (id -> {name, icon, color}); cache what it
+// broadcasts so the options UI and the badge can show names without hardcoding.
+async function mergeFocusCatalog(entries) {
+  if (!isRecord(entries)) {
+    return;
+  }
+  const stored = await browser.storage.local.get("focusCatalog");
+  const catalog = isRecord(stored.focusCatalog) ? { ...stored.focusCatalog } : {};
+  let changed = false;
+  for (const [id, entry] of Object.entries(entries)) {
+    if (typeof id === "string" && isRecord(entry) && typeof entry.name === "string") {
+      catalog[id] = {
+        name: entry.name,
+        icon: typeof entry.icon === "string" ? entry.icon : "target",
+        color: typeof entry.color === "string" ? entry.color : null,
+      };
+      changed = true;
+    }
+  }
+  if (changed) {
+    await browser.storage.local.set({ focusCatalog: catalog });
+  }
+}
+
+async function focusDisplayName(rawId) {
+  if (rawId === null) {
+    return null;
+  }
+  const stored = await browser.storage.local.get("focusCatalog");
+  const catalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
+  const entry = catalog[rawId];
+  return entry && typeof entry.name === "string" && entry.name ? entry.name : rawId;
+}
 
 async function handleMessage(event) {
   const msg = JSON.parse(event.data);
   // MCC multiplexes several state subsystems on this socket (focus, bluetooth,
   // wireguard, ...), each wrapped in a StateEnvelope { type, schemaVersion, ts,
-  // payload }. Only focus envelopes drive tab grouping; ignore everything else
-  // so an unrelated state change can't reset focus and expand all groups.
-  if (!isRecord(msg) || msg.type !== "focus") {
+  // payload }. Focus envelopes drive tab grouping; focusCatalog carries the
+  // id -> {name, icon, color} table. Ignore everything else so an unrelated
+  // state change can't reset focus and expand all groups.
+  if (!isRecord(msg)) {
+    return;
+  }
+  if (msg.type === "focusCatalog") {
+    const payload = isRecord(msg.payload) ? msg.payload : {};
+    await mergeFocusCatalog(payload.entries);
+    return;
+  }
+  if (msg.type !== "focus") {
     return;
   }
   const payload = isRecord(msg.payload) ? msg.payload : {};
-  const rawId = typeof payload.focus === "string" ? payload.focus : null;
+  // payload.focus is null (off), a {id, name, icon, color} object (current MCC),
+  // or a bare id string (older MCC) — accept all three.
+  const focus = payload.focus;
+  let rawId = null;
+  if (typeof focus === "string") {
+    rawId = focus;
+  } else if (isRecord(focus) && typeof focus.id === "string") {
+    rawId = focus.id;
+    await mergeFocusCatalog({ [focus.id]: focus });
+  }
 
   await recordSeen(rawId);
   await applyRawFocus(rawId);
@@ -389,6 +440,7 @@ async function applyFocus(titles, { rawId }) {
   await browser.storage.local.set({
     groupTitles: allGroups.map((group) => group.title),
   });
+  const focusName = rawId !== null ? await focusDisplayName(rawId) : null;
 
   const groupList = allGroups.map((group) =>
     `${group.title} (${group.collapsed ? "collapsed" : "expanded"})`
@@ -423,7 +475,7 @@ async function applyFocus(titles, { rawId }) {
     await notify({
       type: "basic",
       title: "Focus Tab Groups",
-      message: `Unmapped Focus mode ${rawId} — click this notification to open Focus Tab Groups options and assign it`,
+      message: `Unmapped Focus mode ${focusName} — click this notification to open Focus Tab Groups options and assign it`,
     }, notificationId);
     return true;
   }
@@ -514,7 +566,7 @@ async function applyFocus(titles, { rawId }) {
   const lastAction = updateFailures.length === 0 ? "applied" : "applied_with_errors";
 
   await updateBadge(
-    updateFailures.length === 0 ? matching[0].title.substring(0, 1).toUpperCase() : "!",
+    updateFailures.length === 0 ? focusName.substring(0, 1).toUpperCase() : "!",
     updateFailures.length === 0 ? "#00C853" : "#FF9800",
   );
 
@@ -532,7 +584,7 @@ async function applyFocus(titles, { rawId }) {
 
   await notify({
     type: "basic",
-    title: `Focus: ${titlesText}`,
+    title: `Focus: ${focusName}`,
     message: `Expanded: ${expanded}\nCollapsed: ${collapsed}${failureText}`,
   });
   return updateFailures.length === 0;

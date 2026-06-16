@@ -24,6 +24,7 @@ const STORAGE_KEYS = [
   "updateFailures",
   "tabSearchShortcut",
   "aiProvider",
+  "focusCatalog",
 ];
 
 const state = {
@@ -41,6 +42,7 @@ const state = {
   updateFailures: [],
   tabSearchShortcut: { ...DEFAULT_TAB_SEARCH_SHORTCUT },
   aiProvider: { kind: "foundation" },
+  focusCatalog: {},
 };
 
 let draftMappings = {};
@@ -183,6 +185,7 @@ async function loadAll() {
     ? normalizeShortcut(stored.tabSearchShortcut)
     : { ...DEFAULT_TAB_SEARCH_SHORTCUT };
   state.aiProvider = normalizeProvider(stored.aiProvider);
+  state.focusCatalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
   if (!dirty) {
     draftMappings = cloneMappings(state.focusMappings);
   }
@@ -243,10 +246,11 @@ const TRASH_ICON =
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>';
 
-// ── Focus catalog (extension-bundled; mirrors SketchyBar's icons/names) ──
-// Maps a raw Apple Focus id to a display name, a semantic icon, and an accent.
-// The source of truth can later move into MCC's broadcast; the UI only depends
-// on focusCatalogEntry().
+// ── Focus catalog fallback (bundled) ──
+// MCC is the source of truth: it broadcasts id -> {name, icon, color}, which we
+// cache in storage (state.focusCatalog) and prefer here. This bundled table is
+// only a fallback for ids the daemon has not sent yet (daemon down / fresh
+// start). The UI only depends on focusCatalogEntry().
 const FOCUS_CATALOG = {
   "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#c678dd" },
   "com.apple.focus.personal-time": { name: "Personal", icon: "person", color: "#c678dd" },
@@ -267,6 +271,14 @@ const FOCUS_ICON_PATHS = {
 };
 
 function focusCatalogEntry(id) {
+  const cached = state.focusCatalog[id];
+  if (cached && typeof cached.name === "string" && cached.name) {
+    return {
+      name: cached.name,
+      icon: typeof cached.icon === "string" ? cached.icon : "target",
+      color: typeof cached.color === "string" ? cached.color : null,
+    };
+  }
   return FOCUS_CATALOG[id] || { name: id, icon: "target", color: null };
 }
 
@@ -320,6 +332,81 @@ function removeTitleFromFocus(id, title) {
   renderMappings();
 }
 
+let dragState = null;
+
+// Move a group title between Focus rows. fromId null = it came from the
+// unassigned bucket. Move semantics: the title is removed from its source row.
+function moveTitleToFocus(title, fromId, toId) {
+  const clean = (title || "").trim();
+  if (!clean || !toId || fromId === toId) return;
+  if (fromId && hasOwn(draftMappings, fromId)) {
+    draftMappings[fromId] = draftMappings[fromId].filter((existing) => existing !== clean);
+  }
+  if (!hasOwn(draftMappings, toId)) draftMappings[toId] = [];
+  if (!draftMappings[toId].includes(clean)) draftMappings[toId].push(clean);
+  markDirty();
+  renderMappings();
+}
+
+function makeDraggable(chip, title, sourceId) {
+  chip.draggable = true;
+  chip.addEventListener("dragstart", (event) => {
+    dragState = { title, sourceId };
+    chip.classList.add("dragging");
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", title);
+    }
+  });
+  chip.addEventListener("dragend", () => {
+    dragState = null;
+    chip.classList.remove("dragging");
+  });
+}
+
+function makeDropTarget(el, onDrop) {
+  el.addEventListener("dragover", (event) => {
+    if (!dragState) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    el.classList.add("drop-target");
+  });
+  el.addEventListener("dragleave", () => el.classList.remove("drop-target"));
+  el.addEventListener("drop", (event) => {
+    event.preventDefault();
+    el.classList.remove("drop-target");
+    if (dragState) onDrop(dragState);
+  });
+}
+
+function makeUnassignedChip(title) {
+  const chip = document.createElement("span");
+  chip.className = "group-chip group-chip-unassigned";
+  const label = document.createElement("span");
+  label.className = "group-chip-label";
+  label.textContent = title;
+  chip.append(label);
+  makeDraggable(chip, title, null);
+  return chip;
+}
+
+function renderUnassigned() {
+  const list = document.getElementById("unassigned-list");
+  if (!list) return;
+  const assigned = assignedTitles();
+  const titles = state.firefoxGroupTitles.filter((title) => !assigned.has(title));
+  if (titles.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "unassigned-empty";
+    empty.textContent = state.firefoxGroupTitles.length === 0
+      ? "No Firefox tab groups found."
+      : "Every tab group is assigned to a Focus mode.";
+    list.replaceChildren(empty);
+    return;
+  }
+  list.replaceChildren(...titles.map((title) => makeUnassignedChip(title)));
+}
+
 function makeChip(id, title) {
   const chip = document.createElement("span");
   chip.className = "group-chip";
@@ -331,8 +418,10 @@ function makeChip(id, title) {
   remove.className = "group-chip-remove";
   remove.setAttribute("aria-label", `Remove ${title}`);
   remove.textContent = "\u00d7";
+  remove.draggable = false;
   remove.addEventListener("click", () => removeTitleFromFocus(id, title));
   chip.append(label, remove);
+  makeDraggable(chip, title, id);
   return chip;
 }
 
@@ -357,6 +446,7 @@ function renderMappings() {
     row.append(cell);
     body.replaceChildren(row);
     refreshUnassignedDatalist();
+    renderUnassigned();
     return;
   }
 
@@ -446,11 +536,13 @@ function renderMappings() {
     actionCell.append(remove);
 
     row.append(idCell, arrowCell, groupsCell, actionCell);
+    makeDropTarget(row, (drag) => moveTitleToFocus(drag.title, drag.sourceId, id));
     return row;
   });
 
   body.replaceChildren(...rows);
   refreshUnassignedDatalist();
+  renderUnassigned();
   if (adderInput) {
     adderInput.focus();
     activeAdderId = null;
@@ -676,6 +768,9 @@ function applyStorageChange(changes) {
   if (changes.aiProvider) {
     state.aiProvider = normalizeProvider(changes.aiProvider.newValue);
   }
+  if (changes.focusCatalog) {
+    state.focusCatalog = isRecord(changes.focusCatalog.newValue) ? changes.focusCatalog.newValue : {};
+  }
   render();
 }
 
@@ -845,6 +940,13 @@ document.addEventListener("DOMContentLoaded", () => {
       console.error("Tab search shortcut disable failed:", error);
     });
   });
+
+  const unassignedList = document.getElementById("unassigned-list");
+  if (unassignedList) {
+    makeDropTarget(unassignedList, (drag) => {
+      if (drag.sourceId) removeTitleFromFocus(drag.sourceId, drag.title);
+    });
+  }
 
   document.getElementById("preset-openai").addEventListener("click", () => applyProviderPreset("openai"));
   document.getElementById("preset-groq").addEventListener("click", () => applyProviderPreset("groq"));

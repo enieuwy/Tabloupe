@@ -787,6 +787,47 @@ input.mono {
   color: var(--faint);
 }
 
+.group-chip[draggable="true"] {
+  cursor: grab;
+}
+
+.group-chip.dragging {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+
+.group-chip-unassigned {
+  padding: 4px 12px;
+  background: var(--surface);
+  border-style: dashed;
+}
+
+tr.drop-target td {
+  background: var(--accent-tint);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.unassigned-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 40px;
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.unassigned-list.drop-target {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+}
+
+.unassigned-empty {
+  font-size: 12px;
+  font-style: italic;
+  color: var(--faint);
+}
+
 .col-action {
   width: 50px;
   text-align: right;
