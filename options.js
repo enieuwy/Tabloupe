@@ -302,16 +302,16 @@ function assignedTitles() {
   return set;
 }
 
-function refreshUnassignedDatalist() {
-  const datalist = document.getElementById("firefox-groups-unassigned");
-  if (!datalist) return;
-  const assigned = assignedTitles();
-  const options = state.firefoxGroupTitles.filter((title) => !assigned.has(title));
-  datalist.replaceChildren(...options.map((title) => {
+function makeRowDatalist(listId, excluded) {
+  const datalist = document.createElement("datalist");
+  datalist.id = listId;
+  const available = state.firefoxGroupTitles.filter((title) => !excluded.includes(title));
+  datalist.replaceChildren(...available.map((title) => {
     const option = document.createElement("option");
     option.value = title;
     return option;
   }));
+  return datalist;
 }
 
 function addTitleToFocus(id, rawTitle) {
@@ -334,8 +334,9 @@ function removeTitleFromFocus(id, title) {
 
 let dragState = null;
 
-// Move a group title between Focus rows. fromId null = it came from the
-// unassigned bucket. Move semantics: the title is removed from its source row.
+// Assign a group title to a Focus row. A truthy fromId removes it from that
+// source row (move); fromId null adds without removing (copy via Alt-drag, or
+// from the unassigned bucket).
 function moveTitleToFocus(title, fromId, toId) {
   const clean = (title || "").trim();
   if (!clean || !toId || fromId === toId) return;
@@ -354,7 +355,7 @@ function makeDraggable(chip, title, sourceId) {
     dragState = { title, sourceId };
     chip.classList.add("dragging");
     if (event.dataTransfer) {
-      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.effectAllowed = "copyMove";
       event.dataTransfer.setData("text/plain", title);
     }
   });
@@ -368,14 +369,14 @@ function makeDropTarget(el, onDrop) {
   el.addEventListener("dragover", (event) => {
     if (!dragState) return;
     event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    if (event.dataTransfer) event.dataTransfer.dropEffect = event.altKey ? "copy" : "move";
     el.classList.add("drop-target");
   });
   el.addEventListener("dragleave", () => el.classList.remove("drop-target"));
   el.addEventListener("drop", (event) => {
     event.preventDefault();
     el.classList.remove("drop-target");
-    if (dragState) onDrop(dragState);
+    if (dragState) onDrop(dragState, event);
   });
 }
 
@@ -476,14 +477,13 @@ function renderMappings() {
     cell.textContent = "No Focus IDs yet. Toggle a macOS Focus mode or add a custom mapping.";
     row.append(cell);
     body.replaceChildren(row, makeUnassignedRow());
-    refreshUnassignedDatalist();
     renderUnassigned();
     return;
   }
 
   let adderInput = null;
 
-  const rows = ids.map((id) => {
+  const rows = ids.map((id, index) => {
     const row = document.createElement("tr");
     const hasMapping = hasOwn(draftMappings, id);
     const titles = hasMapping ? draftMappings[id] : [];
@@ -532,7 +532,7 @@ function renderMappings() {
     const input = document.createElement("input");
     input.type = "text";
     input.className = "group-chip-input";
-    input.setAttribute("list", "firefox-groups-unassigned");
+    input.setAttribute("list", "firefox-groups-row-" + index);
     input.autocomplete = "off";
     input.placeholder = titles.length === 0 ? "+ add tab group" : "+ add";
     input.addEventListener("keydown", (event) => {
@@ -546,6 +546,7 @@ function renderMappings() {
     });
     chips.append(input);
     groupsCell.append(chips);
+    groupsCell.append(makeRowDatalist("firefox-groups-row-" + index, titles));
     if (id === activeAdderId) {
       adderInput = input;
     }
@@ -567,12 +568,11 @@ function renderMappings() {
     actionCell.append(remove);
 
     row.append(idCell, arrowCell, groupsCell, actionCell);
-    makeDropTarget(row, (drag) => moveTitleToFocus(drag.title, drag.sourceId, id));
+    makeDropTarget(row, (drag, event) => moveTitleToFocus(drag.title, event && event.altKey ? null : drag.sourceId, id));
     return row;
   });
 
   body.replaceChildren(...rows, makeUnassignedRow());
-  refreshUnassignedDatalist();
   renderUnassigned();
   if (adderInput) {
     adderInput.focus();
