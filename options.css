@@ -804,22 +804,26 @@ input.mono {
 
 tr.drop-target td {
   background: var(--accent-tint);
-  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+tr.drop-target td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .unassigned-list {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  min-height: 40px;
-  padding: 10px;
-  border: 1px dashed var(--border);
-  border-radius: var(--radius-sm);
+  align-items: center;
 }
 
-.unassigned-list.drop-target {
-  border-color: var(--accent);
-  background: var(--accent-tint);
+.unassigned-row td {
+  border-top: 2px solid var(--border);
+}
+
+.unassigned-label {
+  color: var(--faint);
+  font-weight: 600;
 }
 
 .unassigned-empty {

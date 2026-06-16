@@ -433,6 +433,37 @@ function makeUnseenDot() {
   return dot;
 }
 
+function makeUnassignedRow() {
+  const row = document.createElement("tr");
+  row.className = "unassigned-row";
+
+  const labelCell = document.createElement("td");
+  labelCell.className = "col-focus";
+  const label = document.createElement("span");
+  label.className = "focus-cell unassigned-label";
+  label.textContent = "Unassigned";
+  labelCell.append(label);
+
+  const arrowCell = document.createElement("td");
+  arrowCell.className = "col-arrow";
+
+  const groupsCell = document.createElement("td");
+  groupsCell.className = "col-groups";
+  const list = document.createElement("div");
+  list.id = "unassigned-list";
+  list.className = "unassigned-list";
+  groupsCell.append(list);
+
+  const actionCell = document.createElement("td");
+  actionCell.className = "col-action";
+
+  row.append(labelCell, arrowCell, groupsCell, actionCell);
+  makeDropTarget(row, (drag) => {
+    if (drag.sourceId) removeTitleFromFocus(drag.sourceId, drag.title);
+  });
+  return row;
+}
+
 function renderMappings() {
   const body = document.getElementById("mappings-body");
   const ids = sortedFocusIds();
@@ -444,7 +475,7 @@ function renderMappings() {
     cell.className = "empty-row";
     cell.textContent = "No Focus IDs yet. Toggle a macOS Focus mode or add a custom mapping.";
     row.append(cell);
-    body.replaceChildren(row);
+    body.replaceChildren(row, makeUnassignedRow());
     refreshUnassignedDatalist();
     renderUnassigned();
     return;
@@ -540,7 +571,7 @@ function renderMappings() {
     return row;
   });
 
-  body.replaceChildren(...rows);
+  body.replaceChildren(...rows, makeUnassignedRow());
   refreshUnassignedDatalist();
   renderUnassigned();
   if (adderInput) {
@@ -940,13 +971,6 @@ document.addEventListener("DOMContentLoaded", () => {
       console.error("Tab search shortcut disable failed:", error);
     });
   });
-
-  const unassignedList = document.getElementById("unassigned-list");
-  if (unassignedList) {
-    makeDropTarget(unassignedList, (drag) => {
-      if (drag.sourceId) removeTitleFromFocus(drag.sourceId, drag.title);
-    });
-  }
 
   document.getElementById("preset-openai").addEventListener("click", () => applyProviderPreset("openai"));
   document.getElementById("preset-groq").addEventListener("click", () => applyProviderPreset("groq"));

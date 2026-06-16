@@ -112,7 +112,7 @@ test("renders saved mappings with name and group chips", async () => {
   });
   await settle();
 
-  const rows = document.querySelectorAll("#mappings-body tr");
+  const rows = document.querySelectorAll("#mappings-body tr:not(.unassigned-row)");
   assert.equal(rows.length, 1);
   assert.equal(rows[0].querySelector(".focus-name").textContent, "Work");
   assert.equal(rows[0].querySelector(".focus-name").title, "com.apple.focus.work");
@@ -149,7 +149,7 @@ test("add custom mapping updates DOM and is dirty", async () => {
   document.getElementById("new-group-title").value = "CustomGroup";
   document.getElementById("add-mapping").click();
 
-  const rows = document.querySelectorAll("#mappings-body tr");
+  const rows = document.querySelectorAll("#mappings-body tr:not(.unassigned-row)");
   assert.equal(rows.length, 1);
   // Unknown id falls back to showing the raw id as the name.
   assert.equal(rows[0].querySelector(".focus-name").textContent, "com.apple.custom");
