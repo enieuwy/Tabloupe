@@ -454,9 +454,11 @@ test("loads an existing custom provider into the form", async () => {
   assert.equal(harness.document.getElementById("provider-key").value, "sk-x");
 });
 
-function dragChipTo(window, chip, target) {
+function dragChipTo(window, chip, target, { alt = false } = {}) {
   chip.dispatchEvent(new window.Event("dragstart", { bubbles: true }));
-  target.dispatchEvent(new window.Event("drop", { bubbles: true, cancelable: true }));
+  const drop = new window.Event("drop", { bubbles: true, cancelable: true });
+  if (alt) Object.defineProperty(drop, "altKey", { value: true });
+  target.dispatchEvent(drop);
 }
 
 function rowForFocus(document, id) {
@@ -532,4 +534,36 @@ test("dragging an unassigned group onto a Focus row assigns it", async () => {
 
   assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), ["Reading"]);
   assert.deepEqual(chipLabels(document.getElementById("unassigned-list")), []);
+});
+
+test("the row add input suggests groups from other modes, excluding its own", async () => {
+  const { document } = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": ["Work"], "com.apple.focus.personal-time": [] } },
+    groups: [{ id: 1, title: "Work" }, { id: 2, title: "Research" }, { id: 3, title: "Reading" }],
+  });
+  await settle();
+
+  const personalList = rowForFocus(document, "com.apple.focus.personal-time")
+    .querySelector(".group-chip-input").getAttribute("list");
+  const personalOptions = [...document.getElementById(personalList).querySelectorAll("option")].map((o) => o.value);
+  assert.deepEqual(personalOptions, ["Reading", "Research", "Work"]);
+
+  const workList = rowForFocus(document, "com.apple.focus.work")
+    .querySelector(".group-chip-input").getAttribute("list");
+  const workOptions = [...document.getElementById(workList).querySelectorAll("option")].map((o) => o.value);
+  assert.deepEqual(workOptions, ["Reading", "Research"]);
+});
+
+test("Alt-dragging a chip copies the group to another mode, keeping the source", async () => {
+  const { window, document } = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": ["Work"], "com.apple.focus.personal-time": [] } },
+    groups: [{ id: 1, title: "Work" }],
+  });
+  await settle();
+
+  const chip = rowForFocus(document, "com.apple.focus.work").querySelector(".group-chip");
+  dragChipTo(window, chip, rowForFocus(document, "com.apple.focus.personal-time"), { alt: true });
+
+  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), ["Work"]);
+  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.personal-time")), ["Work"]);
 });
