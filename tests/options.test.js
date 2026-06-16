@@ -453,3 +453,83 @@ test("loads an existing custom provider into the form", async () => {
   assert.equal(harness.document.getElementById("provider-model").value, "gpt-4o-mini");
   assert.equal(harness.document.getElementById("provider-key").value, "sk-x");
 });
+
+function dragChipTo(window, chip, target) {
+  chip.dispatchEvent(new window.Event("dragstart", { bubbles: true }));
+  target.dispatchEvent(new window.Event("drop", { bubbles: true, cancelable: true }));
+}
+
+function rowForFocus(document, id) {
+  return [...document.querySelectorAll("#mappings-body tr")].find(
+    (row) => row.querySelector(".focus-name") && row.querySelector(".focus-name").title === id
+  );
+}
+
+function chipLabels(scope) {
+  return [...scope.querySelectorAll(".group-chip-label")].map((c) => c.textContent);
+}
+
+test("cached MCC catalog overrides the bundled focus name", async () => {
+  const { document } = createHarness({
+    storage: {
+      focusMappings: { "com.apple.focus.work": ["Work"] },
+      focusCatalog: { "com.apple.focus.work": { name: "Deep Work", icon: "briefcase", color: "#abc" } },
+    },
+  });
+  await settle();
+
+  assert.equal(document.querySelector("#mappings-body .focus-name").textContent, "Deep Work");
+});
+
+test("unassigned list shows Firefox groups not assigned to any focus", async () => {
+  const { document } = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } },
+    groups: [{ id: 1, title: "Work" }, { id: 2, title: "Reading" }, { id: 3, title: "News" }],
+  });
+  await settle();
+
+  assert.deepEqual(chipLabels(document.getElementById("unassigned-list")), ["News", "Reading"]);
+});
+
+test("dragging a chip onto another Focus row moves the group", async () => {
+  const { window, document } = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": ["Work"], "com.apple.focus.personal-time": [] } },
+    groups: [{ id: 1, title: "Work" }],
+  });
+  await settle();
+
+  const chip = rowForFocus(document, "com.apple.focus.work").querySelector(".group-chip");
+  dragChipTo(window, chip, rowForFocus(document, "com.apple.focus.personal-time"));
+
+  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), []);
+  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.personal-time")), ["Work"]);
+  assert.match(document.getElementById("status").textContent, /Unsaved changes/);
+});
+
+test("dragging a chip to the unassigned list unassigns the group", async () => {
+  const { window, document } = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } },
+    groups: [{ id: 1, title: "Work" }],
+  });
+  await settle();
+
+  const chip = rowForFocus(document, "com.apple.focus.work").querySelector(".group-chip");
+  dragChipTo(window, chip, document.getElementById("unassigned-list"));
+
+  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), []);
+  assert.deepEqual(chipLabels(document.getElementById("unassigned-list")), ["Work"]);
+});
+
+test("dragging an unassigned group onto a Focus row assigns it", async () => {
+  const { window, document } = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": [] } },
+    groups: [{ id: 1, title: "Reading" }],
+  });
+  await settle();
+
+  const chip = document.getElementById("unassigned-list").querySelector(".group-chip");
+  dragChipTo(window, chip, rowForFocus(document, "com.apple.focus.work"));
+
+  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), ["Reading"]);
+  assert.deepEqual(chipLabels(document.getElementById("unassigned-list")), []);
+});
