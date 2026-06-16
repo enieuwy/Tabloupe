@@ -31,13 +31,15 @@
         </div>
 
         <datalist id="firefox-groups"></datalist>
+        <datalist id="firefox-groups-unassigned"></datalist>
 
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th scope="col">Apple Focus ID</th>
-                <th scope="col">Firefox tab group title</th>
+                <th scope="col">Focus mode</th>
+                <th scope="col" aria-hidden="true"></th>
+                <th scope="col">Tab groups</th>
                 <th scope="col"><span class="visually-hidden">Actions</span></th>
               </tr>
             </thead>
@@ -56,6 +58,7 @@
             <span>Apple Focus ID</span>
             <input id="new-focus-id" type="text" autocomplete="off" placeholder="com.apple.focus.work">
           </label>
+          <span class="add-arrow" aria-hidden="true">→</span>
           <label>
             <span>Firefox group title</span>
             <input id="new-group-title" type="text" list="firefox-groups" autocomplete="off" placeholder="Work">
@@ -74,8 +77,77 @@
     <section class="card">
       <div class="section-heading">
         <h2>AI tab grouping</h2>
-        <p>Cluster a window's ungrouped tabs into named topic groups, on-device via mac-command-centre. Open it from the <strong>Focus Tab Groups toolbar button</strong>.</p>
+        <p>Cluster a window's ungrouped tabs into named topic groups. Run it from the <strong>toolbar button</strong>; pick the model that does the grouping here.</p>
       </div>
+
+      <div class="provider-options" role="radiogroup" aria-label="Grouping model">
+        <label class="provider-option">
+          <input type="radio" name="provider-kind" value="foundation">
+          <span class="provider-option-icon" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg>
+          </span>
+          <span class="provider-option-title">Foundation</span>
+          <span class="provider-badge badge-private">On-device</span>
+          <span class="provider-option-desc">Apple's on-device model via mac-command-centre. Private — nothing leaves your Mac. Slower on big windows.</span>
+          <span class="provider-check" aria-hidden="true"></span>
+        </label>
+
+        <label class="provider-option">
+          <input type="radio" name="provider-kind" value="custom">
+          <span class="provider-option-icon" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 0 0 .5-8.97A6 6 0 0 0 6.34 9.5 4 4 0 1 0 7 19h10.5z"/></svg>
+          </span>
+          <span class="provider-option-title">Custom API</span>
+          <span class="provider-badge badge-fast">Fast</span>
+          <span class="provider-option-desc">Any OpenAI-compatible endpoint. Fast and handles big windows — sends tab titles &amp; URLs to that provider.</span>
+          <span class="provider-check" aria-hidden="true"></span>
+        </label>
+      </div>
+
+      <div id="provider-custom" class="provider-custom" hidden>
+        <div class="provider-presets">
+          <span class="provider-presets-label">Quick setup</span>
+          <button id="preset-openai" type="button" class="chip">OpenAI</button>
+          <button id="preset-groq" type="button" class="chip">Groq</button>
+          <button id="preset-openrouter" type="button" class="chip">OpenRouter</button>
+        </div>
+
+        <div class="field">
+          <label for="provider-url">API base URL</label>
+          <input id="provider-url" class="mono" type="url" placeholder="https://api.openai.com/v1" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="provider-model">Model</label>
+          <input id="provider-model" class="mono" type="text" placeholder="gpt-4o-mini" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="provider-key">API key</label>
+          <div class="key-input">
+            <input id="provider-key" class="mono" type="password" placeholder="sk-…" autocomplete="off" spellcheck="false">
+            <button id="provider-key-toggle" type="button" class="ghost">Show</button>
+          </div>
+          <p class="field-hint">Stored only in this browser's local storage. Saving asks permission to connect to the provider's domain.</p>
+        </div>
+      </div>
+
+      <div class="provider-actions">
+        <button id="provider-save" type="button" class="primary">Save provider</button>
+        <span id="provider-status" class="provider-status" role="status" aria-live="polite"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-heading">
+        <h2>Tab search shortcut</h2>
+        <p>Opens the tab search overlay on web pages. Click the box and press the keys you want (include at least one of Ctrl, Alt, or Cmd).</p>
+      </div>
+      <div class="shortcut-row">
+        <button id="shortcut-record" type="button" class="shortcut-input">Ctrl + S</button>
+        <button id="shortcut-reset" type="button" class="secondary">Reset to Ctrl+S</button>
+        <button id="shortcut-clear" type="button" class="secondary">Disable</button>
+        <span id="shortcut-status" role="status" aria-live="polite"></span>
+      </div>
+      <p class="shortcut-hint">The overlay can't run on privileged pages (<code>about:</code>, add-ons, PDF viewer). For a shortcut that works there too, assign one under <a href="about:addons">about:addons &rarr; Manage Extension Shortcuts</a>.</p>
     </section>
 
     <section class="card diagnostics">
