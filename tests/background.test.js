@@ -7,12 +7,12 @@ const vm = require("node:vm");
 const backgroundSource = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
 
 const DEFAULT_MAPPINGS = {
-  "com.apple.focus.work": "Work",
-  "com.apple.focus.personal-time": "Personal",
-  "com.apple.donotdisturb.mode.default": "Do Not Disturb",
-  "com.apple.sleep.sleep-mode": "Sleep",
-  "com.apple.donotdisturb.mode.graduationcapfill": "Study",
-  "com.apple.focus.reduce-interruptions": "Reduce Interruptions",
+  "com.apple.focus.work": ["Work"],
+  "com.apple.focus.personal-time": ["Personal"],
+  "com.apple.donotdisturb.mode.default": ["Do Not Disturb"],
+  "com.apple.sleep.sleep-mode": ["Sleep"],
+  "com.apple.donotdisturb.mode.graduationcapfill": ["Study"],
+  "com.apple.focus.reduce-interruptions": ["Reduce Interruptions"],
 };
 
 function clone(value) {
@@ -401,9 +401,9 @@ test("seeds default mappings only when focusMappings is absent", async () => {
   await settle();
   assert.deepEqual(seeded.storageData.focusMappings, DEFAULT_MAPPINGS);
 
-  const existing = createHarness({ storage: { focusMappings: { "custom-id": "Reading" } } });
+  const existing = createHarness({ storage: { focusMappings: { "custom-id": ["Reading"] } } });
   await settle();
-  assert.deepEqual(existing.storageData.focusMappings, { "custom-id": "Reading" });
+  assert.deepEqual(existing.storageData.focusMappings, { "custom-id": ["Reading"] });
 });
 
 test("mapped raw Focus ID records raw diagnostics and applies mapped tab group", async () => {
@@ -516,7 +516,7 @@ test("changing the active raw Focus mapping reapplies despite same raw ID dedupe
   assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
 
   await harness.browser.storage.local.set({
-    focusMappings: { ...DEFAULT_MAPPINGS, "com.apple.focus.work": "Other" },
+    focusMappings: { ...DEFAULT_MAPPINGS, "com.apple.focus.work": ["Other"] },
   });
 
   await waitFor(() => {
@@ -593,6 +593,27 @@ test("a focus mapped to an empty list is ignored, leaving groups untouched", asy
   assert.equal(harness.groupState.find((g) => g.title === "Other").collapsed, false);
 });
 
+test("non-array focus mapping entries are ignored", async () => {
+  const harness = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": 123 } },
+    groups: [
+      { id: 1, title: "Work", collapsed: true },
+      { id: 2, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, groupId: 1, active: false },
+      { id: 20, groupId: 2, active: true },
+    ],
+  });
+  await settle();
+
+  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: "com.apple.focus.work" } }) });
+
+  assert.equal(harness.storageData.lastAction, "ignored");
+  assert.equal(harness.groupState.find((g) => g.title === "Work").collapsed, true);
+  assert.equal(harness.groupState.find((g) => g.title === "Other").collapsed, false);
+});
+
 test("apply-current-focus message force-reapplies last seen Focus", async () => {
   const fixture = twoGroups();
   const harness = createHarness(fixture);
@@ -621,7 +642,7 @@ test("explicit ignore mapping records ignored action and clears stale diagnostic
   const harness = createHarness({
     ...fixture,
     storage: {
-      focusMappings: { "com.apple.focus.custom": "" },
+      focusMappings: { "com.apple.focus.custom": [] },
       unmappedFocusId: "stale",
       expandedGroups: ["stale"],
       collapsedGroups: ["stale"],
@@ -643,7 +664,7 @@ test("explicit ignore mapping records ignored action and clears stale diagnostic
 
 test("missing mapped group expands existing groups and records missing group", async () => {
   const harness = createHarness({
-    storage: { focusMappings: { "com.apple.focus.missing": "Missing" } },
+    storage: { focusMappings: { "com.apple.focus.missing": ["Missing"] } },
     groups: [
       { id: 1, title: "Work", collapsed: true },
       { id: 2, title: "Other", collapsed: true },
@@ -677,7 +698,7 @@ test("empty matching group records empty group without collapsing others", async
 
 test("matching groups are activated in each window before other groups collapse", async () => {
   const harness = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": "Work" } },
+    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } },
     groups: [
       { id: 1, windowId: 1, title: "Work", collapsed: true },
       { id: 2, windowId: 1, title: "Other", collapsed: false },
@@ -706,7 +727,7 @@ test("matching groups are activated in each window before other groups collapse"
 
 test("focus change keeps an ungrouped active tab (options page) in the foreground", async () => {
   const harness = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": "Work" } },
+    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } },
     groups: [
       { id: 1, windowId: 1, title: "Work", collapsed: true },
       { id: 2, windowId: 1, title: "Other", collapsed: false },
@@ -825,7 +846,7 @@ test("activation failures are reported and same raw focus can retry", async () =
 
 test("partial activation failure blocks group changes and remains retryable", async () => {
   const harness = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": "Work" } },
+    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } },
     groups: [
       { id: 1, windowId: 1, title: "Work", collapsed: true },
       { id: 2, windowId: 2, title: "Work", collapsed: true },
@@ -1184,6 +1205,33 @@ test("tabsearch-list returns tabs with current window first and title fallback",
   assert.equal(docs.active, true);
   assert.equal(list.find((tab) => tab.id === 30).title, "https://example.com");
   assert.equal(list.find((tab) => tab.id === 10).currentWindow, false);
+});
+
+test("tabsearch-list includes Firefox tab group context", async () => {
+  const harness = createHarness({
+    currentWindowId: 1,
+    groups: [
+      { id: 7, title: "Release Train", color: "purple" },
+      { id: 8, title: "Empty", color: "green" },
+    ],
+    tabs: [
+      { id: 20, windowId: 1, title: "Issue", url: "https://tracker.example.com", active: false, groupId: 7 },
+      { id: 30, windowId: 1, title: "Docs", url: "https://docs.example.com", active: true, groupId: -1 },
+      { id: 40, windowId: 1, title: "Unknown", url: "https://unknown.example.com", active: false, groupId: 99 },
+    ],
+  });
+  await settle();
+
+  const list = await harness.request({ type: "tabsearch-list" });
+
+  assert.deepEqual(
+    list.map((tab) => ({ id: tab.id, groupTitle: tab.groupTitle, groupColor: tab.groupColor })),
+    [
+      { id: 20, groupTitle: "Release Train", groupColor: "purple" },
+      { id: 30, groupTitle: "", groupColor: "" },
+      { id: 40, groupTitle: "", groupColor: "" },
+    ],
+  );
 });
 
 test("tabsearch-activate focuses the window then activates the tab", async () => {

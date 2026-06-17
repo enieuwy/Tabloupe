@@ -21,12 +21,12 @@ const GROUPABLE_URL = /^https?:\/\//i;
 const TAB_GROUP_COLORS = ["blue", "cyan", "green", "orange", "pink", "purple", "red", "yellow"];
 
 const DEFAULT_FOCUS_MAPPINGS = Object.freeze({
-  "com.apple.focus.work": "Work",
-  "com.apple.focus.personal-time": "Personal",
-  "com.apple.donotdisturb.mode.default": "Do Not Disturb",
-  "com.apple.sleep.sleep-mode": "Sleep",
-  "com.apple.donotdisturb.mode.graduationcapfill": "Study",
-  "com.apple.focus.reduce-interruptions": "Reduce Interruptions",
+  "com.apple.focus.work": ["Work"],
+  "com.apple.focus.personal-time": ["Personal"],
+  "com.apple.donotdisturb.mode.default": ["Do Not Disturb"],
+  "com.apple.sleep.sleep-mode": ["Sleep"],
+  "com.apple.donotdisturb.mode.graduationcapfill": ["Study"],
+  "com.apple.focus.reduce-interruptions": ["Reduce Interruptions"],
 });
 
 let lastDispatchedRawId;
@@ -51,12 +51,8 @@ function hasOwn(object, key) {
 }
 
 // A focus maps to a list of tab-group titles. An empty list means "seen but
-// intentionally ignored". Accepts legacy values: "" -> [], "Title" -> ["Title"].
+// intentionally ignored".
 function normalizeTitles(value) {
-  if (typeof value === "string") {
-    const title = value.trim();
-    return title ? [title] : [];
-  }
   if (!Array.isArray(value)) {
     return [];
   }
@@ -1035,15 +1031,28 @@ async function listTabsForSearch() {
     : null;
   const currentWindowId = currentWindow ? currentWindow.id : null;
   const tabs = await browser.tabs.query({});
-  const mapped = tabs.map((tab) => ({
-    id: tab.id,
-    windowId: tab.windowId,
-    title: tab.title || tab.url || "Untitled",
-    url: tab.url || "",
-    favIconUrl: tab.favIconUrl || "",
-    active: Boolean(tab.active),
-    currentWindow: tab.windowId === currentWindowId,
-  }));
+  let groupsById = null;
+  const hasGroupedTabs = tabs.some((tab) => typeof tab.groupId === "number" && tab.groupId !== -1);
+  if (hasGroupedTabs && browser.tabGroups && typeof browser.tabGroups.query === "function") {
+    const groups = await browser.tabGroups.query({}).catch(() => []);
+    groupsById = new Map(groups.map((group) => [group.id, group]));
+  }
+  const mapped = tabs.map((tab) => {
+    const group = groupsById && typeof tab.groupId === "number" && tab.groupId !== -1
+      ? groupsById.get(tab.groupId)
+      : null;
+    return {
+      id: tab.id,
+      windowId: tab.windowId,
+      title: tab.title || tab.url || "Untitled",
+      url: tab.url || "",
+      favIconUrl: tab.favIconUrl || "",
+      active: Boolean(tab.active),
+      currentWindow: tab.windowId === currentWindowId,
+      groupTitle: group && group.title ? group.title : "",
+      groupColor: group && group.color ? group.color : "",
+    };
+  });
   // Stable sort keeps native tab order within a window; current window floats first.
   mapped.sort((a, b) => {
     if (a.currentWindow !== b.currentWindow) return a.currentWindow ? -1 : 1;
