@@ -22,6 +22,7 @@ let host = null;
 let shadow = null;
 let inputEl = null;
 let listEl = null;
+const MAX_RENDERED_RESULTS = 50;
 
 const DEFAULT_TAB_SEARCH_SHORTCUT = { ctrl: true, alt: false, shift: false, meta: false, key: "s" };
 let shortcut = { ...DEFAULT_TAB_SEARCH_SHORTCUT };
@@ -35,17 +36,31 @@ const ICON_CLOSE =
 const HINT_HTML =
   '<span class="grp"><kbd>\u2191</kbd><kbd>\u2193</kbd> navigate</span><span class="grp"><kbd>\u21b5</kbd> switch</span><span class="grp"><kbd>esc</kbd> close</span>';
 
-// Case-insensitive AND-match: every whitespace token must appear in title or url.
-function filterTabs(tabs, query) {
+// Case-insensitive AND-match: every whitespace token must appear in the
+// precomputed title/url/group haystack.
+function filterTabs(tabs, query, limit = tabs.length) {
   const tokens = String(query || "")
     .toLowerCase()
     .split(/\s+/)
     .filter(Boolean);
-  if (tokens.length === 0) return tabs.slice();
-  return tabs.filter((tab) => {
-    const haystack = `${tab.title} ${tab.url}`.toLowerCase();
-    return tokens.every((token) => haystack.includes(token));
-  });
+  if (tokens.length === 0) return tabs;
+  const matches = tabs.slice(0, 0);
+  for (const tab of tabs) {
+    const haystack = tab._searchHaystack || "";
+    if (tokens.every((token) => haystack.includes(token))) {
+      matches.push(tab);
+      if (matches.length >= limit) break;
+    }
+  }
+  return matches;
+}
+
+function prepareTabsForSearch(tabs) {
+  if (!Array.isArray(tabs)) return [];
+  for (const tab of tabs) {
+    tab._searchHaystack = `${tab.title || ""} ${tab.url || ""} ${tab.groupTitle || ""}`.toLowerCase();
+  }
+  return tabs;
 }
 
 function faviconFor(tab) {
@@ -146,11 +161,20 @@ function buildOverlay() {
       font-size: 12px; color: var(--muted);
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .row .badge {
+    .row .badge, .row .group-badge {
       flex: 0 0 auto; font-size: 9px; font-weight: 600; letter-spacing: 0.04em;
-      text-transform: uppercase; color: var(--accent); background: var(--accent-bg);
-      padding: 2px 7px; border-radius: 999px;
+      text-transform: uppercase; padding: 2px 7px; border-radius: 999px;
     }
+    .row .badge { color: var(--accent); background: var(--accent-bg); }
+    .row .group-badge { color: #f0eff4; background: rgba(255, 255, 255, 0.12); }
+    .row .group-badge[data-color="blue"] { background: rgba(0, 97, 224, 0.42); }
+    .row .group-badge[data-color="cyan"] { background: rgba(0, 139, 170, 0.42); }
+    .row .group-badge[data-color="green"] { background: rgba(18, 128, 54, 0.42); }
+    .row .group-badge[data-color="orange"] { background: rgba(180, 100, 0, 0.42); }
+    .row .group-badge[data-color="pink"] { background: rgba(190, 55, 120, 0.42); }
+    .row .group-badge[data-color="purple"] { background: rgba(120, 75, 190, 0.42); }
+    .row .group-badge[data-color="red"] { background: rgba(190, 55, 55, 0.42); }
+    .row .group-badge[data-color="yellow"] { background: rgba(160, 125, 0, 0.42); }
     .row .close {
       flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
       border: 0; background: transparent; color: var(--faint);
@@ -233,8 +257,9 @@ function buildOverlay() {
 }
 
 function render(query) {
-  filtered = filterTabs(allTabs, query);
-  if (selectedIndex >= filtered.length) selectedIndex = Math.max(0, filtered.length - 1);
+  filtered = filterTabs(allTabs, query, MAX_RENDERED_RESULTS);
+  const renderedCount = filtered.length < MAX_RENDERED_RESULTS ? filtered.length : MAX_RENDERED_RESULTS;
+  if (selectedIndex >= renderedCount) selectedIndex = Math.max(0, renderedCount - 1);
   listEl.textContent = "";
 
   if (filtered.length === 0) {
@@ -245,7 +270,8 @@ function render(query) {
     return;
   }
 
-  filtered.forEach((tab, index) => {
+  for (let index = 0; index < renderedCount; index += 1) {
+    const tab = filtered[index];
     const row = document.createElement("li");
     row.className = "row";
     row.setAttribute("role", "option");
@@ -280,6 +306,13 @@ function render(query) {
       badge.textContent = "current";
       title.appendChild(badge);
     }
+    if (tab.groupTitle) {
+      const badge = document.createElement("span");
+      badge.className = "group-badge";
+      badge.textContent = tab.groupTitle;
+      if (tab.groupColor) badge.dataset.color = tab.groupColor;
+      title.appendChild(badge);
+    }
     const url = document.createElement("div");
     url.className = "url";
     url.textContent = tab.url;
@@ -299,7 +332,7 @@ function render(query) {
     row.appendChild(text);
     row.appendChild(close);
     listEl.appendChild(row);
-  });
+  }
 }
 
 function makeFavFallback() {
@@ -317,8 +350,9 @@ function setSelected(index) {
 }
 
 function moveSelection(delta) {
-  if (filtered.length === 0) return;
-  const next = (selectedIndex + delta + filtered.length) % filtered.length;
+  const renderedCount = Math.min(filtered.length, MAX_RENDERED_RESULTS);
+  if (renderedCount === 0) return;
+  const next = (selectedIndex + delta + renderedCount) % renderedCount;
   setSelected(next);
   const rows = listEl.querySelectorAll(".row");
   if (rows[next] && rows[next].scrollIntoView) {
@@ -327,6 +361,7 @@ function moveSelection(delta) {
 }
 
 function onPanelKeydown(event) {
+  if (event.isComposing || event.keyCode === 229) return;
   // Keep navigation keys away from the host page.
   if (event.key === "ArrowDown") {
     event.preventDefault();
@@ -356,7 +391,7 @@ async function openOverlay() {
   selectedIndex = 0;
   inputEl.focus();
   try {
-    allTabs = (await browser.runtime.sendMessage({ type: "tabsearch-list" })) || [];
+    allTabs = prepareTabsForSearch((await browser.runtime.sendMessage({ type: "tabsearch-list" })) || []);
   } catch (error) {
     allTabs = [];
   }
@@ -385,7 +420,7 @@ function activate(tab) {
 async function closeTab(tab) {
   try {
     const refreshed = await browser.runtime.sendMessage({ type: "tabsearch-close", tabId: tab.id });
-    if (Array.isArray(refreshed)) allTabs = refreshed;
+    if (Array.isArray(refreshed)) allTabs = prepareTabsForSearch(refreshed);
   } catch (error) {
     allTabs = allTabs.filter((candidate) => candidate.id !== tab.id);
   }

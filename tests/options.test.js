@@ -120,14 +120,15 @@ test("renders saved mappings with name and group chips", async () => {
   assert.deepEqual(chips, ["Work", "Research"]);
 });
 
-test("legacy string mappings load as a single group chip", async () => {
+test("non-array mapping entries render as ignored", async () => {
   const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": "Work" } }
+    storage: { focusMappings: { "com.apple.focus.work": 123 } }
   });
   await settle();
 
   const chips = [...document.querySelectorAll("#mappings-body .group-chip-label")].map((c) => c.textContent);
-  assert.deepEqual(chips, ["Work"]);
+  assert.deepEqual(chips, []);
+  assert.equal(document.querySelector("#mappings-body .group-chips-ignored").textContent, "ignored");
 });
 
 test("known focus id renders its catalog name and an icon", async () => {

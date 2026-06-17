@@ -114,9 +114,15 @@ function pressCtrlS(harness) {
   harness.document.body.dispatchEvent(event);
 }
 
-function pressKey(harness, key) {
+function pressKey(harness, key, init = {}) {
   const input = overlayRoot(harness).querySelector(".search");
-  const event = new harness.window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+  const event = new harness.window.KeyboardEvent("keydown", {
+    key,
+    bubbles: true,
+    cancelable: true,
+  });
+  if ("isComposing" in init) Object.defineProperty(event, "isComposing", { value: init.isComposing });
+  if ("keyCode" in init) Object.defineProperty(event, "keyCode", { value: init.keyCode });
   input.dispatchEvent(event);
 }
 
@@ -133,13 +139,17 @@ function pressCombo(harness, combo) {
   harness.document.body.dispatchEvent(event);
 }
 
-test("filterTabs AND-matches tokens across title and url, case-insensitive", () => {
+test("filterTabs AND-matches tokens across the precomputed title/url/group haystack", () => {
   const { window } = createHarness();
-  const tabs = SAMPLE_TABS;
+  const tabs = window.prepareTabsForSearch([
+    ...SAMPLE_TABS,
+    { id: 40, windowId: 1, title: "Bug", url: "https://tracker.example.com", groupTitle: "Release Train" },
+  ]);
   assert.deepEqual(window.filterTabs(tabs, "git").map((t) => t.id), [30]);
-  assert.deepEqual(window.filterTabs(tabs, "EXAMPLE").map((t) => t.id), [20]);
+  assert.deepEqual(window.filterTabs(tabs, "EXAMPLE").map((t) => t.id), [20, 40]);
   assert.deepEqual(window.filterTabs(tabs, "docs example").map((t) => t.id), [20]);
-  assert.deepEqual(window.filterTabs(tabs, "  ").map((t) => t.id), [20, 30, 10]);
+  assert.deepEqual(window.filterTabs(tabs, "release").map((t) => t.id), [40]);
+  assert.deepEqual(window.filterTabs(tabs, "  ").map((t) => t.id), [20, 30, 10, 40]);
   assert.deepEqual(window.filterTabs(tabs, "nope").map((t) => t.id), []);
 });
 
@@ -165,6 +175,64 @@ test("typing filters the rendered rows", async () => {
   assert.deepEqual(rowTitles(harness), ["GitHub"]);
 });
 
+test("group titles are searchable and rendered as badges", async () => {
+  const harness = createHarness({
+    tabs: [
+      { id: 20, windowId: 1, title: "Docs", url: "https://docs.example.com", favIconUrl: "", active: false, currentWindow: true },
+      {
+        id: 30,
+        windowId: 1,
+        title: "Issue",
+        url: "https://tracker.example.com",
+        favIconUrl: "",
+        active: false,
+        currentWindow: true,
+        groupTitle: "Release Train",
+        groupColor: "purple",
+      },
+    ],
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  const root = overlayRoot(harness);
+  const input = root.querySelector(".search");
+  input.value = "release";
+  input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
+
+  assert.deepEqual(rowTitles(harness), ["Issue"]);
+  const badge = root.querySelector(".row .group-badge");
+  assert.equal(badge.textContent, "Release Train");
+  assert.equal(badge.dataset.color, "purple");
+});
+
+test("rendering is bounded for large tab lists", async () => {
+  const tabs = Array.from({ length: 75 }, (_, index) => ({
+    id: index + 1,
+    windowId: 1,
+    title: `Example ${index + 1}`,
+    url: `https://example.com/${index + 1}`,
+    favIconUrl: "",
+    active: index === 0,
+    currentWindow: true,
+  }));
+  const harness = createHarness({ tabs });
+  assert.equal(
+    harness.window.filterTabs(harness.window.prepareTabsForSearch(tabs), "example", 50).length,
+    50,
+  );
+  pressCtrlS(harness);
+  await settle();
+
+  const root = overlayRoot(harness);
+  assert.equal(root.querySelectorAll(".row").length, 50);
+
+  const input = root.querySelector(".search");
+  input.value = "example";
+  input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
+  assert.equal(root.querySelectorAll(".row").length, 50);
+});
+
 test("Enter activates the selected tab and closes the overlay", async () => {
   const harness = createHarness();
   pressCtrlS(harness);
@@ -177,6 +245,19 @@ test("Enter activates the selected tab and closes the overlay", async () => {
   const activate = harness.sent.find((m) => m.type === "tabsearch-activate");
   assert.deepEqual({ ...activate }, { type: "tabsearch-activate", tabId: 30, windowId: 1 });
   assert.equal(overlayRoot(harness), null, "overlay closed after activation");
+});
+
+test("IME composition Enter does not activate the selected tab", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  pressKey(harness, "Enter", { isComposing: true });
+  pressKey(harness, "Enter", { keyCode: 229 });
+  await settle();
+
+  assert.ok(overlayRoot(harness), "overlay remains open during composition confirmation");
+  assert.ok(!harness.sent.some((m) => m.type === "tabsearch-activate"));
 });
 
 test("Escape closes the overlay without activating", async () => {

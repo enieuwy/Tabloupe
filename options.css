@@ -674,23 +674,6 @@ input.mono {
   border: 1.5px solid var(--faint);
 }
 
-.status-unmapped {
-  color: var(--warn-text);
-}
-
-.status-unmapped .status-dot {
-  background: var(--warn-border);
-}
-
-.status-ignored {
-  color: var(--muted);
-}
-
-.status-ignored .status-dot {
-  background: transparent;
-  border: 1.5px solid var(--border);
-}
-
 .col-arrow {
   width: 32px;
   text-align: center;

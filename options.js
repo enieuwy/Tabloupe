@@ -59,12 +59,7 @@ function hasOwn(object, key) {
 }
 
 // A focus maps to a list of tab-group titles. [] means "seen but ignored".
-// Accepts legacy values: "" -> [], "Title" -> ["Title"].
 function normalizeTitles(value) {
-  if (typeof value === "string") {
-    const title = value.trim();
-    return title ? [title] : [];
-  }
   if (!Array.isArray(value)) {
     return [];
   }
