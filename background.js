@@ -9,6 +9,9 @@ const OPTIONS_NOTIFICATION_PREFIX = "focus-unmapped-";
 const GROUPING_TIMEOUT_MS = 120000;
 const AI_GROUPING_ENABLED_KEY = "aiGroupingEnabled";
 const AI_PROVIDER_KEY = "aiProvider";
+const AI_PIN_TO_FOCUS_KEY = "aiPinToFocus";
+const AI_GROUPING_CUSTOM_INSTRUCTIONS_KEY = "aiGroupingCustomInstructions";
+const AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX = 500;
 const GROUPING_SYSTEM_PROMPT =
   "You organize a user's open browser tabs into a small number of topic groups, like " +
   "Safari's automatic tab groups. Group tabs that share a project, task, or subject. Prefer " +
@@ -19,6 +22,11 @@ const GROUPABLE_URL = /^https?:\/\//i;
 // Firefox tab-group colors. Assigned round-robin so adjacent groups differ;
 // the model only proposes topics + members, never presentation.
 const TAB_GROUP_COLORS = ["blue", "cyan", "green", "orange", "pink", "purple", "red", "yellow"];
+
+// macOS notifications silently truncate (or drop) very long bodies. Cap the
+// variable-length group/title lists embedded in messages so a window with many
+// tab groups still produces a readable, deliverable notification.
+const NOTIFICATION_LIST_MAX = 12;
 
 const DEFAULT_FOCUS_MAPPINGS = Object.freeze({
   "com.apple.focus.work": ["Work"],
@@ -41,6 +49,10 @@ const pendingGroupingRequests = new Map();
 // dismiss, window close, or TTL expiry.
 const PROPOSAL_TTL_MS = 5 * 60 * 1000;
 const lastProposalByWindow = new Map();
+
+// AI previews collapse onto one in-flight request per window so re-opening the
+// popup or clicking Regroup mid-compute can't fan out duplicate daemon/LLM calls.
+const inflightPreviews = new Map();
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -131,6 +143,38 @@ function mappedFocus(rawId, focusMappings) {
   return normalizeTitles(focusMappings[rawId]);
 }
 
+// A mapping entry containing * or ? is a glob: * matches any run of characters,
+// ? matches exactly one. Plain entries match a tab-group title exactly.
+function isGlobPattern(entry) {
+  return /[*?]/.test(entry);
+}
+
+function globToRegExp(pattern) {
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const body = escaped.replace(/\\\*/g, ".*").replace(/\\\?/g, ".");
+  return new RegExp(`^${body}$`);
+}
+
+// Build a predicate over tab-group titles from a focus's mapped entries (a mix
+// of exact titles and globs). A title matches if it equals an exact entry or
+// matches any glob.
+function buildTitleMatcher(titles) {
+  const exact = new Set();
+  const globs = [];
+  for (const entry of titles) {
+    if (isGlobPattern(entry)) {
+      try {
+        globs.push(globToRegExp(entry));
+      } catch (error) {
+        console.error("Invalid focus mapping glob:", entry, error);
+      }
+    } else {
+      exact.add(entry);
+    }
+  }
+  return (title) => exact.has(title) || globs.some((re) => re.test(title));
+}
+
 async function applyRawFocus(rawId, { force = false } = {}) {
   if (!force && rawId === lastDispatchedRawId) {
     return;
@@ -198,13 +242,11 @@ async function handleMessage(event) {
     return;
   }
   const payload = isRecord(msg.payload) ? msg.payload : {};
-  // payload.focus is null (off), a {id, name, icon, color} object (current MCC),
-  // or a bare id string (older MCC) — accept all three.
+  // payload.focus is null (Focus off) or an enriched { id, name, icon, color }
+  // object. Cache the enriched entry so the badge/notifications can name it.
   const focus = payload.focus;
   let rawId = null;
-  if (typeof focus === "string") {
-    rawId = focus;
-  } else if (isRecord(focus) && typeof focus.id === "string") {
+  if (isRecord(focus) && typeof focus.id === "string") {
     rawId = focus.id;
     await mergeFocusCatalog({ [focus.id]: focus });
   }
@@ -288,6 +330,30 @@ browser.runtime.onMessage.addListener((message) => {
   }
   if (message && message.type === "tabsearch-close") {
     return closeTabFromSearch(message.tabId);
+  }
+  if (message && message.type === "tabsearch-close-many") {
+    return closeManyTabsFromSearch(message.tabIds);
+  }
+  if (message && message.type === "tabsearch-group") {
+    return groupTabsFromSearch(message.tabIds, message.title, message.windowId, message.groupId);
+  }
+  if (message && message.type === "tabsearch-ungroup") {
+    return ungroupTabsFromSearch(message.tabIds);
+  }
+  if (message && message.type === "tabsearch-move-new-window") {
+    return moveTabsToNewWindow(message.tabIds);
+  }
+  if (message && message.type === "tabsearch-set-pinned") {
+    return setTabsPinnedFromSearch(message.tabIds, message.pinned);
+  }
+  if (message && message.type === "tabsearch-discard") {
+    return discardTabsFromSearch(message.tabIds);
+  }
+  if (message && message.type === "tabsearch-move") {
+    return moveTabsFromSearch(message.tabIds, message.windowId, message.anchorId, message.placeAfter, message.groupId);
+  }
+  if (message && message.type === "tabsearch-ai-preview") {
+    return tabsearchAiPreview(message.windowId, message.tabIds);
   }
   return false;
 });
@@ -374,6 +440,14 @@ function groupLabel(group) {
   return typeof group.windowId === "number" ? `${title} (window ${group.windowId})` : title;
 }
 
+function truncateList(items, separator = ", ") {
+  if (items.length <= NOTIFICATION_LIST_MAX) {
+    return items.join(separator);
+  }
+  const hidden = items.length - NOTIFICATION_LIST_MAX;
+  return `${items.slice(0, NOTIFICATION_LIST_MAX).join(separator)}${separator}… (+${hidden} more)`;
+}
+
 async function setGroupCollapsed(group, collapsed) {
   if (group.collapsed === collapsed) {
     return null;
@@ -398,8 +472,34 @@ async function activateMatchingGroups(groups) {
   let activated = false;
   const failures = [];
 
+  // One tabs.query instead of N+1: bucket every tab by group and remember each
+  // window's active tab in memory, so a focus mapped to many groups doesn't fan
+  // out a query per group plus a per-group active-tab lookup.
+  const allTabs = await browser.tabs.query({});
+  const tabsByGroup = new Map();
+  const activeByWindow = new Map();
+  let firstActiveTab = null;
+  for (const tab of allTabs) {
+    if (typeof tab.groupId === "number" && tab.groupId !== -1) {
+      const bucket = tabsByGroup.get(tab.groupId);
+      if (bucket) {
+        bucket.push(tab);
+      } else {
+        tabsByGroup.set(tab.groupId, [tab]);
+      }
+    }
+    if (tab.active) {
+      if (firstActiveTab === null) {
+        firstActiveTab = tab;
+      }
+      if (typeof tab.windowId === "number" && !activeByWindow.has(tab.windowId)) {
+        activeByWindow.set(tab.windowId, tab);
+      }
+    }
+  }
+
   for (const group of groups) {
-    const tabs = await browser.tabs.query({ groupId: group.id });
+    const tabs = tabsByGroup.get(group.id) || [];
     if (tabs.length === 0) {
       continue;
     }
@@ -408,11 +508,9 @@ async function activateMatchingGroups(groups) {
     // pinned tab, or an about: page. Ungrouped tabs never block collapsing other
     // groups, so activating a matching tab here is unnecessary and would yank the
     // user off whatever they were deliberately viewing.
-    const windowQuery =
-      typeof group.windowId === "number"
-        ? { active: true, windowId: group.windowId }
-        : { active: true };
-    const [activeTab] = await browser.tabs.query(windowQuery);
+    const activeTab = typeof group.windowId === "number"
+      ? activeByWindow.get(group.windowId) || null
+      : firstActiveTab;
     if (activeTab && isUngroupedTab(activeTab)) {
       activated = true;
       continue;
@@ -438,9 +536,10 @@ async function applyFocus(titles, { rawId }) {
   });
   const focusName = rawId !== null ? await focusDisplayName(rawId) : null;
 
-  const groupList = allGroups.map((group) =>
-    `${group.title} (${group.collapsed ? "collapsed" : "expanded"})`
-  ).join("\n");
+  const groupList = truncateList(
+    allGroups.map((group) => `${group.title} (${group.collapsed ? "collapsed" : "expanded"})`),
+    "\n",
+  );
 
   if (titles === null && rawId === null) {
     await updateBadge("", null);
@@ -455,7 +554,7 @@ async function applyFocus(titles, { rawId }) {
       title: "Focus Tab Groups",
       message: `Focus off — ${
         updateFailures.length === 0 ? `expanded all ${allGroups.length} groups` : "some groups could not be expanded"
-      }${groupList ? `:\n${groupList}` : ""}${updateFailures.length === 0 ? "" : `\nFailed: ${updateFailures.join(", ")}`}`,
+      }${groupList ? `:\n${groupList}` : ""}${updateFailures.length === 0 ? "" : `\nFailed: ${truncateList(updateFailures)}`}`,
     });
     return updateFailures.length === 0;
   }
@@ -499,9 +598,9 @@ async function applyFocus(titles, { rawId }) {
     return true;
   }
 
-  const wanted = new Set(titles);
-  const matching = allGroups.filter((group) => wanted.has(group.title));
-  const others = allGroups.filter((group) => !wanted.has(group.title));
+  const matches = buildTitleMatcher(titles);
+  const matching = allGroups.filter((group) => matches(group.title));
+  const others = allGroups.filter((group) => !matches(group.title));
   const titlesText = titles.join(", ");
 
   if (matching.length === 0) {
@@ -535,7 +634,7 @@ async function applyFocus(titles, { rawId }) {
     await notify({
       type: "basic",
       title: "Focus Tab Groups",
-      message: `Could not activate every target tab group — not changing groups\nFailed: ${activation.failures.join(", ")}`,
+      message: `Could not activate every target tab group — not changing groups\nFailed: ${truncateList(activation.failures)}`,
     });
     return false;
   }
@@ -566,9 +665,9 @@ async function applyFocus(titles, { rawId }) {
     updateFailures.length === 0 ? "#00C853" : "#FF9800",
   );
 
-  const expanded = matching.map((group) => group.title).join(", ");
-  const collapsed = others.map((group) => group.title).join(", ") || "(none)";
-  const failureText = updateFailures.length === 0 ? "" : `\nFailed: ${updateFailures.join(", ")}`;
+  const expanded = truncateList(matching.map((group) => group.title));
+  const collapsed = truncateList(others.map((group) => group.title)) || "(none)";
+  const failureText = updateFailures.length === 0 ? "" : `\nFailed: ${truncateList(updateFailures)}`;
 
   await browser.storage.local.set({
     ...CLEAR_ACTION_DIAGNOSTICS,
@@ -631,7 +730,7 @@ function rejectPendingGrouping(error) {
   }
 }
 
-function requestTabGrouping(tabsPayload) {
+function requestTabGrouping(tabsPayload, instructions) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return Promise.reject(new Error("daemon_disconnected"));
   }
@@ -643,7 +742,12 @@ function requestTabGrouping(tabsPayload) {
     }, GROUPING_TIMEOUT_MS);
     pendingGroupingRequests.set(id, { resolve, reject, timer });
     try {
-      socket.send(JSON.stringify({ type: "groupTabs", schemaVersion: 1, id, tabs: tabsPayload }));
+      const message = { type: "groupTabs", schemaVersion: 1, id, tabs: tabsPayload };
+      const extra = normalizeCustomGroupingInstructions(instructions);
+      if (extra) {
+        message.instructions = extra;
+      }
+      socket.send(JSON.stringify(message));
     } catch (error) {
       clearTimeout(timer);
       pendingGroupingRequests.delete(id);
@@ -808,9 +912,36 @@ function parseGroupsFromContent(content) {
   return groups;
 }
 
+
+
+function normalizeCustomGroupingInstructions(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return "";
+  }
+  return trimmed.length > AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX
+    ? trimmed.slice(0, AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX)
+    : trimmed;
+}
+
+async function getCustomGroupingInstructions() {
+  const stored = await browser.storage.local.get(AI_GROUPING_CUSTOM_INSTRUCTIONS_KEY);
+  return normalizeCustomGroupingInstructions(stored[AI_GROUPING_CUSTOM_INSTRUCTIONS_KEY]);
+}
+
+function buildGroupingSystemPrompt(customInstructions) {
+  const extra = normalizeCustomGroupingInstructions(customInstructions);
+  if (!extra) {
+    return GROUPING_SYSTEM_PROMPT;
+  }
+  return `${GROUPING_SYSTEM_PROMPT}\n\nAdditional user instructions:\n${extra}`;
+}
 // Calls an OpenAI-compatible endpoint directly from the extension. Returns raw
 // [{topic, tabIndices}]; throws an Error with a `code` and a friendly message.
-async function cloudCluster(payload, provider) {
+async function cloudCluster(payload, provider, systemPrompt) {
   const endpoint = provider.baseURL.replace(/\/+$/, "") + "/chat/completions";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), GROUPING_TIMEOUT_MS);
@@ -828,7 +959,7 @@ async function cloudCluster(payload, provider) {
         temperature: 0.2,
         response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: GROUPING_SYSTEM_PROMPT },
+          { role: "system", content: systemPrompt || GROUPING_SYSTEM_PROMPT },
           { role: "user", content: buildGroupingPrompt(payload) },
         ],
       }),
@@ -871,10 +1002,13 @@ async function cloudCluster(payload, provider) {
   return parseGroupsFromContent(content);
 }
 
-async function computeTabGrouping(windowId) {
-  const candidates = await collectGroupableTabs(windowId);
+async function computeTabGrouping(windowId, explicitTabs) {
+  const candidates = Array.isArray(explicitTabs) ? explicitTabs : await collectGroupableTabs(windowId);
   if (candidates.length < 2) {
-    return { ok: false, error: "not_enough_tabs", message: "Open at least 2 ungrouped tabs to organize." };
+    const message = Array.isArray(explicitTabs)
+      ? "Select at least 2 ungrouped tabs to organize."
+      : "Open at least 2 ungrouped tabs to organize.";
+    return { ok: false, error: "not_enough_tabs", message };
   }
 
   const payload = candidates.map((tab, index) => ({
@@ -884,17 +1018,19 @@ async function computeTabGrouping(windowId) {
   }));
 
   const provider = await getProvider();
+  const customInstructions = await getCustomGroupingInstructions();
+  const systemPrompt = buildGroupingSystemPrompt(customInstructions);
   let raw;
   if (provider.kind === "custom") {
     try {
-      raw = await cloudCluster(payload, provider);
+      raw = await cloudCluster(payload, provider, systemPrompt);
     } catch (error) {
       return { ok: false, error: error.code || "cloud_failed", message: error.message || "Cloud provider failed." };
     }
   } else {
     let response;
     try {
-      response = await requestTabGrouping(payload);
+      response = await requestTabGrouping(payload, customInstructions);
     } catch (error) {
       return { ok: false, error: error.message || "grouping_failed", message: describeGroupingError(error.message) };
     }
@@ -915,9 +1051,21 @@ async function computeTabGrouping(windowId) {
   return { ok: true, groups };
 }
 
-async function applyTabGrouping(groups) {
+async function applyTabGrouping(groups, windowId) {
   const applied = [];
   const failures = [];
+  // Merge into an existing same-named group (manual or a prior AI run) instead
+  // of spawning a duplicate. Snapshot existing groups once, scoped to the window.
+  const existingByTitle = new Map();
+  if (browser.tabGroups && typeof browser.tabGroups.query === "function") {
+    const query = typeof windowId === "number" ? { windowId } : {};
+    const existing = await browser.tabGroups.query(query).catch(() => []);
+    for (const group of existing) {
+      if (typeof group.title === "string" && group.title !== "" && !existingByTitle.has(group.title)) {
+        existingByTitle.set(group.title, group);
+      }
+    }
+  }
   for (const group of groups) {
     const tabIds = group.tabs.map((tab) => tab.id).filter((id) => typeof id === "number");
     if (tabIds.length === 0) {
@@ -925,8 +1073,14 @@ async function applyTabGrouping(groups) {
     }
     const color = TAB_GROUP_COLORS.includes(group.color) ? group.color : TAB_GROUP_COLORS[0];
     try {
-      const groupId = await browser.tabs.group({ tabIds });
-      await browser.tabGroups.update(groupId, { title: group.topic, color });
+      const existing = existingByTitle.get(group.topic);
+      if (existing) {
+        // Append to the existing group; leave its title and color intact.
+        await browser.tabs.group({ groupId: existing.id, tabIds });
+      } else {
+        const groupId = await browser.tabs.group({ tabIds });
+        await browser.tabGroups.update(groupId, { title: group.topic, color });
+      }
       applied.push(group.topic);
     } catch (error) {
       console.error("AI tab group apply error:", group.topic, error);
@@ -939,6 +1093,43 @@ async function applyTabGrouping(groups) {
 async function aiGroupingEnabled() {
   const stored = await browser.storage.local.get(AI_GROUPING_ENABLED_KEY);
   return stored[AI_GROUPING_ENABLED_KEY] === true;
+}
+
+async function aiPinToFocusEnabled() {
+  const stored = await browser.storage.local.get(AI_PIN_TO_FOCUS_KEY);
+  return stored[AI_PIN_TO_FOCUS_KEY] === true;
+}
+
+async function activeFocusName() {
+  const stored = await browser.storage.local.get("lastFocusSeen");
+  const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
+  return rawId === null ? null : await focusDisplayName(rawId);
+}
+
+// When the user opts in, append freshly applied AI topics to the active Focus's
+// mapping so the new groups aren't collapsed on the next Focus change.
+async function pinTopicsToActiveFocus(topics) {
+  if (topics.length === 0 || !(await aiPinToFocusEnabled())) {
+    return;
+  }
+  const stored = await browser.storage.local.get(["lastFocusSeen", "focusMappings"]);
+  const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
+  if (rawId === null) {
+    return;
+  }
+  const mappings = isRecord(stored.focusMappings) ? { ...stored.focusMappings } : {};
+  const titles = Array.isArray(mappings[rawId]) ? mappings[rawId].slice() : [];
+  let changed = false;
+  for (const topic of topics) {
+    if (!titles.includes(topic)) {
+      titles.push(topic);
+      changed = true;
+    }
+  }
+  if (changed) {
+    mappings[rawId] = titles;
+    await browser.storage.local.set({ focusMappings: mappings });
+  }
 }
 
 function cachedProposal(windowId) {
@@ -954,16 +1145,20 @@ function cachedProposal(windowId) {
 }
 
 async function handleGroupState(windowId) {
-  const [enabled, candidates, provider] = await Promise.all([
+  const [enabled, candidates, provider, pinToFocus, activeFocus] = await Promise.all([
     aiGroupingEnabled(),
     collectGroupableTabs(windowId),
     getProvider(),
+    aiPinToFocusEnabled(),
+    activeFocusName(),
   ]);
   return {
     enabled,
     groupableCount: candidates.length,
     proposal: cachedProposal(windowId),
     providerKind: provider.kind,
+    pinToFocus,
+    activeFocus,
   };
 }
 
@@ -978,11 +1173,27 @@ async function handleGroupPreview(windowId) {
   if (!(await aiGroupingEnabled())) {
     return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
   }
-  const result = await computeTabGrouping(windowId);
-  if (result.ok && typeof windowId === "number") {
-    lastProposalByWindow.set(windowId, { groups: result.groups, ts: Date.now() });
+  // Collapse concurrent previews for the same window onto one in-flight request
+  // so re-opening the popup or clicking Regroup mid-compute can't fan out
+  // duplicate daemon/LLM calls. The cache key tolerates an absent windowId.
+  const key = typeof windowId === "number" ? windowId : "current";
+  const existing = inflightPreviews.get(key);
+  if (existing) {
+    return existing;
   }
-  return result;
+  const work = (async () => {
+    const result = await computeTabGrouping(windowId);
+    if (result.ok && typeof windowId === "number") {
+      lastProposalByWindow.set(windowId, { groups: result.groups, ts: Date.now() });
+    }
+    return result;
+  })();
+  inflightPreviews.set(key, work);
+  try {
+    return await work;
+  } finally {
+    inflightPreviews.delete(key);
+  }
 }
 
 async function handleGroupApply(windowId, groups) {
@@ -1005,10 +1216,13 @@ async function handleGroupApply(windowId, groups) {
     return { ok: false, error: "no_groups", message: "Those tabs are no longer available to group." };
   }
 
-  const outcome = await applyTabGrouping(normalized);
+  const outcome = await applyTabGrouping(normalized, windowId);
   const ok = outcome.failures.length === 0;
-  if (ok && typeof windowId === "number") {
-    lastProposalByWindow.delete(windowId);
+  if (ok) {
+    await pinTopicsToActiveFocus(outcome.applied);
+    if (typeof windowId === "number") {
+      lastProposalByWindow.delete(windowId);
+    }
   }
   await updateBadge(ok ? "AI" : "!", ok ? "#00C853" : "#FF9800");
   await notify({
@@ -1051,6 +1265,9 @@ async function listTabsForSearch() {
       currentWindow: tab.windowId === currentWindowId,
       groupTitle: group && group.title ? group.title : "",
       groupColor: group && group.color ? group.color : "",
+      pinned: Boolean(tab.pinned),
+      grouped: typeof tab.groupId === "number" && tab.groupId !== -1,
+      groupId: typeof tab.groupId === "number" ? tab.groupId : -1,
     };
   });
   // Stable sort keeps native tab order within a window; current window floats first.
@@ -1075,6 +1292,161 @@ async function closeTabFromSearch(tabId) {
     await browser.tabs.remove(tabId).catch(() => {});
   }
   return listTabsForSearch();
+}
+
+function validTabIds(tabIds) {
+  return Array.isArray(tabIds) ? tabIds.filter((id) => typeof id === "number") : [];
+}
+
+async function closeManyTabsFromSearch(tabIds) {
+  const validIds = validTabIds(tabIds);
+  if (validIds.length > 0) {
+    await browser.tabs.remove(validIds).catch(() => {});
+  }
+  return listTabsForSearch();
+}
+
+async function groupTabsFromSearch(tabIds, title, windowId, groupId) {
+  const validIds = validTabIds(tabIds);
+  if (validIds.length === 0) {
+    return { ok: false, error: "no_tabs", message: "No tabs to group.", list: await listTabsForSearch() };
+  }
+  // Drag-onto-section: add tabs to an existing group by id — no title needed,
+  // and the group's existing title/color are preserved.
+  if (typeof groupId === "number") {
+    try {
+      await browser.tabs.group({ groupId, tabIds: validIds });
+    } catch (error) {
+      return { ok: false, error: "group_failed", message: "Could not add tabs to the group.", list: await listTabsForSearch() };
+    }
+    return { ok: true, list: await listTabsForSearch() };
+  }
+  const trimmed = typeof title === "string" ? title.trim() : "";
+  if (trimmed === "") {
+    return { ok: false, error: "no_title", message: "Enter a group name." };
+  }
+  let existingGroupCount = 0;
+  if (browser.tabGroups && typeof browser.tabGroups.query === "function") {
+    const query = typeof windowId === "number" ? { windowId } : {};
+    const existing = await browser.tabGroups.query(query).catch(() => []);
+    existingGroupCount = Array.isArray(existing) ? existing.length : 0;
+  }
+  const group = {
+    topic: trimmed,
+    color: TAB_GROUP_COLORS[existingGroupCount % TAB_GROUP_COLORS.length] || TAB_GROUP_COLORS[0],
+    tabs: validIds.map((id) => ({ id })),
+  };
+  const outcome = await applyTabGrouping([group], windowId);
+  const ok = outcome.failures.length === 0;
+  const result = { ok, list: await listTabsForSearch() };
+  if (!ok) {
+    result.error = "group_failed";
+    result.message = "Could not group some tabs.";
+  }
+  return result;
+}
+
+async function ungroupTabsFromSearch(tabIds) {
+  const validIds = validTabIds(tabIds);
+  if (validIds.length > 0 && browser.tabs && typeof browser.tabs.ungroup === "function") {
+    await browser.tabs.ungroup(validIds).catch(() => {});
+  }
+  return listTabsForSearch();
+}
+
+async function moveTabsToNewWindow(tabIds) {
+  const validIds = validTabIds(tabIds);
+  if (validIds.length < 1) {
+    return listTabsForSearch();
+  }
+  try {
+    const win = await browser.windows.create({ tabId: validIds[0] });
+    if (validIds.length > 1 && win && typeof win.id === "number") {
+      await browser.tabs.move(validIds.slice(1), { windowId: win.id, index: -1 });
+    }
+  } catch (error) {
+    // Keep the overlay responsive if one of the selected tabs no longer exists.
+  }
+  return listTabsForSearch();
+}
+
+async function moveTabsFromSearch(tabIds, windowId, anchorId, placeAfter, groupId) {
+  const validIds = validTabIds(tabIds);
+  if (validIds.length === 0 || typeof windowId !== "number") {
+    return listTabsForSearch();
+  }
+  try {
+    const winTabs = (await browser.tabs.query({ windowId }))
+      .slice()
+      .sort((a, b) => (a.index || 0) - (b.index || 0));
+    const moveSet = new Set(validIds);
+    let anchorIdx = winTabs.findIndex((tab) => tab.id === anchorId);
+    if (anchorIdx === -1) anchorIdx = winTabs.length - 1;
+    let target = placeAfter ? anchorIdx + 1 : anchorIdx;
+    // Discount moved tabs already positioned before the target slot so the tab
+    // lands exactly where it was dropped (the classic reorder off-by-one).
+    const movedBefore = winTabs.slice(0, target).filter((tab) => moveSet.has(tab.id)).length;
+    target = Math.max(0, target - movedBefore);
+    await browser.tabs.move(validIds, { windowId, index: target });
+    // Group membership follows the drop position: join the target group, or drop
+    // out of any group when the position isn't inside one.
+    if (typeof groupId === "number" && groupId !== -1) {
+      await browser.tabs.group({ groupId, tabIds: validIds });
+    } else if (typeof browser.tabs.ungroup === "function") {
+      await browser.tabs.ungroup(validIds);
+    }
+  } catch (error) {
+    // Keep the overlay responsive if a tab vanished mid-drag.
+  }
+  return listTabsForSearch();
+}
+
+async function setTabsPinnedFromSearch(tabIds, pinned) {
+  const validIds = validTabIds(tabIds);
+  await Promise.all(validIds.map((id) => browser.tabs.update(id, { pinned: Boolean(pinned) }).catch(() => {})));
+  return listTabsForSearch();
+}
+
+async function discardTabsFromSearch(tabIds) {
+  const validIds = validTabIds(tabIds);
+  if (browser.tabs && typeof browser.tabs.discard === "function") {
+    await Promise.all(validIds.map((id) => browser.tabs.discard(id).catch(() => {})));
+  }
+  return listTabsForSearch();
+}
+
+async function tabsearchAiPreview(windowId, tabIds) {
+  if (!(await aiGroupingEnabled())) {
+    return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
+  }
+  let candidates;
+  const validIds = validTabIds(tabIds);
+  if (validIds.length > 0) {
+    const wanted = new Set(validIds);
+    const tabs = await browser.tabs.query({});
+    candidates = tabs.filter((tab) =>
+      wanted.has(tab.id) &&
+      (typeof windowId !== "number" || tab.windowId === windowId) &&
+      !tab.pinned &&
+      isUngroupedTab(tab) &&
+      typeof tab.url === "string" &&
+      GROUPABLE_URL.test(tab.url)
+    );
+  } else {
+    candidates = await collectGroupableTabs(windowId);
+  }
+  const result = await computeTabGrouping(windowId, candidates);
+  if (!result.ok) {
+    return result;
+  }
+  return {
+    ok: true,
+    groups: result.groups.map((group) => ({
+      topic: group.topic,
+      color: group.color,
+      tabs: group.tabs.map((tab) => ({ id: tab.id, title: tab.title })),
+    })),
+  };
 }
 
 async function openTabSearchOverlay() {

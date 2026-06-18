@@ -24,6 +24,7 @@ const STORAGE_KEYS = [
   "updateFailures",
   "tabSearchShortcut",
   "aiProvider",
+  "aiGroupingCustomInstructions",
   "focusCatalog",
 ];
 
@@ -42,6 +43,7 @@ const state = {
   updateFailures: [],
   tabSearchShortcut: { ...DEFAULT_TAB_SEARCH_SHORTCUT },
   aiProvider: { kind: "foundation" },
+  aiGroupingCustomInstructions: "",
   focusCatalog: {},
 };
 
@@ -49,6 +51,8 @@ let draftMappings = {};
 let dirty = false;
 let recordingShortcut = false;
 let activeAdderId = null;
+let activePatternAdderId = null;
+const expandedPatternRows = new Set();
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -56,6 +60,10 @@ function isRecord(value) {
 
 function hasOwn(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function isGlobPattern(entry) {
+  return /[*?]/.test(entry);
 }
 
 // A focus maps to a list of tab-group titles. [] means "seen but ignored".
@@ -180,6 +188,7 @@ async function loadAll() {
     ? normalizeShortcut(stored.tabSearchShortcut)
     : { ...DEFAULT_TAB_SEARCH_SHORTCUT };
   state.aiProvider = normalizeProvider(stored.aiProvider);
+  state.aiGroupingCustomInstructions = normalizeCustomInstructions(stored.aiGroupingCustomInstructions);
   state.focusCatalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
   if (!dirty) {
     draftMappings = cloneMappings(state.focusMappings);
@@ -187,6 +196,7 @@ async function loadAll() {
 
   render();
   renderProvider();
+  renderCustomInstructions();
 }
 
 function sortedFocusIds() {
@@ -240,6 +250,11 @@ const TRASH_ICON =
   '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>';
+
+const CHEVRON_ICON =
+  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M6 9l6 6 6-6"/></svg>';
 
 // ── Focus catalog fallback (bundled) ──
 // MCC is the source of truth: it broadcasts id -> {name, icon, color}, which we
@@ -317,6 +332,18 @@ function addTitleToFocus(id, rawTitle) {
   draftMappings[id].push(title);
   markDirty();
   activeAdderId = id;
+  renderMappings();
+}
+
+function addPatternToFocus(id, rawValue) {
+  const value = rawValue.trim();
+  if (!value) return;
+  if (!hasOwn(draftMappings, id)) draftMappings[id] = [];
+  if (draftMappings[id].includes(value)) return;
+  draftMappings[id].push(value);
+  expandedPatternRows.add(id);
+  markDirty();
+  activePatternAdderId = id;
   renderMappings();
 }
 
@@ -421,6 +448,22 @@ function makeChip(id, title) {
   return chip;
 }
 
+function makePatternChip(id, pattern) {
+  const chip = document.createElement("span");
+  chip.className = "group-chip group-chip-pattern";
+  const label = document.createElement("span");
+  label.className = "group-chip-label";
+  label.textContent = pattern;
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "group-chip-remove";
+  remove.setAttribute("aria-label", `Remove pattern ${pattern}`);
+  remove.textContent = "\u00d7";
+  remove.addEventListener("click", () => removeTitleFromFocus(id, pattern));
+  chip.append(label, remove);
+  return chip;
+}
+
 function makeUnseenDot() {
   const dot = document.createElement("span");
   dot.className = "status-dot status-unseen";
@@ -477,11 +520,14 @@ function renderMappings() {
   }
 
   let adderInput = null;
+  let patternAdderInput = null;
 
   const rows = ids.map((id, index) => {
     const row = document.createElement("tr");
     const hasMapping = hasOwn(draftMappings, id);
     const titles = hasMapping ? draftMappings[id] : [];
+    const exactTitles = titles.filter((title) => !isGlobPattern(title));
+    const patternTitles = titles.filter((title) => isGlobPattern(title));
     const hasSeen = hasOwn(state.seenFocusIds, id);
     const isActive = state.lastFocusSeen === id;
     const entry = focusCatalogEntry(id);
@@ -515,21 +561,15 @@ function renderMappings() {
     groupsCell.className = "col-groups";
     const chips = document.createElement("span");
     chips.className = "group-chips";
-    for (const title of titles) {
+    for (const title of exactTitles) {
       chips.append(makeChip(id, title));
-    }
-    if (hasMapping && titles.length === 0) {
-      const ignored = document.createElement("span");
-      ignored.className = "group-chips-ignored";
-      ignored.textContent = "ignored";
-      chips.append(ignored);
     }
     const input = document.createElement("input");
     input.type = "text";
     input.className = "group-chip-input";
     input.setAttribute("list", "firefox-groups-row-" + index);
     input.autocomplete = "off";
-    input.placeholder = titles.length === 0 ? "+ add tab group" : "+ add";
+    input.placeholder = exactTitles.length === 0 ? "+ add tab group" : "+ add";
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
@@ -546,8 +586,74 @@ function renderMappings() {
       adderInput = input;
     }
 
+    // "More options": title-pattern (glob) matching, revealed by the row's
+    // options button so the common exact-title case stays uncluttered.
+    const optionsOpen = expandedPatternRows.has(id);
+    const panel = document.createElement("div");
+    panel.className = "row-options";
+    panel.hidden = !optionsOpen;
+    const patternChips = document.createElement("span");
+    patternChips.className = "group-chips group-chips-patterns";
+    for (const pattern of patternTitles) {
+      patternChips.append(makePatternChip(id, pattern));
+    }
+    const patternInput = document.createElement("input");
+    patternInput.type = "text";
+    patternInput.className = "group-chip-input pattern-input";
+    patternInput.autocomplete = "off";
+    patternInput.placeholder = "+ add title pattern, e.g. Work-*";
+    patternInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        addPatternToFocus(id, patternInput.value);
+      } else if (event.key === "Escape") {
+        patternInput.value = "";
+        patternInput.blur();
+      }
+    });
+    patternChips.append(patternInput);
+    const hint = document.createElement("p");
+    hint.className = "pattern-hint";
+    hint.textContent = "Patterns match tab-group titles by glob: * = any text, ? = one character.";
+    panel.append(patternChips, hint);
+    groupsCell.append(panel);
+    if (id === activePatternAdderId) {
+      patternAdderInput = patternInput;
+    }
+
     const actionCell = document.createElement("td");
     actionCell.className = "col-action";
+    const actions = document.createElement("div");
+    actions.className = "row-actions";
+
+    const optionsBtn = document.createElement("button");
+    optionsBtn.type = "button";
+    optionsBtn.className = "icon-btn icon-btn-options";
+    if (optionsOpen) {
+      optionsBtn.classList.add("is-open");
+    }
+    if (patternTitles.length > 0) {
+      optionsBtn.classList.add("has-content");
+    }
+    optionsBtn.setAttribute("aria-expanded", String(optionsOpen));
+    optionsBtn.title = patternTitles.length > 0 ? `Title patterns (${patternTitles.length})` : "Title patterns";
+    optionsBtn.setAttribute("aria-label", `Title pattern options for ${id}`);
+    optionsBtn.innerHTML = CHEVRON_ICON;
+    optionsBtn.addEventListener("click", () => {
+      const open = !expandedPatternRows.has(id);
+      if (open) {
+        expandedPatternRows.add(id);
+      } else {
+        expandedPatternRows.delete(id);
+      }
+      panel.hidden = !open;
+      optionsBtn.classList.toggle("is-open", open);
+      optionsBtn.setAttribute("aria-expanded", String(open));
+      if (open) {
+        patternInput.focus();
+      }
+    });
+
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "icon-btn";
@@ -557,10 +663,12 @@ function renderMappings() {
     remove.innerHTML = TRASH_ICON;
     remove.addEventListener("click", () => {
       delete draftMappings[id];
+      expandedPatternRows.delete(id);
       markDirty();
       renderMappings();
     });
-    actionCell.append(remove);
+    actions.append(optionsBtn, remove);
+    actionCell.append(actions);
 
     row.append(idCell, arrowCell, groupsCell, actionCell);
     makeDropTarget(row, (drag, event) => moveTitleToFocus(drag.title, event && event.altKey ? null : drag.sourceId, id));
@@ -572,6 +680,10 @@ function renderMappings() {
   if (adderInput) {
     adderInput.focus();
     activeAdderId = null;
+  }
+  if (patternAdderInput) {
+    patternAdderInput.focus();
+    activePatternAdderId = null;
   }
 }
 
@@ -794,6 +906,10 @@ function applyStorageChange(changes) {
   if (changes.aiProvider) {
     state.aiProvider = normalizeProvider(changes.aiProvider.newValue);
   }
+  if (changes.aiGroupingCustomInstructions) {
+    state.aiGroupingCustomInstructions = normalizeCustomInstructions(changes.aiGroupingCustomInstructions.newValue);
+    renderCustomInstructions();
+  }
   if (changes.focusCatalog) {
     state.focusCatalog = isRecord(changes.focusCatalog.newValue) ? changes.focusCatalog.newValue : {};
   }
@@ -803,6 +919,22 @@ function applyStorageChange(changes) {
 async function refreshFirefoxGroups() {
   state.firefoxGroupTitles = await queryGroupTitles();
   render();
+}
+
+
+const AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX = 500;
+
+function normalizeCustomInstructions(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return "";
+  }
+  return trimmed.length > AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX
+    ? trimmed.slice(0, AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX)
+    : trimmed;
 }
 
 const PROVIDER_PRESETS = {
@@ -873,14 +1005,27 @@ function applyProviderPreset(presetKey) {
   setProviderStatus("");
 }
 
+function renderCustomInstructions() {
+  const field = document.getElementById("ai-custom-instructions");
+  if (field) {
+    field.value = state.aiGroupingCustomInstructions || "";
+  }
+}
+
 async function saveProvider() {
   const checked = document.querySelector('input[name="provider-kind"]:checked');
   const kind = checked ? checked.value : "foundation";
+  const instructionsField = document.getElementById("ai-custom-instructions");
+  const instructions = normalizeCustomInstructions(instructionsField ? instructionsField.value : "");
 
   if (kind !== "custom") {
     const provider = { kind: "foundation" };
-    await browser.storage.local.set({ aiProvider: provider });
+    await browser.storage.local.set({ aiProvider: provider, aiGroupingCustomInstructions: instructions });
     state.aiProvider = provider;
+    state.aiGroupingCustomInstructions = instructions;
+    if (instructionsField) {
+      instructionsField.value = instructions;
+    }
     setProviderStatus("Saved — using the on-device Foundation model.", "ok");
     return;
   }
@@ -914,8 +1059,12 @@ async function saveProvider() {
   }
 
   const provider = { kind: "custom", baseURL, model, apiKey };
-  await browser.storage.local.set({ aiProvider: provider });
+  await browser.storage.local.set({ aiProvider: provider, aiGroupingCustomInstructions: instructions });
   state.aiProvider = provider;
+  state.aiGroupingCustomInstructions = instructions;
+  if (instructionsField) {
+    instructionsField.value = instructions;
+  }
   setProviderStatus(`Saved — using ${model} at ${origin}.`, "ok");
 }
 
@@ -976,6 +1125,7 @@ document.addEventListener("DOMContentLoaded", () => {
       providerCustomVisible(!!selected && selected.value === "custom");
     });
   }
+
   document.getElementById("provider-save").addEventListener("click", () => {
     saveProvider().catch((error) => {
       console.error("Provider save failed:", error);

@@ -71,6 +71,18 @@ h1 {
   font-size: 12.5px;
 }
 
+.pin-toggle {
+  margin: 0 0 10px;
+}
+
+.pin-toggle[hidden] {
+  display: none;
+}
+
+.pin-toggle input:disabled {
+  cursor: not-allowed;
+}
+
 .groups[hidden] {
   display: none;
 }

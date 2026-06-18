@@ -128,8 +128,15 @@
         </div>
       </div>
 
+
+      <div class="field">
+        <label for="ai-custom-instructions">Custom instructions</label>
+        <textarea id="ai-custom-instructions" rows="3" maxlength="500" placeholder="e.g. Use emojis in group titles; separate frontend and backend docs"></textarea>
+        <p class="field-hint">Optional. Appended to the grouping prompt when using <strong>Custom API</strong>. Ignored by the on-device Foundation model.</p>
+      </div>
+
       <div class="provider-actions">
-        <button id="provider-save" type="button" class="primary">Save provider</button>
+        <button id="provider-save" type="button" class="primary">Save AI settings</button>
         <span id="provider-status" class="provider-status" role="status" aria-live="polite"></span>
       </div>
     </section>
