@@ -10,11 +10,13 @@ const GROUPING_TIMEOUT_MS = 120000;
 const AI_GROUPING_ENABLED_KEY = "aiGroupingEnabled";
 const AI_PROVIDER_KEY = "aiProvider";
 const AI_PIN_TO_FOCUS_KEY = "aiPinToFocus";
-const AI_GROUPING_CUSTOM_INSTRUCTIONS_KEY = "aiGroupingCustomInstructions";
-const AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX = 500;
+const AI_GROUPING_PROMPT_KEY = "aiGroupingPrompt";
+const AI_GROUPING_PROMPT_MAX = 4000;
+// Default system prompt. The user can replace it wholesale from Options (stored
+// in aiGroupingPrompt); an empty override falls back to this default.
 const GROUPING_SYSTEM_PROMPT =
-  "You organize a user's open browser tabs into a small number of topic groups, like " +
-  "Safari's automatic tab groups. Group tabs that share a project, task, or subject. Prefer " +
+  "You organize a user's open browser tabs into a small number of topic groups. " +
+  "Group tabs that share a project, task, or subject. Prefer " +
   "two to six groups. Every tab index belongs to exactly one group. Topic labels must be short " +
   '(1-4 words). Respond with ONLY a JSON object of the form ' +
   '{"groups":[{"topic":"...","tabIndices":[0,1]}]} and nothing else.';
@@ -730,7 +732,7 @@ function rejectPendingGrouping(error) {
   }
 }
 
-function requestTabGrouping(tabsPayload, instructions) {
+function requestTabGrouping(tabsPayload, promptOverride) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     return Promise.reject(new Error("daemon_disconnected"));
   }
@@ -743,9 +745,9 @@ function requestTabGrouping(tabsPayload, instructions) {
     pendingGroupingRequests.set(id, { resolve, reject, timer });
     try {
       const message = { type: "groupTabs", schemaVersion: 1, id, tabs: tabsPayload };
-      const extra = normalizeCustomGroupingInstructions(instructions);
-      if (extra) {
-        message.instructions = extra;
+      const prompt = normalizeGroupingPrompt(promptOverride);
+      if (prompt) {
+        message.prompt = prompt;
       }
       socket.send(JSON.stringify(message));
     } catch (error) {
@@ -914,7 +916,7 @@ function parseGroupsFromContent(content) {
 
 
 
-function normalizeCustomGroupingInstructions(value) {
+function normalizeGroupingPrompt(value) {
   if (typeof value !== "string") {
     return "";
   }
@@ -922,22 +924,21 @@ function normalizeCustomGroupingInstructions(value) {
   if (trimmed.length === 0) {
     return "";
   }
-  return trimmed.length > AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX
-    ? trimmed.slice(0, AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX)
+  return trimmed.length > AI_GROUPING_PROMPT_MAX
+    ? trimmed.slice(0, AI_GROUPING_PROMPT_MAX)
     : trimmed;
 }
 
-async function getCustomGroupingInstructions() {
-  const stored = await browser.storage.local.get(AI_GROUPING_CUSTOM_INSTRUCTIONS_KEY);
-  return normalizeCustomGroupingInstructions(stored[AI_GROUPING_CUSTOM_INSTRUCTIONS_KEY]);
+async function getGroupingPromptOverride() {
+  const stored = await browser.storage.local.get(AI_GROUPING_PROMPT_KEY);
+  return normalizeGroupingPrompt(stored[AI_GROUPING_PROMPT_KEY]);
 }
 
-function buildGroupingSystemPrompt(customInstructions) {
-  const extra = normalizeCustomGroupingInstructions(customInstructions);
-  if (!extra) {
-    return GROUPING_SYSTEM_PROMPT;
-  }
-  return `${GROUPING_SYSTEM_PROMPT}\n\nAdditional user instructions:\n${extra}`;
+// The user's stored prompt fully replaces the default when set; an empty
+// override uses the built-in GROUPING_SYSTEM_PROMPT.
+function buildGroupingSystemPrompt(promptOverride) {
+  const override = normalizeGroupingPrompt(promptOverride);
+  return override || GROUPING_SYSTEM_PROMPT;
 }
 // Calls an OpenAI-compatible endpoint directly from the extension. Returns raw
 // [{topic, tabIndices}]; throws an Error with a `code` and a friendly message.
@@ -1018,8 +1019,8 @@ async function computeTabGrouping(windowId, explicitTabs) {
   }));
 
   const provider = await getProvider();
-  const customInstructions = await getCustomGroupingInstructions();
-  const systemPrompt = buildGroupingSystemPrompt(customInstructions);
+  const promptOverride = await getGroupingPromptOverride();
+  const systemPrompt = buildGroupingSystemPrompt(promptOverride);
   let raw;
   if (provider.kind === "custom") {
     try {
@@ -1030,7 +1031,7 @@ async function computeTabGrouping(windowId, explicitTabs) {
   } else {
     let response;
     try {
-      response = await requestTabGrouping(payload, customInstructions);
+      response = await requestTabGrouping(payload, promptOverride);
     } catch (error) {
       return { ok: false, error: error.message || "grouping_failed", message: describeGroupingError(error.message) };
     }

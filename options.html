@@ -24,12 +24,19 @@
 
     <form id="mappings-form">
       <section class="card">
-        <div class="section-heading">
-          <h2>Focus mappings</h2>
-          <p>Rows combine saved mappings and Focus IDs recently reported by mac-command-centre. Drag a group between rows to reassign it, or to <strong>Unassigned</strong> to remove it.</p>
+        <div class="section-heading section-heading-row">
+          <div>
+            <h2>Focus mappings</h2>
+            <p>Rows combine saved mappings and Focus IDs recently reported by mac-command-centre. Drag a group between rows to reassign it, or to <strong>Unassigned</strong> to remove it.</p>
+          </div>
+          <button id="reveal-add-focus" type="button" class="ghost add-focus-toggle">+ Add Focus ID</button>
         </div>
 
-        <datalist id="firefox-groups"></datalist>
+        <div id="add-focus-row" class="add-focus-row" hidden>
+          <input id="new-focus-id" type="text" autocomplete="off" spellcheck="false" placeholder="Apple Focus ID you haven't toggled yet, e.g. com.apple.focus.work">
+          <button id="add-mapping" type="button">Add</button>
+          <button id="cancel-add-focus" type="button" class="secondary">Cancel</button>
+        </div>
 
         <div class="table-wrap">
           <table>
@@ -44,32 +51,12 @@
             <tbody id="mappings-body"></tbody>
           </table>
         </div>
-      </section>
-
-      <section class="card add-card">
-        <div class="section-heading">
-          <h2>Add custom mapping</h2>
-          <p>Use this for a Focus ID you know but have not toggled yet.</p>
-        </div>
-        <div class="add-row">
-          <label>
-            <span>Apple Focus ID</span>
-            <input id="new-focus-id" type="text" autocomplete="off" placeholder="com.apple.focus.work">
-          </label>
-          <span class="add-arrow" aria-hidden="true">→</span>
-          <label>
-            <span>Firefox group title</span>
-            <input id="new-group-title" type="text" list="firefox-groups" autocomplete="off" placeholder="Work">
-          </label>
-          <button id="add-mapping" type="button">Add</button>
+        <div class="actions">
+          <button id="save" type="submit">Save</button>
+          <button id="discard" type="button" class="secondary">Discard changes</button>
+          <span id="status" role="status" aria-live="polite"></span>
         </div>
       </section>
-
-      <div class="actions">
-        <button id="save" type="submit">Save</button>
-        <button id="discard" type="button" class="secondary">Discard changes</button>
-        <span id="status" role="status" aria-live="polite"></span>
-      </div>
     </form>
 
     <section class="card">
@@ -130,13 +117,17 @@
 
 
       <div class="field">
-        <label for="ai-custom-instructions">Custom instructions</label>
-        <textarea id="ai-custom-instructions" rows="3" maxlength="500" placeholder="e.g. Use emojis in group titles; separate frontend and backend docs"></textarea>
-        <p class="field-hint">Optional. Appended to the grouping prompt when using <strong>Custom API</strong>. Ignored by the on-device Foundation model.</p>
+        <label for="ai-grouping-prompt">Grouping prompt</label>
+        <textarea id="ai-grouping-prompt" rows="8" maxlength="4000" spellcheck="false"></textarea>
+        <p class="field-hint">The full instruction sent to the model. Edit to change how tabs are grouped, or reset to the built-in default. Used by the <strong>Custom API</strong> path; the on-device Foundation model uses its own prompt.</p>
       </div>
 
       <div class="provider-actions">
         <button id="provider-save" type="button" class="primary">Save AI settings</button>
+        <button id="ai-prompt-reset" type="button" class="reset-btn">
+          <svg class="reset-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+          Reset to default
+        </button>
         <span id="provider-status" class="provider-status" role="status" aria-live="polite"></span>
       </div>
     </section>

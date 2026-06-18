@@ -10,6 +10,16 @@ const DEFAULT_FOCUS_ORDER = [
 const DEFAULT_TAB_SEARCH_SHORTCUT = Object.freeze({ ctrl: true, alt: false, shift: false, meta: false, key: "s" });
 const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent || "");
 
+// Default AI grouping system prompt. MUST stay identical to GROUPING_SYSTEM_PROMPT
+// in background.js so a field equal to the default can be stored as an empty
+// override (which then tracks future default changes).
+const DEFAULT_GROUPING_PROMPT =
+  "You organize a user's open browser tabs into a small number of topic groups. " +
+  "Group tabs that share a project, task, or subject. Prefer " +
+  "two to six groups. Every tab index belongs to exactly one group. Topic labels must be short " +
+  '(1-4 words). Respond with ONLY a JSON object of the form ' +
+  '{"groups":[{"topic":"...","tabIndices":[0,1]}]} and nothing else.';
+
 const STORAGE_KEYS = [
   "focusMappings",
   "seenFocusIds",
@@ -24,7 +34,7 @@ const STORAGE_KEYS = [
   "updateFailures",
   "tabSearchShortcut",
   "aiProvider",
-  "aiGroupingCustomInstructions",
+  "aiGroupingPrompt",
   "focusCatalog",
 ];
 
@@ -43,7 +53,7 @@ const state = {
   updateFailures: [],
   tabSearchShortcut: { ...DEFAULT_TAB_SEARCH_SHORTCUT },
   aiProvider: { kind: "foundation" },
-  aiGroupingCustomInstructions: "",
+  aiGroupingPrompt: "",
   focusCatalog: {},
 };
 
@@ -188,7 +198,7 @@ async function loadAll() {
     ? normalizeShortcut(stored.tabSearchShortcut)
     : { ...DEFAULT_TAB_SEARCH_SHORTCUT };
   state.aiProvider = normalizeProvider(stored.aiProvider);
-  state.aiGroupingCustomInstructions = normalizeCustomInstructions(stored.aiGroupingCustomInstructions);
+  state.aiGroupingPrompt = normalizeGroupingPrompt(stored.aiGroupingPrompt);
   state.focusCatalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
   if (!dirty) {
     draftMappings = cloneMappings(state.focusMappings);
@@ -196,7 +206,7 @@ async function loadAll() {
 
   render();
   renderProvider();
-  renderCustomInstructions();
+  renderGroupingPrompt();
 }
 
 function sortedFocusIds() {
@@ -225,15 +235,6 @@ function setStatus(message, kind = "") {
 function markDirty() {
   dirty = true;
   setStatus("Unsaved changes", "");
-}
-
-function renderDatalist() {
-  const datalist = document.getElementById("firefox-groups");
-  datalist.replaceChildren(...state.firefoxGroupTitles.map((title) => {
-    const option = document.createElement("option");
-    option.value = title;
-    return option;
-  }));
 }
 
 function makeStatus(kind, label) {
@@ -742,7 +743,6 @@ function renderCallout() {
 }
 
 function render() {
-  renderDatalist();
   renderMappings();
   renderDiagnostics();
   renderCallout();
@@ -828,20 +828,41 @@ function buildMappingsForSave() {
 
 function addCustomMapping() {
   const idInput = document.getElementById("new-focus-id");
-  const titleInput = document.getElementById("new-group-title");
   const id = idInput.value.trim();
-  const title = titleInput.value.trim();
-
   if (!id) {
-    setStatus("Enter a Focus ID. Leave the group title empty to ignore it.", "error");
+    setStatus("Enter an Apple Focus ID.", "error");
     return;
   }
-
-  draftMappings[id] = title ? [title] : [];
-  idInput.value = "";
-  titleInput.value = "";
-  markDirty();
+  if (!hasOwn(draftMappings, id)) {
+    draftMappings[id] = [];
+    markDirty();
+  }
+  hideAddFocusRow();
+  // Focus the new row's group adder so the user can map groups immediately.
+  activeAdderId = id;
   renderMappings();
+}
+
+function showAddFocusRow() {
+  const rowEl = document.getElementById("add-focus-row");
+  const idInput = document.getElementById("new-focus-id");
+  if (rowEl) {
+    rowEl.hidden = false;
+  }
+  if (idInput) {
+    idInput.focus();
+  }
+}
+
+function hideAddFocusRow() {
+  const rowEl = document.getElementById("add-focus-row");
+  const idInput = document.getElementById("new-focus-id");
+  if (idInput) {
+    idInput.value = "";
+  }
+  if (rowEl) {
+    rowEl.hidden = true;
+  }
 }
 
 async function saveMappings(event) {
@@ -906,9 +927,9 @@ function applyStorageChange(changes) {
   if (changes.aiProvider) {
     state.aiProvider = normalizeProvider(changes.aiProvider.newValue);
   }
-  if (changes.aiGroupingCustomInstructions) {
-    state.aiGroupingCustomInstructions = normalizeCustomInstructions(changes.aiGroupingCustomInstructions.newValue);
-    renderCustomInstructions();
+  if (changes.aiGroupingPrompt) {
+    state.aiGroupingPrompt = normalizeGroupingPrompt(changes.aiGroupingPrompt.newValue);
+    renderGroupingPrompt();
   }
   if (changes.focusCatalog) {
     state.focusCatalog = isRecord(changes.focusCatalog.newValue) ? changes.focusCatalog.newValue : {};
@@ -922,9 +943,9 @@ async function refreshFirefoxGroups() {
 }
 
 
-const AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX = 500;
+const AI_GROUPING_PROMPT_MAX = 4000;
 
-function normalizeCustomInstructions(value) {
+function normalizeGroupingPrompt(value) {
   if (typeof value !== "string") {
     return "";
   }
@@ -932,8 +953,8 @@ function normalizeCustomInstructions(value) {
   if (trimmed.length === 0) {
     return "";
   }
-  return trimmed.length > AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX
-    ? trimmed.slice(0, AI_GROUPING_CUSTOM_INSTRUCTIONS_MAX)
+  return trimmed.length > AI_GROUPING_PROMPT_MAX
+    ? trimmed.slice(0, AI_GROUPING_PROMPT_MAX)
     : trimmed;
 }
 
@@ -1005,26 +1026,39 @@ function applyProviderPreset(presetKey) {
   setProviderStatus("");
 }
 
-function renderCustomInstructions() {
-  const field = document.getElementById("ai-custom-instructions");
+function renderGroupingPrompt() {
+  const field = document.getElementById("ai-grouping-prompt");
   if (field) {
-    field.value = state.aiGroupingCustomInstructions || "";
+    field.value = state.aiGroupingPrompt || DEFAULT_GROUPING_PROMPT;
   }
+}
+
+async function resetGroupingPrompt() {
+  await browser.storage.local.set({ aiGroupingPrompt: "" });
+  state.aiGroupingPrompt = "";
+  const field = document.getElementById("ai-grouping-prompt");
+  if (field) {
+    field.value = DEFAULT_GROUPING_PROMPT;
+  }
+  setProviderStatus("Reset to the default grouping prompt.", "ok");
 }
 
 async function saveProvider() {
   const checked = document.querySelector('input[name="provider-kind"]:checked');
   const kind = checked ? checked.value : "foundation";
-  const instructionsField = document.getElementById("ai-custom-instructions");
-  const instructions = normalizeCustomInstructions(instructionsField ? instructionsField.value : "");
+  const promptField = document.getElementById("ai-grouping-prompt");
+  let promptOverride = normalizeGroupingPrompt(promptField ? promptField.value : "");
+  if (promptOverride === DEFAULT_GROUPING_PROMPT) {
+    promptOverride = "";
+  }
 
   if (kind !== "custom") {
     const provider = { kind: "foundation" };
-    await browser.storage.local.set({ aiProvider: provider, aiGroupingCustomInstructions: instructions });
+    await browser.storage.local.set({ aiProvider: provider, aiGroupingPrompt: promptOverride });
     state.aiProvider = provider;
-    state.aiGroupingCustomInstructions = instructions;
-    if (instructionsField) {
-      instructionsField.value = instructions;
+    state.aiGroupingPrompt = promptOverride;
+    if (promptField) {
+      promptField.value = promptOverride || DEFAULT_GROUPING_PROMPT;
     }
     setProviderStatus("Saved — using the on-device Foundation model.", "ok");
     return;
@@ -1059,11 +1093,11 @@ async function saveProvider() {
   }
 
   const provider = { kind: "custom", baseURL, model, apiKey };
-  await browser.storage.local.set({ aiProvider: provider, aiGroupingCustomInstructions: instructions });
+  await browser.storage.local.set({ aiProvider: provider, aiGroupingPrompt: promptOverride });
   state.aiProvider = provider;
-  state.aiGroupingCustomInstructions = instructions;
-  if (instructionsField) {
-    instructionsField.value = instructions;
+  state.aiGroupingPrompt = promptOverride;
+  if (promptField) {
+    promptField.value = promptOverride || DEFAULT_GROUPING_PROMPT;
   }
   setProviderStatus(`Saved — using ${model} at ${origin}.`, "ok");
 }
@@ -1077,6 +1111,16 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   document.getElementById("discard").addEventListener("click", discardChanges);
   document.getElementById("add-mapping").addEventListener("click", addCustomMapping);
+  document.getElementById("reveal-add-focus").addEventListener("click", showAddFocusRow);
+  document.getElementById("cancel-add-focus").addEventListener("click", hideAddFocusRow);
+  document.getElementById("new-focus-id").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addCustomMapping();
+    } else if (event.key === "Escape") {
+      hideAddFocusRow();
+    }
+  });
 
   document.getElementById("apply-now").addEventListener("click", () => {
     browser.runtime.sendMessage({ type: "apply-current-focus" })
@@ -1090,12 +1134,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("callout-map-btn").addEventListener("click", () => {
     const rawId = state.unmappedFocusId;
     if (!rawId) return;
-    const idInput = document.getElementById("new-focus-id");
-    const titleInput = document.getElementById("new-group-title");
-    idInput.value = rawId;
-    titleInput.value = "";
-    titleInput.focus();
-    idInput.scrollIntoView({ behavior: "smooth", block: "center" });
+    document.getElementById("new-focus-id").value = rawId;
+    addCustomMapping();
   });
 
   const shortcutRecord = document.getElementById("shortcut-record");
@@ -1130,6 +1170,13 @@ document.addEventListener("DOMContentLoaded", () => {
     saveProvider().catch((error) => {
       console.error("Provider save failed:", error);
       setProviderStatus("Save failed. See extension console.", "error");
+    });
+  });
+
+  document.getElementById("ai-prompt-reset").addEventListener("click", () => {
+    resetGroupingPrompt().catch((error) => {
+      console.error("Grouping prompt reset failed:", error);
+      setProviderStatus("Reset failed. See extension console.", "error");
     });
   });
 
