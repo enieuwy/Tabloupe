@@ -1597,12 +1597,12 @@ test("custom provider routes preview through fetch, not the daemon", async () =>
 });
 
 
-test("custom provider appends saved instructions to the system prompt", async () => {
+test("custom provider uses the saved prompt override as the system message", async () => {
   const harness = createHarness({
     storage: {
       aiGroupingEnabled: true,
       aiProvider: { kind: "custom", baseURL: "https://api.example.com/v1", model: "m1", apiKey: "sk-1" },
-      aiGroupingCustomInstructions: "Use emojis in group titles.",
+      aiGroupingPrompt: "Cluster tabs and use emojis. Reply JSON only.",
     },
     tabs: [
       { id: 10, url: "https://a.com", title: "Alpha", groupId: -1 },
@@ -1615,17 +1615,14 @@ test("custom provider appends saved instructions to the system prompt", async ()
   const result = await harness.messageListeners[0]({ type: "ai-group-preview", windowId: 1 });
   assert.equal(result.ok, true);
   const body = JSON.parse(harness.fetchCalls[0].init.body);
-  assert.match(body.messages[0].content, /Additional user instructions:/);
-  assert.match(body.messages[0].content, /Use emojis in group titles/);
+  assert.equal(body.messages[0].content, "Cluster tabs and use emojis. Reply JSON only.");
 });
 
-test("custom instructions longer than 500 characters are truncated", async () => {
-  const long = "x".repeat(600);
+test("custom provider falls back to the default prompt when no override is saved", async () => {
   const harness = createHarness({
     storage: {
       aiGroupingEnabled: true,
       aiProvider: { kind: "custom", baseURL: "https://api.example.com/v1", model: "m1", apiKey: "sk-1" },
-      aiGroupingCustomInstructions: long,
     },
     tabs: [
       { id: 10, url: "https://a.com", title: "Alpha", groupId: -1 },
@@ -1637,15 +1634,36 @@ test("custom instructions longer than 500 characters are truncated", async () =>
 
   await harness.messageListeners[0]({ type: "ai-group-preview", windowId: 1 });
   const body = JSON.parse(harness.fetchCalls[0].init.body);
-  const extra = body.messages[0].content.split("Additional user instructions:\n")[1];
-  assert.equal(extra.length, 500);
+  assert.match(body.messages[0].content, /You organize a user's open browser tabs/);
+  assert.doesNotMatch(body.messages[0].content, /Safari/);
 });
 
-test("foundation preview forwards custom instructions to the daemon when set", async () => {
+test("an over-long saved prompt is truncated to the 4000-char cap", async () => {
+  const long = "x".repeat(5000);
   const harness = createHarness({
     storage: {
       aiGroupingEnabled: true,
-      aiGroupingCustomInstructions: "Group by top-level domain.",
+      aiProvider: { kind: "custom", baseURL: "https://api.example.com/v1", model: "m1", apiKey: "sk-1" },
+      aiGroupingPrompt: long,
+    },
+    tabs: [
+      { id: 10, url: "https://a.com", title: "Alpha", groupId: -1 },
+      { id: 11, url: "https://b.com", title: "Beta", groupId: -1 },
+    ],
+    fetchHandler: async () => chatCompletion([{ topic: "Pair", tabIndices: [0, 1] }]),
+  });
+  await settle();
+
+  await harness.messageListeners[0]({ type: "ai-group-preview", windowId: 1 });
+  const body = JSON.parse(harness.fetchCalls[0].init.body);
+  assert.equal(body.messages[0].content.length, 4000);
+});
+
+test("foundation preview forwards the saved prompt override to the daemon", async () => {
+  const harness = createHarness({
+    storage: {
+      aiGroupingEnabled: true,
+      aiGroupingPrompt: "Group by top-level domain.",
     },
     tabs: [
       { id: 10, url: "https://a.com", title: "Alpha", groupId: -1 },
@@ -1660,7 +1678,7 @@ test("foundation preview forwards custom instructions to the daemon when set", a
   });
   const sent = harness.sentMessages.find((m) => m.type === "groupTabs");
   assert.ok(sent);
-  assert.equal(sent.instructions, "Group by top-level domain.");
+  assert.equal(sent.prompt, "Group by top-level domain.");
 });
 
 test("custom provider parses fenced JSON content", async () => {

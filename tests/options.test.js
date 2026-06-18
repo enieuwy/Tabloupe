@@ -142,28 +142,26 @@ test("known focus id renders its catalog name and an icon", async () => {
   assert.ok(row.querySelector(".focus-icon"));
 });
 
-test("add custom mapping updates DOM and is dirty", async () => {
+test("add custom focus id creates a row and is dirty", async () => {
   const { document } = createHarness();
   await settle();
 
   document.getElementById("new-focus-id").value = "com.apple.custom";
-  document.getElementById("new-group-title").value = "CustomGroup";
   document.getElementById("add-mapping").click();
 
   const rows = document.querySelectorAll("#mappings-body tr:not(.unassigned-row)");
   assert.equal(rows.length, 1);
   // Unknown id falls back to showing the raw id as the name.
   assert.equal(rows[0].querySelector(".focus-name").textContent, "com.apple.custom");
-  assert.deepEqual([...rows[0].querySelectorAll(".group-chip-label")].map((c) => c.textContent), ["CustomGroup"]);
+  assert.equal(rows[0].querySelectorAll(".group-chip").length, 0);
   assert.match(document.getElementById("status").textContent, /Unsaved changes/);
 });
 
-test("add custom mapping with empty title creates an empty mapping", async () => {
+test("adding a focus id and saving stores an empty mapping", async () => {
   const { window, document, storageData } = createHarness();
   await settle();
 
   document.getElementById("new-focus-id").value = "com.apple.ignore";
-  document.getElementById("new-group-title").value = "";
   document.getElementById("add-mapping").click();
 
   const row = document.querySelector("#mappings-body tr");
@@ -205,8 +203,11 @@ test("save mappings writes arrays to storage and clears dirty state", async () =
   await settle();
 
   document.getElementById("new-focus-id").value = "com.apple.custom";
-  document.getElementById("new-group-title").value = "CustomGroup";
   document.getElementById("add-mapping").click();
+
+  const input = document.querySelector("#mappings-body .group-chip-input");
+  input.value = "CustomGroup";
+  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
 
   const form = document.getElementById("mappings-form");
   form.dispatchEvent(new window.Event("submit", { cancelable: true, bubbles: true }));
@@ -237,9 +238,9 @@ test("discard changes reverts to storage state", async () => {
   assert.match(document.getElementById("status").textContent, /Discarded changes/);
 });
 
-test("unmapped callout is displayed and map-it-now pre-fills form", async () => {
+test("unmapped callout is displayed and map-it-now adds the focus row", async () => {
   const { document } = createHarness({
-    storage: { 
+    storage: {
       lastAction: "unmapped_focus_id",
       unmappedFocusId: "com.apple.focus.new"
     }
@@ -250,16 +251,12 @@ test("unmapped callout is displayed and map-it-now pre-fills form", async () => 
   assert.equal(callout.hidden, false);
   assert.equal(document.getElementById("callout-focus-id").textContent, "com.apple.focus.new");
 
-  // Click 'Map it now'
-  // jsdom doesn't fully implement scrollIntoView, so mock it on the input
-  const idInput = document.getElementById("new-focus-id");
-  idInput.scrollIntoView = () => {};
-  
   document.getElementById("callout-map-btn").click();
-  
-  assert.equal(idInput.value, "com.apple.focus.new");
-  assert.equal(document.getElementById("new-group-title").value, "");
-  assert.equal(document.activeElement, document.getElementById("new-group-title"));
+
+  // A mapping row now exists for the previously-unmapped id.
+  const names = [...document.querySelectorAll("#mappings-body .focus-name")].map((n) => n.textContent);
+  assert.ok(names.includes("com.apple.focus.new"));
+  assert.match(document.getElementById("status").textContent, /Unsaved changes/);
 });
 
 test("apply-now button sends message", async () => {
@@ -638,33 +635,66 @@ test("adding a pattern via the options input saves it as a plain mapping string"
   assert.deepEqual(storageData.focusMappings["com.apple.focus.work"], ["Work", "Work-*"]);
 });
 
-test("saving custom instructions stores them in local storage", async () => {
+test("saving an edited grouping prompt stores it as the override", async () => {
   const harness = createHarness();
   await settle();
 
-  harness.document.getElementById("ai-custom-instructions").value = "Use emojis in titles.";
+  harness.document.getElementById("ai-grouping-prompt").value = "Group tabs by domain. JSON only.";
   harness.document.getElementById("provider-save").click();
   await settle();
 
-  assert.equal(harness.storageData.aiGroupingCustomInstructions, "Use emojis in titles.");
+  assert.equal(harness.storageData.aiGroupingPrompt, "Group tabs by domain. JSON only.");
   assert.match(harness.document.getElementById("provider-status").textContent, /Saved/);
 });
 
-test("loads saved custom instructions into the textarea", async () => {
-  const harness = createHarness({ storage: { aiGroupingCustomInstructions: "Separate frontend and backend." } });
+test("loads a saved grouping prompt override into the textarea", async () => {
+  const harness = createHarness({ storage: { aiGroupingPrompt: "Custom: cluster by project." } });
   await settle();
 
-  assert.equal(harness.document.getElementById("ai-custom-instructions").value, "Separate frontend and backend.");
+  assert.equal(harness.document.getElementById("ai-grouping-prompt").value, "Custom: cluster by project.");
 });
 
-test("custom instructions longer than 500 characters are truncated on save", async () => {
+test("the prompt field shows the built-in default when no override is stored", async () => {
   const harness = createHarness();
   await settle();
 
-  harness.document.getElementById("ai-custom-instructions").value = "y".repeat(600);
+  const value = harness.document.getElementById("ai-grouping-prompt").value;
+  assert.match(value, /^You organize a user's open browser tabs/);
+  assert.doesNotMatch(value, /Safari/);
+});
+
+test("saving the unchanged default prompt stores an empty override", async () => {
+  const harness = createHarness();
+  await settle();
+
+  // The field loads pre-filled with the default; saving it unchanged should not
+  // persist a literal copy, so it keeps tracking the default.
   harness.document.getElementById("provider-save").click();
   await settle();
 
-  assert.equal(harness.storageData.aiGroupingCustomInstructions.length, 500);
+  assert.equal(harness.storageData.aiGroupingPrompt, "");
+});
+
+test("reset clears the override and restores the default prompt text", async () => {
+  const harness = createHarness({ storage: { aiGroupingPrompt: "Custom override." } });
+  await settle();
+  assert.equal(harness.document.getElementById("ai-grouping-prompt").value, "Custom override.");
+
+  harness.document.getElementById("ai-prompt-reset").click();
+  await settle();
+
+  assert.equal(harness.storageData.aiGroupingPrompt, "");
+  assert.match(harness.document.getElementById("ai-grouping-prompt").value, /^You organize a user's open browser tabs/);
+});
+
+test("an over-long prompt is truncated to 4000 chars on save", async () => {
+  const harness = createHarness();
+  await settle();
+
+  harness.document.getElementById("ai-grouping-prompt").value = "y".repeat(5000);
+  harness.document.getElementById("provider-save").click();
+  await settle();
+
+  assert.equal(harness.storageData.aiGroupingPrompt.length, 4000);
 });
 
