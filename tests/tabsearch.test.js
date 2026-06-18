@@ -7,9 +7,9 @@ const { JSDOM } = require("jsdom");
 const tabsearchJs = fs.readFileSync(path.join(__dirname, "..", "tabsearch.js"), "utf8");
 
 const SAMPLE_TABS = [
-  { id: 20, windowId: 1, title: "Docs", url: "https://docs.example.com", favIconUrl: "", active: true, currentWindow: true },
-  { id: 30, windowId: 1, title: "GitHub", url: "https://github.com", favIconUrl: "", active: false, currentWindow: true },
-  { id: 10, windowId: 2, title: "Mozilla", url: "https://mozilla.org", favIconUrl: "", active: false, currentWindow: false },
+  { id: 20, windowId: 1, title: "Docs", url: "https://docs.example.com", favIconUrl: "", active: true, currentWindow: true, pinned: false, grouped: false },
+  { id: 30, windowId: 1, title: "GitHub", url: "https://github.com", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupTitle: "Work", groupColor: "blue" },
+  { id: 10, windowId: 2, title: "Mozilla", url: "https://mozilla.org", favIconUrl: "", active: false, currentWindow: false, pinned: true, grouped: false },
 ];
 
 function nextTick() {
@@ -104,6 +104,18 @@ function rowTitles(harness) {
   );
 }
 
+function rows(harness) {
+  return Array.from(overlayRoot(harness).querySelectorAll(".row"));
+}
+
+function markedRows(harness) {
+  return rows(harness).filter((row) => row.classList.contains("marked"));
+}
+
+function plain(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 function pressCtrlS(harness) {
   const event = new harness.window.KeyboardEvent("keydown", {
     key: "s",
@@ -118,6 +130,10 @@ function pressKey(harness, key, init = {}) {
   const input = overlayRoot(harness).querySelector(".search");
   const event = new harness.window.KeyboardEvent("keydown", {
     key,
+    ctrlKey: Boolean(init.ctrl),
+    metaKey: Boolean(init.meta),
+    shiftKey: Boolean(init.shift),
+    altKey: Boolean(init.alt),
     bubbles: true,
     cancelable: true,
   });
@@ -342,4 +358,352 @@ test("a live storage change swaps the active shortcut", async () => {
   pressCombo(harness, { ctrl: true, alt: true, key: "p" });
   await settle();
   assert.ok(overlayRoot(harness), "new Ctrl+Alt+P fires");
+});
+
+test("marking via checkbox, Ctrl-click, and Shift-click shows and clears the action bar", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  assert.equal(markedRows(harness).length, 1);
+  assert.equal(overlayRoot(harness).querySelector(".actions .count").textContent, "1 selected");
+
+  rows(harness)[1].dispatchEvent(new harness.window.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+  assert.equal(markedRows(harness).length, 2);
+
+  rows(harness)[2].dispatchEvent(new harness.window.MouseEvent("click", { bubbles: true, cancelable: true, shiftKey: true }));
+  assert.equal(markedRows(harness).length, 3);
+  assert.equal(overlayRoot(harness).querySelector(".actions .count").textContent, "3 selected");
+
+  Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "Clear").click();
+  assert.equal(markedRows(harness).length, 0);
+  assert.equal(overlayRoot(harness).querySelector(".hint") !== null, true);
+});
+
+test("Escape first clears marks, then closes the overlay", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  pressKey(harness, "Escape");
+  await settle();
+
+  assert.ok(overlayRoot(harness), "overlay remains open after clearing marks");
+  assert.equal(markedRows(harness).length, 0);
+
+  pressKey(harness, "Escape");
+  await settle();
+  assert.equal(overlayRoot(harness), null);
+});
+
+test("same-window grouping gate disables group actions for cross-window marks", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  rows(harness)[2].querySelector(".mark").click();
+
+  const buttons = Array.from(overlayRoot(harness).querySelectorAll(".actions button"));
+  assert.equal(buttons.find((button) => button.textContent === "Group").disabled, true);
+  assert.equal(buttons.find((button) => button.textContent === "AI group").disabled, true);
+  assert.match(overlayRoot(harness).querySelector(".actions .message").textContent, /one window/);
+});
+
+test("manual group sends selected tab ids, title, and shared window id then refreshes", async () => {
+  const refreshed = SAMPLE_TABS.map((tab) =>
+    tab.windowId === 1 ? { ...tab, grouped: true, groupId: 7, groupTitle: "Reading", groupColor: "purple" } : tab
+  );
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-group") return { ok: true, list: refreshed };
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  rows(harness)[1].querySelector(".mark").click();
+  Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "Group").click();
+  const input = overlayRoot(harness).querySelector(".actions input");
+  input.value = "Reading";
+  input.closest("form").dispatchEvent(new harness.window.Event("submit", { bubbles: true, cancelable: true }));
+  await settle();
+
+  const sent = harness.sent.find((message) => message.type === "tabsearch-group");
+  assert.deepEqual(plain(sent), { type: "tabsearch-group", tabIds: [20, 30], title: "Reading", windowId: 1 });
+  assert.equal(markedRows(harness).length, 0);
+  assert.equal(overlayRoot(harness).querySelector(".group-header .group-badge").textContent, "Reading");
+});
+
+test("AI preview renders topic sections and apply sends reduced groups", async () => {
+  const previewGroups = [
+    { topic: "Research", color: "green", tabs: [{ id: 20, title: "Docs" }, { id: 30, title: "GitHub" }] },
+  ];
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-ai-preview") return { ok: true, groups: previewGroups };
+      if (message.type === "ai-group-apply") return { ok: true, applied: 1, failures: [] };
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  rows(harness)[1].querySelector(".mark").click();
+  Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "AI group").click();
+  await settle();
+
+  assert.equal(overlayRoot(harness).querySelector(".preview-topic .group-badge").textContent, "Research");
+  Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "Apply").click();
+  await settle();
+
+  const preview = harness.sent.find((message) => message.type === "tabsearch-ai-preview");
+  assert.deepEqual(plain(preview), { type: "tabsearch-ai-preview", windowId: 1, tabIds: [20, 30] });
+  const apply = harness.sent.find((message) => message.type === "ai-group-apply");
+  assert.deepEqual(plain(apply), {
+    type: "ai-group-apply",
+    windowId: 1,
+    groups: [{ topic: "Research", color: "green", tabs: [{ id: 20 }, { id: 30 }] }],
+  });
+  assert.equal(overlayRoot(harness), null);
+});
+
+test("bulk close sends tabsearch-close-many and refreshes the list", async () => {
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-close-many") return SAMPLE_TABS.filter((tab) => !message.tabIds.includes(tab.id));
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  rows(harness)[1].querySelector(".mark").click();
+  Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "Close").click();
+  await settle();
+
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-close-many")), {
+    type: "tabsearch-close-many",
+    tabIds: [20, 30],
+  });
+  assert.deepEqual(rowTitles(harness), ["Mozilla"]);
+  assert.equal(markedRows(harness).length, 0);
+});
+
+test("More menu Pin sends tabsearch-set-pinned with the derived target", async () => {
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-set-pinned") {
+        return SAMPLE_TABS.map((tab) => (message.tabIds.includes(tab.id) ? { ...tab, pinned: message.pinned } : tab));
+      }
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  const pin = Array.from(overlayRoot(harness).querySelectorAll(".actions .menu button")).find((button) => button.textContent === "Pin");
+  pin.click();
+  await settle();
+
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-set-pinned")), {
+    type: "tabsearch-set-pinned",
+    tabIds: [20],
+    pinned: true,
+  });
+  assert.equal(markedRows(harness).length, 0);
+});
+
+test("Ctrl+Enter marks the highlighted row, advances, and plain Enter still activates", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  pressKey(harness, "Enter", { ctrl: true });
+  assert.deepEqual(markedRows(harness).map((row) => row.querySelector(".name").textContent), ["Docs"]);
+  assert.equal(rows(harness)[1].getAttribute("aria-selected"), "true");
+
+  pressKey(harness, "Enter");
+  await settle();
+
+  const activate = harness.sent.find((message) => message.type === "tabsearch-activate");
+  assert.deepEqual({ ...activate }, { type: "tabsearch-activate", tabId: 30, windowId: 1 });
+  assert.equal(overlayRoot(harness), null);
+});
+
+test("marks survive filtering and are pruned when a marked tab disappears", async () => {
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-close") return SAMPLE_TABS.filter((tab) => tab.id !== message.tabId);
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  const input = overlayRoot(harness).querySelector(".search");
+  input.value = "git";
+  input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
+  assert.equal(overlayRoot(harness).querySelector(".actions .count").textContent, "1 selected");
+  assert.equal(markedRows(harness).length, 0, "marked tab can be hidden by the current filter");
+
+  input.value = "";
+  input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
+  rows(harness)[0].querySelector(".close").click();
+  await settle();
+
+  assert.deepEqual(rowTitles(harness), ["GitHub", "Mozilla"]);
+  assert.equal(overlayRoot(harness).querySelector(".hint") !== null, true);
+});
+
+test("AI preview failure leaves selection and shows the returned message", async () => {
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-ai-preview") {
+        return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
+      }
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  rows(harness)[1].querySelector(".mark").click();
+  Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "AI group").click();
+  await settle();
+
+  assert.equal(overlayRoot(harness).querySelector(".actions .message").textContent, "AI tab grouping is turned off.");
+  assert.equal(markedRows(harness).length, 2);
+});
+
+test("browse mode renders a collapsible group section and collapsing hides its members", async () => {
+  const tabs = [
+    { id: 1, windowId: 1, title: "Docs", url: "https://docs.example.com", favIconUrl: "", active: true, currentWindow: true, pinned: false, grouped: false, groupId: -1 },
+    { id: 2, windowId: 1, title: "HN", url: "https://news.ycombinator.com", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "Read", groupColor: "green" },
+    { id: 3, windowId: 1, title: "Lobsters", url: "https://lobste.rs", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "Read", groupColor: "green" },
+  ];
+  const harness = createHarness({ tabs });
+  pressCtrlS(harness);
+  await settle();
+
+  const root = overlayRoot(harness);
+  const header = root.querySelector(".group-header");
+  assert.ok(header, "a group section header is rendered in browse mode");
+  assert.equal(header.querySelector(".group-badge").textContent, "Read");
+  assert.equal(header.querySelector(".gcount").textContent, "2");
+  // Members render, indented, with the per-row pill suppressed under the header.
+  assert.equal(rows(harness).length, 3);
+  assert.equal(root.querySelectorAll(".row.in-group").length, 2);
+  assert.equal(root.querySelector(".row.in-group .group-badge"), null);
+
+  // Collapsing keeps the header but hides (and de-navigates) the members.
+  header.click();
+  assert.ok(root.querySelector(".group-header.collapsed"));
+  assert.equal(rows(harness).length, 1);
+});
+
+test("dragging a row onto a group header groups it via the target groupId", async () => {
+  const tabs = [
+    { id: 1, windowId: 1, title: "Docs", url: "https://docs.example.com", favIconUrl: "", active: true, currentWindow: true, pinned: false, grouped: false, groupId: -1 },
+    { id: 2, windowId: 1, title: "HN", url: "https://news.ycombinator.com", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "Read", groupColor: "green" },
+  ];
+  const harness = createHarness({
+    tabs,
+    respond(message) {
+      if (message.type === "tabsearch-list") return tabs.slice();
+      if (message.type === "tabsearch-group") return { ok: true, list: tabs.slice() };
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  const root = overlayRoot(harness);
+  const docsRow = rows(harness)[0];
+  docsRow.dispatchEvent(new harness.window.Event("dragstart", { bubbles: true }));
+  const header = root.querySelector(".group-header");
+  header.dispatchEvent(new harness.window.Event("drop", { bubbles: true, cancelable: true }));
+  await settle();
+
+  const sent = harness.sent.find((message) => message.type === "tabsearch-group");
+  assert.ok(sent, "a group message was sent");
+  assert.equal(sent.groupId, 5);
+  assert.deepEqual(plain(sent.tabIds), [1]);
+  assert.equal(sent.windowId, 1);
+});
+
+test("dropping a row inside a group (between two members) moves it into that group", async () => {
+  const tabs = [
+    { id: 1, windowId: 1, title: "Docs", url: "https://d.com", favIconUrl: "", active: true, currentWindow: true, pinned: false, grouped: false, groupId: -1 },
+    { id: 2, windowId: 1, title: "A", url: "https://a.com", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "G", groupColor: "green" },
+    { id: 3, windowId: 1, title: "B", url: "https://b.com", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "G", groupColor: "green" },
+  ];
+  const harness = createHarness({
+    tabs,
+    respond(message) {
+      if (message.type === "tabsearch-list") return tabs.slice();
+      if (message.type === "tabsearch-move") return tabs.slice();
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  // Visible order: Docs, [G header], A, B. Drop Docs onto A's bottom half -> between A and B.
+  const rowsArr = rows(harness);
+  rowsArr[0].dispatchEvent(new harness.window.Event("dragstart", { bubbles: true }));
+  rowsArr[1].dispatchEvent(new harness.window.MouseEvent("drop", { bubbles: true, cancelable: true, clientY: 100 }));
+  await settle();
+
+  const sent = harness.sent.find((message) => message.type === "tabsearch-move");
+  assert.ok(sent, "a move message was sent");
+  assert.deepEqual(plain(sent.tabIds), [1]);
+  assert.equal(sent.anchorId, 2);
+  assert.equal(sent.placeAfter, true);
+  assert.equal(sent.groupId, 5);
+});
+
+test("dropping a grouped row among ungrouped rows drags it out of the group", async () => {
+  const tabs = [
+    { id: 1, windowId: 1, title: "Docs", url: "https://d.com", favIconUrl: "", active: true, currentWindow: true, pinned: false, grouped: false, groupId: -1 },
+    { id: 2, windowId: 1, title: "News", url: "https://n.com", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: false, groupId: -1 },
+    { id: 3, windowId: 1, title: "A", url: "https://a.com", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "G", groupColor: "green" },
+  ];
+  const harness = createHarness({
+    tabs,
+    respond(message) {
+      if (message.type === "tabsearch-list") return tabs.slice();
+      return tabs.slice();
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  // Visible order: Docs, News, [G header], A. Drop A onto Docs's top half -> before Docs (ungrouped).
+  const rowsArr = rows(harness);
+  rowsArr[2].dispatchEvent(new harness.window.Event("dragstart", { bubbles: true }));
+  rowsArr[0].dispatchEvent(new harness.window.MouseEvent("drop", { bubbles: true, cancelable: true, clientY: 0 }));
+  await settle();
+
+  const sent = harness.sent.find((message) => message.type === "tabsearch-move");
+  assert.ok(sent, "a move message was sent");
+  assert.deepEqual(plain(sent.tabIds), [3]);
+  assert.equal(sent.anchorId, 1);
+  assert.equal(sent.placeAfter, false);
+  assert.equal(sent.groupId, -1);
 });

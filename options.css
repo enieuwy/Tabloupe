@@ -559,9 +559,22 @@ label span {
   color: var(--muted);
 }
 
-.field input {
+.field input,
+.field textarea {
   width: 100%;
   box-sizing: border-box;
+}
+
+.field textarea {
+  min-height: 72px;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.45;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  color: var(--text);
 }
 
 input.mono {
@@ -764,12 +777,6 @@ input.mono {
   background: var(--surface);
 }
 
-.group-chips-ignored {
-  font-size: 12px;
-  font-style: italic;
-  color: var(--faint);
-}
-
 .group-chip[draggable="true"] {
   cursor: grab;
 }
@@ -783,6 +790,21 @@ input.mono {
   padding: 4px 12px;
   background: var(--surface);
   border-style: dashed;
+}
+
+.row-options {
+  margin-top: 8px;
+}
+
+.group-chip-pattern {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--accent-tint);
+}
+
+.pattern-hint {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--faint);
 }
 
 tr.drop-target td {
@@ -816,7 +838,7 @@ tr.drop-target td:first-child {
 }
 
 .col-action {
-  width: 50px;
+  width: 84px;
   text-align: right;
 }
 
@@ -842,6 +864,30 @@ tr.drop-target td:first-child {
 .icon-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+
+.row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 2px;
+}
+
+.icon-btn-options:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--fg);
+}
+
+.icon-btn-options svg {
+  transition: transform 0.15s ease;
+}
+
+.icon-btn-options.is-open svg {
+  transform: rotate(180deg);
+}
+
+.icon-btn-options.has-content {
+  color: var(--accent);
 }
 
 tbody tr {

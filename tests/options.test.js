@@ -120,7 +120,7 @@ test("renders saved mappings with name and group chips", async () => {
   assert.deepEqual(chips, ["Work", "Research"]);
 });
 
-test("non-array mapping entries render as ignored", async () => {
+test("non-array mapping entries render with no chips", async () => {
   const { document } = createHarness({
     storage: { focusMappings: { "com.apple.focus.work": 123 } }
   });
@@ -128,7 +128,7 @@ test("non-array mapping entries render as ignored", async () => {
 
   const chips = [...document.querySelectorAll("#mappings-body .group-chip-label")].map((c) => c.textContent);
   assert.deepEqual(chips, []);
-  assert.equal(document.querySelector("#mappings-body .group-chips-ignored").textContent, "ignored");
+  assert.equal(document.querySelector("#mappings-body .group-chips-ignored"), null);
 });
 
 test("known focus id renders its catalog name and an icon", async () => {
@@ -158,8 +158,8 @@ test("add custom mapping updates DOM and is dirty", async () => {
   assert.match(document.getElementById("status").textContent, /Unsaved changes/);
 });
 
-test("add custom mapping with empty title creates an ignored mapping", async () => {
-  const { document } = createHarness();
+test("add custom mapping with empty title creates an empty mapping", async () => {
+  const { window, document, storageData } = createHarness();
   await settle();
 
   document.getElementById("new-focus-id").value = "com.apple.ignore";
@@ -169,7 +169,10 @@ test("add custom mapping with empty title creates an ignored mapping", async () 
   const row = document.querySelector("#mappings-body tr");
   assert.equal(row.querySelector(".focus-name").textContent, "com.apple.ignore");
   assert.equal(row.querySelectorAll(".group-chip").length, 0);
-  assert.match(row.textContent, /ignored/);
+
+  document.getElementById("mappings-form").dispatchEvent(new window.Event("submit", { cancelable: true, bubbles: true }));
+  await settle();
+  assert.deepEqual(storageData.focusMappings["com.apple.ignore"], []);
 });
 
 test("the row add input adds a group chip via Enter", async () => {
@@ -568,3 +571,100 @@ test("Alt-dragging a chip copies the group to another mode, keeping the source",
   assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), ["Work"]);
   assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.personal-time")), ["Work"]);
 });
+
+test("glob entries render as pattern chips behind the options panel, not as main chips", async () => {
+  const { document } = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": ["Work", "Work-*"] } },
+  });
+  await settle();
+
+  const row = document.querySelector("#mappings-body tr:not(.unassigned-row)");
+  // The exact title is a main chip; the glob is not.
+  const mainChips = [...row.querySelector(".group-chips").querySelectorAll(".group-chip-label")].map((c) => c.textContent);
+  assert.deepEqual(mainChips, ["Work"]);
+  // The options button flags that the row holds patterns; the panel is collapsed.
+  const optionsBtn = row.querySelector(".icon-btn-options");
+  assert.ok(optionsBtn.classList.contains("has-content"));
+  assert.equal(optionsBtn.getAttribute("aria-expanded"), "false");
+  const panel = row.querySelector(".row-options");
+  assert.equal(panel.hidden, true);
+  const patternChips = [...panel.querySelectorAll(".group-chip-label")].map((c) => c.textContent);
+  assert.deepEqual(patternChips, ["Work-*"]);
+});
+
+test("the row options panel toggles open and closed", async () => {
+  const { document } = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": ["Work-*"] } },
+  });
+  await settle();
+
+  const row = document.querySelector("#mappings-body tr:not(.unassigned-row)");
+  const optionsBtn = row.querySelector(".icon-btn-options");
+  const panel = row.querySelector(".row-options");
+  assert.equal(panel.hidden, true);
+
+  optionsBtn.click();
+  assert.equal(panel.hidden, false);
+  assert.equal(optionsBtn.getAttribute("aria-expanded"), "true");
+  assert.ok(optionsBtn.classList.contains("is-open"));
+
+  optionsBtn.click();
+  assert.equal(panel.hidden, true);
+  assert.equal(optionsBtn.getAttribute("aria-expanded"), "false");
+});
+
+test("adding a pattern via the options input saves it as a plain mapping string", async () => {
+  const { window, document, storageData } = createHarness({
+    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } },
+  });
+  await settle();
+
+  const patternInput = document.querySelector("#mappings-body .pattern-input");
+  assert.ok(patternInput);
+  patternInput.value = "Work-*";
+  patternInput.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await settle();
+
+  // Adding opens the panel and shows the new pattern chip.
+  const row = document.querySelector("#mappings-body tr:not(.unassigned-row)");
+  assert.equal(row.querySelector(".row-options").hidden, false);
+  const patternChips = [...row.querySelector(".row-options").querySelectorAll(".group-chip-label")].map((c) => c.textContent);
+  assert.deepEqual(patternChips, ["Work-*"]);
+  assert.match(document.getElementById("status").textContent, /Unsaved changes/);
+
+  document.getElementById("mappings-form").dispatchEvent(new window.Event("submit", { cancelable: true, bubbles: true }));
+  await settle();
+
+  assert.deepEqual(storageData.focusMappings["com.apple.focus.work"], ["Work", "Work-*"]);
+});
+
+test("saving custom instructions stores them in local storage", async () => {
+  const harness = createHarness();
+  await settle();
+
+  harness.document.getElementById("ai-custom-instructions").value = "Use emojis in titles.";
+  harness.document.getElementById("provider-save").click();
+  await settle();
+
+  assert.equal(harness.storageData.aiGroupingCustomInstructions, "Use emojis in titles.");
+  assert.match(harness.document.getElementById("provider-status").textContent, /Saved/);
+});
+
+test("loads saved custom instructions into the textarea", async () => {
+  const harness = createHarness({ storage: { aiGroupingCustomInstructions: "Separate frontend and backend." } });
+  await settle();
+
+  assert.equal(harness.document.getElementById("ai-custom-instructions").value, "Separate frontend and backend.");
+});
+
+test("custom instructions longer than 500 characters are truncated on save", async () => {
+  const harness = createHarness();
+  await settle();
+
+  harness.document.getElementById("ai-custom-instructions").value = "y".repeat(600);
+  harness.document.getElementById("provider-save").click();
+  await settle();
+
+  assert.equal(harness.storageData.aiGroupingCustomInstructions.length, 500);
+});
+

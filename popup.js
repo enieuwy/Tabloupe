@@ -83,6 +83,26 @@ function renderIdle(groupableCount) {
   setActionsDisabled(false);
 }
 
+function renderPin(state) {
+  const row = el("ai-pin-row");
+  const box = el("ai-pin");
+  const label = el("ai-pin-label");
+  if (!row || !box || !label) return;
+  if (state.enabled !== true) {
+    row.hidden = true;
+    return;
+  }
+  row.hidden = false;
+  box.checked = state.pinToFocus === true;
+  if (state.activeFocus) {
+    box.disabled = false;
+    label.textContent = `Pin new groups to Focus: ${state.activeFocus}`;
+  } else {
+    box.disabled = true;
+    label.textContent = "Pin new groups to active Focus (none active)";
+  }
+}
+
 async function send(message) {
   return browser.runtime.sendMessage({ ...message, windowId });
 }
@@ -166,6 +186,7 @@ async function refresh({ autoPreview = true } = {}) {
   }
 
   el("ai-enabled").checked = state.enabled === true;
+  renderPin(state);
 
   if (state.enabled !== true) {
     renderDisabled();
@@ -198,6 +219,9 @@ async function init() {
   el("ai-enabled").addEventListener("change", async (event) => {
     await browser.storage.local.set({ aiGroupingEnabled: event.target.checked });
     await refresh();
+  });
+  el("ai-pin").addEventListener("change", async (event) => {
+    await browser.storage.local.set({ aiPinToFocus: event.target.checked });
   });
   el("ai-organize").addEventListener("click", runPreview);
   el("ai-regroup").addEventListener("click", runPreview);
