@@ -440,7 +440,7 @@ test("denied host permission does not store a custom provider", async () => {
   await settle();
 
   assert.equal(harness.storageData.aiProvider, undefined);
-  assert.match(harness.document.getElementById("provider-status").textContent, /denied/i);
+  assert.match(harness.document.querySelector("#toast-host .toast").textContent, /denied/i);
 });
 
 test("loads an existing custom provider into the form", async () => {
@@ -644,7 +644,7 @@ test("saving an edited grouping prompt stores it as the override", async () => {
   await settle();
 
   assert.equal(harness.storageData.aiGroupingPrompt, "Group tabs by domain. JSON only.");
-  assert.match(harness.document.getElementById("provider-status").textContent, /Saved/);
+  assert.match(harness.document.querySelector("#toast-host .toast").textContent, /Saved/);
 });
 
 test("loads a saved grouping prompt override into the textarea", async () => {

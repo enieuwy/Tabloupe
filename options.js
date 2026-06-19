@@ -981,13 +981,29 @@ function normalizeProvider(value) {
   return { kind: "foundation" };
 }
 
-function setProviderStatus(message, kind = "") {
-  const status = document.getElementById("provider-status");
-  if (!status) {
+let toastTimer = null;
+function showToast(message, kind = "") {
+  if (!message) {
     return;
   }
-  status.textContent = message;
-  status.className = kind;
+  const host = document.getElementById("toast-host");
+  if (!host) {
+    return;
+  }
+  const toast = document.createElement("div");
+  toast.className = `toast ${kind}`.trim();
+  toast.textContent = message;
+  host.replaceChildren(toast);
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => toast.classList.add("show"));
+  } else {
+    toast.classList.add("show");
+  }
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toast.classList.remove("show");
+    toast.addEventListener("transitionend", () => toast.remove(), { once: true });
+  }, kind === "error" ? 5000 : 3000);
 }
 
 function providerCustomVisible(visible) {
@@ -1023,7 +1039,6 @@ function applyProviderPreset(presetKey) {
   document.getElementById("provider-url").value = preset.baseURL;
   document.getElementById("provider-model").value = preset.model;
   document.getElementById("provider-key").focus();
-  setProviderStatus("");
 }
 
 function renderGroupingPrompt() {
@@ -1040,7 +1055,7 @@ async function resetGroupingPrompt() {
   if (field) {
     field.value = DEFAULT_GROUPING_PROMPT;
   }
-  setProviderStatus("Reset to the default grouping prompt.", "ok");
+  showToast("Reset to the default grouping prompt.", "ok");
 }
 
 async function saveProvider() {
@@ -1060,7 +1075,7 @@ async function saveProvider() {
     if (promptField) {
       promptField.value = promptOverride || DEFAULT_GROUPING_PROMPT;
     }
-    setProviderStatus("Saved — using the on-device Foundation model.", "ok");
+    showToast("Saved — using the on-device Foundation model.", "ok");
     return;
   }
 
@@ -1068,14 +1083,14 @@ async function saveProvider() {
   const model = document.getElementById("provider-model").value.trim();
   const apiKey = document.getElementById("provider-key").value.trim();
   if (!baseURL || !model) {
-    setProviderStatus("Enter both an API base URL and a model.", "error");
+    showToast("Enter both an API base URL and a model.", "error");
     return;
   }
   let origin;
   try {
     origin = new URL(baseURL).origin;
   } catch (error) {
-    setProviderStatus("That base URL is not valid.", "error");
+    showToast("That base URL is not valid.", "error");
     return;
   }
 
@@ -1084,11 +1099,11 @@ async function saveProvider() {
     granted = await browser.permissions.request({ origins: [`${origin}/*`] });
   } catch (error) {
     console.error("Host permission request failed:", error);
-    setProviderStatus("Could not request permission for that domain.", "error");
+    showToast("Could not request permission for that domain.", "error");
     return;
   }
   if (!granted) {
-    setProviderStatus("Permission denied — the extension can't reach that domain.", "error");
+    showToast("Permission denied — the extension can't reach that domain.", "error");
     return;
   }
 
@@ -1099,7 +1114,7 @@ async function saveProvider() {
   if (promptField) {
     promptField.value = promptOverride || DEFAULT_GROUPING_PROMPT;
   }
-  setProviderStatus(`Saved — using ${model} at ${origin}.`, "ok");
+  showToast(`Saved — using ${model} at ${origin}.`, "ok");
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -1169,14 +1184,14 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("provider-save").addEventListener("click", () => {
     saveProvider().catch((error) => {
       console.error("Provider save failed:", error);
-      setProviderStatus("Save failed. See extension console.", "error");
+      showToast("Save failed. See extension console.", "error");
     });
   });
 
   document.getElementById("ai-prompt-reset").addEventListener("click", () => {
     resetGroupingPrompt().catch((error) => {
       console.error("Grouping prompt reset failed:", error);
-      setProviderStatus("Reset failed. See extension console.", "error");
+      showToast("Reset failed. See extension console.", "error");
     });
   });
 
