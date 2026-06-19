@@ -93,6 +93,18 @@ function buildOverlay() {
   host.style.cssText = "all: initial;";
   shadow = host.attachShadow({ mode: "open" });
 
+  // Keep keystrokes inside the overlay. The input lives in this shadow root, so
+  // when key events bubble out to the host page's document they are retargeted to
+  // the host <div> (not a form field). Page-level hotkey handlers (e.g. GitHub's
+  // @github/hotkey, registered on document keydown in the bubble phase) then think
+  // no field is focused and steal focus to their own search box on every 's'/'/'.
+  // Our own handlers sit on deeper nodes (inputEl) and fire first; swallowing here
+  // only stops the event from leaving the overlay.
+  const swallowKey = (event) => event.stopPropagation();
+  host.addEventListener("keydown", swallowKey);
+  host.addEventListener("keypress", swallowKey);
+  host.addEventListener("keyup", swallowKey);
+
   const style = document.createElement("style");
   style.textContent = `
     :host { all: initial; }
