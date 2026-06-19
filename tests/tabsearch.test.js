@@ -707,3 +707,28 @@ test("dropping a grouped row among ungrouped rows drags it out of the group", as
   assert.equal(sent.placeAfter, false);
   assert.equal(sent.groupId, -1);
 });
+
+test("typing in the overlay does not leak key events to the host page (focus-steal guard)", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  // Simulate a page-level bubble keydown handler like @github/hotkey on document.
+  let pageSawKey = false;
+  harness.document.addEventListener("keydown", () => {
+    pageSawKey = true;
+  });
+
+  // A real keyboard event is composed:true, so it crosses the shadow boundary and
+  // is retargeted to the host <div> on its way to document.
+  const input = overlayRoot(harness).querySelector(".search");
+  const event = new harness.window.KeyboardEvent("keydown", {
+    key: "s",
+    bubbles: true,
+    composed: true,
+    cancelable: true,
+  });
+  input.dispatchEvent(event);
+
+  assert.equal(pageSawKey, false, "the host page never sees the keystroke while the overlay is open");
+});
