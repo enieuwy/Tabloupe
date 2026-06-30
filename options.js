@@ -51,6 +51,9 @@ const STORAGE_KEYS = [
   "aiProvider",
   "aiGroupingPrompt",
   "focusCatalog",
+  "lensSchedules",
+  "focusSessionHistory",
+  "automationFallback",
 ];
 
 const state = {
@@ -78,6 +81,9 @@ const state = {
   aiProvider: { kind: "foundation" },
   aiGroupingPrompt: "",
   focusCatalog: {},
+  lensSchedules: [],
+  focusSessionHistory: [],
+  automationFallback: { kind: "all" },
 };
 
 let recordingShortcut = false;
@@ -156,6 +162,30 @@ function normalizeLenses(value) {
     return [];
   }
   return value.map(normalizeLens).filter(Boolean);
+}
+
+function normalizeLensSchedules(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter(isRecord).map((schedule) => ({
+    lensId: typeof schedule.lensId === "string" ? schedule.lensId : "",
+    enabled: schedule.enabled === true,
+    days: Array.isArray(schedule.days)
+      ? [...new Set(schedule.days.filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))]
+      : [],
+    start: typeof schedule.start === "string" && /^\d{2}:\d{2}$/.test(schedule.start) ? schedule.start : "09:00",
+    end: typeof schedule.end === "string" && /^\d{2}:\d{2}$/.test(schedule.end) ? schedule.end : "17:00",
+  })).filter((schedule) => schedule.lensId);
+}
+
+function normalizeFocusSessionHistory(value) {
+  return Array.isArray(value) ? value.filter(isRecord).map((entry) => ({
+    view: isRecord(entry.view) ? entry.view : { kind: "all" },
+    trigger: typeof entry.trigger === "string" ? entry.trigger : "manual",
+    startedAt: typeof entry.startedAt === "number" ? entry.startedAt : null,
+    endedAt: typeof entry.endedAt === "number" ? entry.endedAt : null,
+    expandedGroups: normalizeStringArray(entry.expandedGroups),
+    collapsedGroups: normalizeStringArray(entry.collapsedGroups),
+  })).filter((entry) => entry.startedAt && entry.endedAt) : [];
 }
 
 function normalizeSeen(value) {
@@ -365,6 +395,9 @@ async function loadAll() {
   state.aiProvider = normalizeProvider(stored.aiProvider);
   state.aiGroupingPrompt = normalizeGroupingPrompt(stored.aiGroupingPrompt);
   state.focusCatalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
+  state.lensSchedules = normalizeLensSchedules(stored.lensSchedules);
+  state.focusSessionHistory = normalizeFocusSessionHistory(stored.focusSessionHistory);
+  state.automationFallback = isRecord(stored.automationFallback) ? stored.automationFallback : { kind: "all" };
   if (isRecord(lensState)) {
     if (isRecord(lensState.activeView)) {
       state.activeView = lensState.activeView;
@@ -1090,6 +1123,85 @@ function makeRowDropTarget(card, lens) {
   });
 }
 
+function scheduleForLens(lensId) {
+  return state.lensSchedules.find((schedule) => schedule.lensId === lensId) || {
+    lensId,
+    enabled: false,
+    days: [1, 2, 3, 4, 5],
+    start: "09:00",
+    end: "17:00",
+  };
+}
+
+async function persistLensSchedule(lensId, patch) {
+  const schedules = normalizeLensSchedules(state.lensSchedules);
+  const index = schedules.findIndex((schedule) => schedule.lensId === lensId);
+  const existing = index === -1 ? scheduleForLens(lensId) : schedules[index];
+  const next = { ...existing, ...patch, lensId };
+  if (index === -1) {
+    schedules.push(next);
+  } else {
+    schedules[index] = next;
+  }
+  state.lensSchedules = normalizeLensSchedules(schedules);
+  await browser.storage.local.set({ lensSchedules: state.lensSchedules });
+  render();
+}
+
+function makeScheduleEditor(lens) {
+  const schedule = scheduleForLens(lens.id);
+  const wrap = document.createElement("div");
+  wrap.className = "schedule-editor";
+  const label = document.createElement("label");
+  label.className = "toggle inline-toggle";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = schedule.enabled;
+  checkbox.addEventListener("change", () => {
+    persistLensSchedule(lens.id, { enabled: checkbox.checked }).catch((error) => {
+      console.error("Schedule save failed:", error);
+      setStatus("Schedule save failed. See extension console.", "error");
+    });
+  });
+  label.append(checkbox, document.createElement("span"));
+  label.lastChild.textContent = "Activate on a schedule";
+
+  const row = document.createElement("div");
+  row.className = "schedule-row";
+  const start = document.createElement("input");
+  start.type = "time";
+  start.value = schedule.start;
+  const end = document.createElement("input");
+  end.type = "time";
+  end.value = schedule.end;
+  const days = document.createElement("input");
+  days.type = "text";
+  days.className = "mono";
+  days.value = schedule.days.join(",");
+  days.placeholder = "1,2,3,4,5";
+  days.setAttribute("aria-label", `Schedule days for ${lens.name}`);
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "secondary compact";
+  save.textContent = "Save schedule";
+  save.addEventListener("click", () => {
+    const parsedDays = days.value.split(",")
+      .map((part) => Number.parseInt(part.trim(), 10))
+      .filter((day) => Number.isInteger(day) && day >= 0 && day <= 6);
+    persistLensSchedule(lens.id, { start: start.value || "09:00", end: end.value || "17:00", days: parsedDays }).catch((error) => {
+      console.error("Schedule save failed:", error);
+      setStatus("Schedule save failed. See extension console.", "error");
+    });
+  });
+  row.append("Days ", days, " from ", start, " to ", end, save);
+  const hint = document.createElement("p");
+  hint.className = "field-hint";
+  hint.textContent = "Days use 0=Sun through 6=Sat. Schedules are ignored while a live Apple Focus activation owns the current view.";
+  wrap.append(label, row, hint);
+  return wrap;
+}
+
+
 function renderLensCard(lens, index) {
   const card = document.createElement("article");
   const isActive = lensIsActive(lens);
@@ -1236,7 +1348,7 @@ function renderLensCard(lens, index) {
   const hint = document.createElement("p");
   hint.className = "pattern-hint";
   hint.textContent = "* = any text, ? = one character, e.g. Client *";
-  panel.append(hint, makeLensStyleEditor(lens));
+  panel.append(hint, makeLensStyleEditor(lens), makeScheduleEditor(lens));
   selectorSection.append(panel);
   card.append(selectorSection);
 
@@ -1628,6 +1740,78 @@ function formatRelativeTime(ms) {
   }
   return `${Math.floor(elapsedMinutes / 60)}h ago`;
 }
+function viewName(view) {
+  if (!isRecord(view) || view.kind === "all") return "All groups";
+  if (view.kind === "lens") {
+    const lens = findLens(view.lensId);
+    return lens ? lens.name : "Deleted lens";
+  }
+  return "View";
+}
+
+function renderActivity() {
+  const summary = document.getElementById("activity-summary");
+  const list = document.getElementById("activity-list");
+  if (!summary || !list) return;
+  list.textContent = "";
+  const sessions = state.focusSessionHistory.slice(-10).reverse();
+  if (sessions.length === 0) {
+    summary.textContent = "No sessions yet.";
+    return;
+  }
+  const totalMs = state.focusSessionHistory.reduce((sum, entry) => sum + Math.max(0, entry.endedAt - entry.startedAt), 0);
+  const totalMinutes = Math.round(totalMs / 60000);
+  summary.textContent = `${state.focusSessionHistory.length} session${state.focusSessionHistory.length === 1 ? "" : "s"} recorded, ${totalMinutes < 60 ? `${totalMinutes} min` : `${Math.round(totalMinutes / 60)}h`} total.`;
+  for (const session of sessions) {
+    const item = document.createElement("li");
+    const minutes = Math.max(1, Math.round((session.endedAt - session.startedAt) / 60000));
+    item.textContent = `${viewName(session.view)} — ${minutes} min via ${session.trigger}`;
+    list.append(item);
+  }
+}
+
+function exportSettings() {
+  const provider = isRecord(state.aiProvider) ? { ...state.aiProvider } : { kind: "foundation" };
+  delete provider.apiKey;
+  const payload = {
+    schemaVersion: 2,
+    exportedAt: new Date().toISOString(),
+    lenses: state.lenses,
+    activeView: state.activeView,
+    automationFallback: state.automationFallback,
+    lensSchedules: state.lensSchedules,
+    tabSearchShortcut: state.tabSearchShortcut,
+    aiProvider: provider,
+    aiGroupingPrompt: state.aiGroupingPrompt,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `tab-lens-settings-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+  showToast("Settings exported.", "success");
+}
+
+async function importSettingsFile(file) {
+  if (!file) return;
+  const text = await file.text();
+  const parsed = JSON.parse(text);
+  if (!isRecord(parsed)) throw new Error("Invalid settings file");
+  const values = {};
+  if (hasOwn(parsed, "lenses")) values.lenses = normalizeLenses(parsed.lenses);
+  if (hasOwn(parsed, "activeView") && isRecord(parsed.activeView)) values.activeView = parsed.activeView;
+  if (hasOwn(parsed, "automationFallback") && isRecord(parsed.automationFallback)) values.automationFallback = parsed.automationFallback;
+  if (hasOwn(parsed, "lensSchedules")) values.lensSchedules = normalizeLensSchedules(parsed.lensSchedules);
+  if (hasOwn(parsed, "tabSearchShortcut")) values.tabSearchShortcut = normalizeShortcut(parsed.tabSearchShortcut);
+  if (hasOwn(parsed, "aiProvider")) values.aiProvider = normalizeProvider(parsed.aiProvider);
+  if (hasOwn(parsed, "aiGroupingPrompt")) values.aiGroupingPrompt = normalizeGroupingPrompt(parsed.aiGroupingPrompt);
+  await browser.storage.local.set(values);
+  await loadAll();
+  showToast("Settings imported.", "success");
+}
+
 
 function renderDiagnostics() {
   const connection = document.getElementById("diag-connection");
@@ -1700,6 +1884,7 @@ function applyPendingFocus() {
 function render() {
   renderLenses();
   renderDiagnostics();
+  renderActivity();
   renderShortcut();
   applyPendingFocus();
 }
@@ -1835,6 +2020,15 @@ function applyStorageChange(changes) {
   }
   if (changes.focusCatalog) {
     state.focusCatalog = isRecord(changes.focusCatalog.newValue) ? changes.focusCatalog.newValue : {};
+  }
+  if (changes.lensSchedules) {
+    state.lensSchedules = normalizeLensSchedules(changes.lensSchedules.newValue);
+  }
+  if (changes.focusSessionHistory) {
+    state.focusSessionHistory = normalizeFocusSessionHistory(changes.focusSessionHistory.newValue);
+  }
+  if (changes.automationFallback) {
+    state.automationFallback = isRecord(changes.automationFallback.newValue) ? changes.automationFallback.newValue : { kind: "all" };
   }
   render();
 }
@@ -1999,6 +2193,7 @@ async function saveProvider() {
     return;
   }
 
+
   let granted;
   try {
     granted = await browser.permissions.request({ origins: [`${origin}/*`] });
@@ -2084,6 +2279,24 @@ document.addEventListener("DOMContentLoaded", () => {
     const reveal = input.type === "password";
     input.type = reveal ? "text" : "password";
     toggle.textContent = reveal ? "Hide" : "Show";
+  });
+
+  document.getElementById("settings-export").addEventListener("click", () => {
+    try {
+      exportSettings();
+    } catch (error) {
+      console.error("Settings export failed:", error);
+      showToast("Export failed. See extension console.", "error");
+    }
+  });
+  document.getElementById("settings-import").addEventListener("change", (event) => {
+    const file = event.target.files && event.target.files[0];
+    importSettingsFile(file).catch((error) => {
+      console.error("Settings import failed:", error);
+      showToast("Import failed. Check the JSON file.", "error");
+    }).finally(() => {
+      event.target.value = "";
+    });
   });
 
   browser.storage.onChanged.addListener((changes, areaName) => {

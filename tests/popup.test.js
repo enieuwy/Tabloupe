@@ -131,6 +131,32 @@ test("popup renders the active lens from lens-state", async () => {
   assert.equal(stateMsg.windowId, 7);
 });
 
+test("window automation selector saves a per-window profile", async () => {
+  const harness = createHarness({
+    respond: (message) => {
+      if (message.type === "lens-state") {
+        return defaultLensState({
+          windowProfile: { kind: "default" },
+          lenses: [{ id: "lens_work", name: "Work", icon: "briefcase", color: "blue", active: false }],
+          hasGroups: true,
+        });
+      }
+      if (message.type === "window-profile-set") return { ok: true, profile: message.profile };
+      return {};
+    },
+  });
+  await settle();
+
+  const select = harness.document.getElementById("window-profile");
+  select.value = "lens:lens_work";
+  select.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  await settle();
+
+  const profile = harness.sent.find((message) => message.type === "window-profile-set");
+  assert.equal(profile.windowId, 7);
+  assert.deepEqual(JSON.parse(JSON.stringify(profile.profile)), { kind: "lens", lensId: "lens_work" });
+});
+
 test("clicking a lens chip activates that lens for the current window", async () => {
   const harness = createHarness({
     respond: (message) => {

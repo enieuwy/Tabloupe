@@ -2314,3 +2314,90 @@ test("lens-reorder reorders the lenses array", async () => {
   assert.equal(result.ok, true);
   assert.deepEqual(harness.storageData.lenses.map((entry) => entry.id), ["lens_c", "lens_a", "lens_b"]);
 });
+
+test("scheduled lenses activate from the alarm tick", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])],
+      lensSchedules: [{ lensId: "lens_work", enabled: true, days: [1], start: "09:00", end: "17:00" }],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: true },
+    ],
+  });
+  await settle();
+
+  await harness.context.handleScheduleTick(new Date("2026-06-29T10:00:00"));
+
+  assert.equal(harness.storageData.lastActivation.trigger, "schedule");
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
+});
+
+test("window profile overrides automation per window", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [
+        lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["com.apple.focus.work"]),
+        lens("lens_personal", "Personal", [{ type: "title", value: "Personal" }]),
+      ],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Personal", collapsed: false },
+      { id: 3, windowId: 2, title: "Work", collapsed: false },
+      { id: 4, windowId: 2, title: "Personal", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: true },
+      { id: 30, windowId: 2, groupId: 3, active: true },
+      { id: 40, windowId: 2, groupId: 4, active: false },
+    ],
+  });
+  await settle();
+
+  await harness.request({ type: "window-profile-set", windowId: 2, profile: { kind: "lens", lensId: "lens_personal" } });
+  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", payload: { focus: { id: "com.apple.focus.work" } } }) });
+
+  assert.equal(harness.groupState.find((group) => group.id === 1).collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, true);
+  assert.equal(harness.groupState.find((group) => group.id === 3).collapsed, true);
+  assert.equal(harness.groupState.find((group) => group.id === 4).collapsed, false);
+});
+
+test("switching persisted views records a session history entry", async () => {
+  const harness = createHarness({
+    storage: {
+      activeView: { kind: "lens", lensId: "lens_work" },
+      lastActivation: { trigger: "manual", at: 1000 },
+      expandedGroups: ["Work"],
+      collapsedGroups: ["Other"],
+      lenses: [
+        lens("lens_work", "Work", [{ type: "title", value: "Work" }]),
+        lens("lens_other", "Other", [{ type: "title", value: "Other" }]),
+      ],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: false },
+      { id: 2, windowId: 1, title: "Other", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: true },
+      { id: 20, windowId: 1, groupId: 2, active: false },
+    ],
+  });
+  await settle();
+
+  await harness.request({ type: "lens-activate", windowId: 1, view: { kind: "lens", lensId: "lens_other" } });
+
+  assert.equal(harness.storageData.focusSessionHistory.length, 1);
+  assert.deepEqual(harness.storageData.focusSessionHistory[0].view, { kind: "lens", lensId: "lens_work" });
+  assert.deepEqual(harness.storageData.focusSessionHistory[0].expandedGroups, ["Work"]);
+  assert.deepEqual(harness.storageData.focusSessionHistory[0].collapsedGroups, ["Other"]);
+});

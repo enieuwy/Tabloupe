@@ -303,6 +303,40 @@ function renderCurrentGroups(state) {
   }
 }
 
+function renderWindowProfile(state) {
+  const select = el("window-profile");
+  if (!select) return;
+  const profile = state.windowProfile || { kind: "default" };
+  select.textContent = "";
+  const options = [
+    { value: "default", label: "Follow active automation" },
+    { value: "none", label: "Ignore automation" },
+  ];
+  for (const lens of state.lenses || []) {
+    options.push({ value: `lens:${lens.id}`, label: `Always show ${lens.name}` });
+  }
+  for (const option of options) {
+    const node = document.createElement("option");
+    node.value = option.value;
+    node.textContent = option.label;
+    select.appendChild(node);
+  }
+  select.value = profile.kind === "lens" ? `lens:${profile.lensId}` : profile.kind;
+}
+
+async function setWindowProfile(value) {
+  let profile = { kind: value };
+  if (value.startsWith("lens:")) {
+    profile = { kind: "lens", lensId: value.slice("lens:".length) };
+  }
+  const result = await send({ type: "window-profile-set", profile });
+  if (!result || result.ok === false) {
+    throw new Error(result && result.error ? result.error : "profile_failed");
+  }
+  await refreshLensState();
+}
+
+
 function renderLensState(state) {
   lensState = {
     activeView: { kind: "all" },
@@ -318,6 +352,7 @@ function renderLensState(state) {
   renderTriggerLine(lensState);
   renderLensChips(lensState);
   renderCurrentGroups(lensState);
+  renderWindowProfile(lensState);
   const empty = !lensState.hasGroups && (lensState.lenses || []).length === 0;
   el("empty-state").hidden = !empty;
   setLensStatus("");
@@ -556,6 +591,12 @@ async function init() {
 
   el("lens-show-all").addEventListener("click", () => activateView({ kind: "all" }));
   el("lens-save-window").addEventListener("click", saveWindowAsLens);
+  el("window-profile").addEventListener("change", (event) => {
+    setWindowProfile(event.target.value).catch((error) => {
+      console.error("Window profile save failed:", error);
+      setLensStatus("Could not save this window's automation setting.", "error");
+    });
+  });
   el("open-ai").addEventListener("click", openAiSubview);
   el("empty-organize").addEventListener("click", openAiSubview);
   el("lens-options").addEventListener("click", (event) => {
