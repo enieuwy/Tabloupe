@@ -25,10 +25,14 @@
 
 body {
   margin: 0;
-  width: 320px;
+  width: 340px;
   padding: 14px;
   background: var(--bg);
   color: var(--fg);
+}
+
+[hidden] {
+  display: none !important;
 }
 
 .popup-header {
@@ -46,10 +50,162 @@ h1 {
   letter-spacing: -0.01em;
 }
 
+.panel,
+.section,
+.empty-state {
+  margin-bottom: 12px;
+}
+
+.showing-panel {
+  display: grid;
+  gap: 8px;
+  padding: 11px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.showing-line {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.trigger-line {
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.section h2 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.lens-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.lens-chip {
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 9px;
+  border-color: var(--border);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12.5px;
+}
+
+.lens-chip:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.lens-chip.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.color-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.muted {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.window-groups {
+  display: grid;
+  gap: 8px;
+  max-height: 270px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.window-group {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.window-group-details {
+  min-width: 0;
+}
+
+.group-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.group-title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-saved {
+  margin: 3px 0 0 16px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.row-actions,
+.footer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.empty-state {
+  padding: 11px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.empty-state p {
+  margin: 0 0 10px;
+  color: var(--muted);
+}
+
+.ai-view {
+  min-height: 260px;
+}
+
 .toggle {
   display: flex;
   align-items: center;
   gap: 6px;
+  margin-bottom: 10px;
   font-size: 12px;
   color: var(--muted);
   cursor: pointer;
@@ -71,20 +227,24 @@ h1 {
   font-size: 12.5px;
 }
 
+.conn {
+  margin: -4px 0 10px;
+  min-height: 1em;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.conn-warn {
+  color: var(--danger);
+  font-weight: 600;
+}
+
 .pin-toggle {
   margin: 0 0 10px;
 }
 
-.pin-toggle[hidden] {
-  display: none;
-}
-
 .pin-toggle input:disabled {
   cursor: not-allowed;
-}
-
-.groups[hidden] {
-  display: none;
 }
 
 .groups {
@@ -109,6 +269,8 @@ h1 {
   font-size: 12.5px;
   font-weight: 600;
   color: var(--fg);
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 .group ul {
@@ -128,7 +290,7 @@ h1 {
 }
 
 .status {
-  margin: 0 0 10px;
+  margin: 10px 0 0;
   min-height: 1em;
   color: var(--muted);
   font-size: 12px;
@@ -159,7 +321,7 @@ button {
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  transition: background 0.12s ease;
+  transition: background 0.12s ease, border-color 0.12s ease;
 }
 
 button:hover:not(:disabled) {
@@ -181,6 +343,12 @@ button.secondary:hover:not(:disabled) {
   background: var(--border);
 }
 
+button.compact {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -188,10 +356,13 @@ button.secondary:hover:not(:disabled) {
 
 .options-link {
   display: inline-block;
-  margin-top: 12px;
   font-size: 12px;
   color: var(--accent-text);
   text-decoration: none;
+}
+
+.ai-view .options-link {
+  margin-top: 12px;
 }
 
 .options-link:hover {

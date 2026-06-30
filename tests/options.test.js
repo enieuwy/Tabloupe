@@ -6,7 +6,7 @@ const { JSDOM } = require("jsdom");
 
 const optionsHtml = fs.readFileSync(path.join(__dirname, "..", "options.html"), "utf8");
 const optionsJs = fs.readFileSync(path.join(__dirname, "..", "options.js"), "utf8");
-const htmlWithScript = optionsHtml.replace('<script defer src="options.js"></script>', `<script>${optionsJs}</script>`);
+const htmlWithScript = optionsHtml.replace('<script defer src="options.js"></script>', () => `<script>${optionsJs}</script>`);
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -22,7 +22,7 @@ async function settle() {
   await nextTick();
 }
 
-function createHarness({ storage = {}, groups = [], grantPermission = true } = {}) {
+function createHarness({ storage = {}, groups = [], grantPermission = true, platform = "MacIntel" } = {}) {
   const storageData = clone(storage) || {};
   const groupState = clone(groups);
   const storageListeners = [];
@@ -64,9 +64,78 @@ function createHarness({ storage = {}, groups = [], grantPermission = true } = {
         return clone(groupState);
       }
     },
+    windows: {
+      async getCurrent() {
+        return { id: 7 };
+      }
+    },
     runtime: {
       async sendMessage(msg) {
         messages.push(msg);
+        if (msg.type === "lens-state") {
+          const lenses = clone(storageData.lenses) || [];
+          return {
+            activeView: clone(storageData.activeView) || { kind: "all" },
+            lastActivation: clone(storageData.lastActivation) || null,
+            lenses: lenses.map((lens) => ({
+              id: lens.id,
+              name: lens.name,
+              icon: lens.icon,
+              color: lens.color,
+              active: storageData.activeView && storageData.activeView.kind === "lens" && storageData.activeView.lensId === lens.id,
+            })),
+            currentGroups: groupState.map((group) => ({ title: group.title, color: group.color || null, savedIn: clone(group.savedIn) || [], active: Boolean(group.active) })),
+            hasGroups: groupState.length > 0,
+            hasAppleBinding: lenses.some((lens) => lens.triggers && lens.triggers.appleFocusIds && lens.triggers.appleFocusIds.length > 0),
+            aiEnabled: true,
+          };
+        }
+        if (msg.type === "lens-save") {
+          const titles = [...new Set(groupState.map((group) => group.title).filter(Boolean))];
+          const now = Date.now();
+          const lens = {
+            id: msg.source === "empty" ? "lens_empty" : "lens_saved",
+            name: msg.name,
+            icon: "circle",
+            color: msg.color || null,
+            groupSelectors: msg.source === "window" ? titles.map((title) => ({ type: "title", value: title })) : [],
+            triggers: { appleFocusIds: [] },
+            createdAt: now,
+            updatedAt: now,
+          };
+          storageData.lenses = [...(storageData.lenses || []), clone(lens)];
+          return { ok: true, lens: clone(lens) };
+        }
+        if (msg.type === "lens-update") {
+          storageData.lenses = (storageData.lenses || []).map((lens) => (
+            lens.id === msg.lensId ? { ...lens, ...clone(msg.patch) } : lens
+          ));
+          return { ok: true };
+        }
+        if (msg.type === "lens-delete") {
+          storageData.lenses = (storageData.lenses || []).filter((lens) => lens.id !== msg.lensId);
+          return { ok: true };
+        }
+        if (msg.type === "lens-link-focus") {
+          storageData.lenses = (storageData.lenses || []).map((lens) => {
+            const ids = (lens.triggers && lens.triggers.appleFocusIds ? lens.triggers.appleFocusIds : [])
+              .filter((id) => id !== msg.focusId);
+            if (msg.lensId && lens.id === msg.lensId) {
+              ids.push(msg.focusId);
+            }
+            return { ...lens, triggers: { ...(lens.triggers || {}), appleFocusIds: [...new Set(ids)].sort() } };
+          });
+          return { ok: true };
+        }
+        if (msg.type === "lens-activate") {
+          storageData.activeView = clone(msg.view);
+          return { ok: true };
+        }
+        if (msg.type === "lens-reorder") {
+          const byId = new Map((storageData.lenses || []).map((lens) => [lens.id, lens]));
+          storageData.lenses = msg.orderedIds.map((id) => byId.get(id)).filter(Boolean);
+          return { ok: true };
+        }
       }
     },
     permissions: {
@@ -81,6 +150,11 @@ function createHarness({ storage = {}, groups = [], grantPermission = true } = {
     url: "http://localhost/",
     runScripts: "dangerously",
     beforeParse(window) {
+      try {
+        Object.defineProperty(window.navigator, "platform", { value: platform, configurable: true });
+      } catch (error) {
+        // Older jsdom versions may expose platform as non-configurable.
+      }
       window.browser = browser;
       // Polyfill requestAnimationFrame for jsdom if needed, but setTimeout works for settle
     }
@@ -98,176 +172,517 @@ function createHarness({ storage = {}, groups = [], grantPermission = true } = {
   };
 }
 
-test("initial render shows 'No Focus IDs' when empty", async () => {
-  const { document } = createHarness();
-  await settle();
+function lastMessageOfType(messages, type) {
+  return [...messages].reverse().find((message) => message.type === type);
+}
 
-  const tbody = document.getElementById("mappings-body");
-  assert.match(tbody.textContent, /No Focus IDs yet/);
-});
+function lensFixture(overrides = {}) {
+  return {
+    id: "lens_work",
+    name: "Work lens",
+    icon: "briefcase",
+    color: "#3366ff",
+    groupSelectors: [{ type: "title", value: "Work" }],
+    triggers: { appleFocusIds: [] },
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
 
-test("renders saved mappings with name and group chips", async () => {
-  const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work", "Research"] } }
-  });
-  await settle();
+function lensCard(document, lensId = "lens_work") {
+  return document.querySelector(`.lens-card[data-lens-id="${lensId}"]`);
+}
 
-  const rows = document.querySelectorAll("#mappings-body tr:not(.unassigned-row)");
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].querySelector(".focus-name").textContent, "Work");
-  assert.equal(rows[0].querySelector(".focus-name").title, "com.apple.focus.work");
-  const chips = [...rows[0].querySelectorAll(".group-chip-label")].map((c) => c.textContent);
-  assert.deepEqual(chips, ["Work", "Research"]);
-});
-
-test("non-array mapping entries render with no chips", async () => {
-  const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": 123 } }
-  });
-  await settle();
-
-  const chips = [...document.querySelectorAll("#mappings-body .group-chip-label")].map((c) => c.textContent);
-  assert.deepEqual(chips, []);
-  assert.equal(document.querySelector("#mappings-body .group-chips-ignored"), null);
-});
-
-test("known focus id renders its catalog name and an icon", async () => {
-  const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.personal-time": ["Personal"] } }
-  });
-  await settle();
-
-  const row = document.querySelector("#mappings-body tr");
-  assert.equal(row.querySelector(".focus-name").textContent, "Personal");
-  assert.ok(row.querySelector(".focus-icon"));
-});
-
-test("add custom focus id creates a row and is dirty", async () => {
-  const { document } = createHarness();
-  await settle();
-
-  document.getElementById("new-focus-id").value = "com.apple.custom";
-  document.getElementById("add-mapping").click();
-
-  const rows = document.querySelectorAll("#mappings-body tr:not(.unassigned-row)");
-  assert.equal(rows.length, 1);
-  // Unknown id falls back to showing the raw id as the name.
-  assert.equal(rows[0].querySelector(".focus-name").textContent, "com.apple.custom");
-  assert.equal(rows[0].querySelectorAll(".group-chip").length, 0);
-  assert.match(document.getElementById("status").textContent, /Unsaved changes/);
-});
-
-test("adding a focus id and saving stores an empty mapping", async () => {
-  const { window, document, storageData } = createHarness();
-  await settle();
-
-  document.getElementById("new-focus-id").value = "com.apple.ignore";
-  document.getElementById("add-mapping").click();
-
-  const row = document.querySelector("#mappings-body tr");
-  assert.equal(row.querySelector(".focus-name").textContent, "com.apple.ignore");
-  assert.equal(row.querySelectorAll(".group-chip").length, 0);
-
-  document.getElementById("mappings-form").dispatchEvent(new window.Event("submit", { cancelable: true, bubbles: true }));
-  await settle();
-  assert.deepEqual(storageData.focusMappings["com.apple.ignore"], []);
-});
-
-test("the row add input adds a group chip via Enter", async () => {
-  const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": [] } }
-  });
-  await settle();
-
-  const input = document.querySelector("#mappings-body .group-chip-input");
-  input.value = "Deep Work";
-  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
-
-  assert.deepEqual([...document.querySelectorAll("#mappings-body .group-chip-label")].map((c) => c.textContent), ["Deep Work"]);
-  assert.match(document.getElementById("status").textContent, /Unsaved changes/);
-});
-
-test("removing a group chip updates the draft", async () => {
-  const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work", "Research"] } }
-  });
-  await settle();
-
-  document.querySelectorAll("#mappings-body .group-chip-remove")[0].click();
-
-  assert.deepEqual([...document.querySelectorAll("#mappings-body .group-chip-label")].map((c) => c.textContent), ["Research"]);
-});
-
-test("save mappings writes arrays to storage and clears dirty state", async () => {
-  const { window, document, storageData } = createHarness();
-  await settle();
-
-  document.getElementById("new-focus-id").value = "com.apple.custom";
-  document.getElementById("add-mapping").click();
-
-  const input = document.querySelector("#mappings-body .group-chip-input");
-  input.value = "CustomGroup";
-  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
-
-  const form = document.getElementById("mappings-form");
-  form.dispatchEvent(new window.Event("submit", { cancelable: true, bubbles: true }));
-  await settle();
-
-  assert.deepEqual(storageData.focusMappings, { "com.apple.custom": ["CustomGroup"] });
-  assert.equal(document.getElementById("status").className, "ok");
-  assert.match(document.getElementById("status").textContent, /Saved/);
-});
-
-test("discard changes reverts to storage state", async () => {
-  const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } }
-  });
-  await settle();
-
-  const input = document.querySelector("#mappings-body .group-chip-input");
-  input.value = "Research";
-  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
-
-  assert.match(document.getElementById("status").textContent, /Unsaved changes/);
-  assert.deepEqual([...document.querySelectorAll("#mappings-body .group-chip-label")].map((c) => c.textContent), ["Work", "Research"]);
-
-  document.getElementById("discard").click();
-  await settle();
-
-  assert.deepEqual([...document.querySelectorAll("#mappings-body .group-chip-label")].map((c) => c.textContent), ["Work"]);
-  assert.match(document.getElementById("status").textContent, /Discarded changes/);
-});
-
-test("unmapped callout is displayed and map-it-now adds the focus row", async () => {
-  const { document } = createHarness({
-    storage: {
-      lastAction: "unmapped_focus_id",
-      unmappedFocusId: "com.apple.focus.new"
-    }
-  });
-  await settle();
-
-  const callout = document.getElementById("unmapped-callout");
-  assert.equal(callout.hidden, false);
-  assert.equal(document.getElementById("callout-focus-id").textContent, "com.apple.focus.new");
-
-  document.getElementById("callout-map-btn").click();
-
-  // A mapping row now exists for the previously-unmapped id.
-  const names = [...document.querySelectorAll("#mappings-body .focus-name")].map((n) => n.textContent);
-  assert.ok(names.includes("com.apple.focus.new"));
-  assert.match(document.getElementById("status").textContent, /Unsaved changes/);
-});
-
-test("apply-now button sends message", async () => {
+test("empty state renders first-run copy and no drag trays", async () => {
   const { document, messages } = createHarness();
   await settle();
 
-  document.getElementById("apply-now").click();
+  const list = document.getElementById("lenses-list");
+  assert.match(list.textContent, /No lenses yet/);
+  assert.match(list.textContent, /A lens shows only the tab groups you pick/);
+  assert.equal(list.querySelector(".lens-palette"), null);
+  assert.equal(list.querySelector(".focus-strip"), null);
+  assert.equal(messages[0].type, "lens-state");
+  assert.equal(messages[0].windowId, 7);
+});
+
+test("renders a lens row with group chips, trigger pills, and palette annotations", async () => {
+  const { document } = createHarness({
+    storage: {
+      activeView: { kind: "lens", lensId: "lens_work" },
+      lenses: [lensFixture({
+        groupSelectors: [{ type: "title", value: "Work" }, { type: "glob", value: "Client *" }],
+        triggers: { appleFocusIds: ["com.apple.focus.work"] },
+      })],
+      focusCatalog: { "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#3366ff" } },
+      seenFocusIds: { "com.apple.focus.work": { firstSeen: 1, lastSeen: 2 } },
+    },
+    groups: [
+      { id: 1, title: "Work", savedIn: ["lens_work"] },
+      { id: 2, title: "Scratch", savedIn: [] },
+      { id: 3, title: "Client A", savedIn: ["lens_work", "lens_client"] },
+    ],
+  });
   await settle();
 
-  assert.equal(messages.length, 1);
-  assert.equal(messages[0].type, "apply-current-focus");
+  const card = lensCard(document);
+  assert.ok(card);
+  assert.equal(card.querySelector(".lens-name-input").value, "Work lens");
+  assert.equal(card.querySelector(".lens-active-pill").textContent, "● active");
+  assert.equal(document.querySelector(".active-view-summary").textContent.includes("Showing: Work lens"), true);
+  assert.deepEqual(chipLabels(card.querySelector(".shows-zone")), ["Work", "Client *"]);
+  assert.equal(card.querySelector(".group-chip-pattern .group-chip-badge").textContent, "pattern");
+  assert.match(card.querySelector(".focus-pill").textContent, /Work/);
+  assert.match(document.querySelector(".lens-palette").textContent, /Scratch.*unused/s);
+  assert.match(document.querySelector(".lens-palette").textContent, /Client A.*in 2 lenses/s);
+});
+
+test("Save current window's groups as a lens uses the active group name and enters edit mode", async () => {
+  const { document, messages } = createHarness({
+    groups: [{ id: 1, title: "Work", active: true }, { id: 2, title: "Research" }],
+  });
+  await settle();
+
+  document.getElementById("save-window-lens").click();
+  await settle();
+
+  const save = lastMessageOfType(messages, "lens-save");
+  assert.ok(save);
+  assert.equal(save.windowId, 7);
+  assert.equal(save.source, "window");
+  assert.equal(save.name, "Work");
+  assert.ok(save.color);
+  const nameInput = lensCard(document, "lens_saved").querySelector(".lens-name-input");
+  assert.equal(document.activeElement, nameInput);
+  assert.equal(nameInput.selectionStart, 0);
+  assert.equal(nameInput.selectionEnd, "Work".length);
+});
+
+test("Save current window's groups falls back to Window lens without an active group", async () => {
+  const { document, messages } = createHarness({
+    groups: [{ id: 1, title: "Work" }, { id: 2, title: "Research" }],
+  });
+  await settle();
+
+  document.getElementById("save-window-lens").click();
+  await settle();
+
+  const save = lastMessageOfType(messages, "lens-save");
+  assert.ok(save);
+  assert.equal(save.source, "window");
+  assert.equal(save.name, "Window lens");
+});
+
+test("+ New lens sends lens-save for an empty lens and edits its default name", async () => {
+  const { document, messages } = createHarness({
+    storage: {
+      lenses: [lensFixture()],
+    },
+  });
+  await settle();
+
+  document.getElementById("new-empty-lens").click();
+  await settle();
+
+  const save = lastMessageOfType(messages, "lens-save");
+  assert.ok(save);
+  assert.equal(save.source, "empty");
+  assert.equal(save.name, "Lens 2");
+  assert.ok(save.color);
+  const nameInput = lensCard(document, "lens_empty").querySelector(".lens-name-input");
+  assert.equal(document.activeElement, nameInput);
+  assert.equal(nameInput.selectionStart, 0);
+  assert.equal(nameInput.selectionEnd, "Lens 2".length);
+});
+
+test("+ add group sends lens-update with an appended title selector", async () => {
+  const { document, messages } = createHarness({
+    storage: { lenses: [lensFixture({ groupSelectors: [] })] },
+    groups: [{ id: 1, title: "Deep Work" }],
+  });
+  await settle();
+
+  const input = lensCard(document).querySelector(".group-chip-input");
+  input.value = "Deep Work";
+  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await settle();
+
+  const update = lastMessageOfType(messages, "lens-update");
+  assert.ok(update);
+  assert.equal(update.lensId, "lens_work");
+  assert.deepEqual(clone(update.patch.groupSelectors), [{ type: "title", value: "Deep Work" }]);
+});
+
+test("adding the first group to a default-named lens auto-renames it", async () => {
+  const { document, messages } = createHarness({
+    storage: { lenses: [lensFixture({ name: "Lens 1", groupSelectors: [] })] },
+    groups: [{ id: 1, title: "Deep Work" }],
+  });
+  await settle();
+
+  const input = lensCard(document).querySelector(".group-chip-input");
+  input.value = "Deep Work";
+  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await settle();
+
+  const update = lastMessageOfType(messages, "lens-update");
+  assert.ok(update);
+  assert.deepEqual(clone(update.patch), {
+    groupSelectors: [{ type: "title", value: "Deep Work" }],
+    name: "Deep Work",
+  });
+});
+
+test("typing a wildcard in + add group appends a glob selector", async () => {
+  const { document, messages } = createHarness({
+    storage: { lenses: [lensFixture({ groupSelectors: [{ type: "title", value: "Work" }] })] },
+  });
+  await settle();
+
+  const input = lensCard(document).querySelector(".group-chip-input");
+  input.value = "Client *";
+  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await settle();
+
+  const update = lastMessageOfType(messages, "lens-update");
+  assert.deepEqual(clone(update.patch.groupSelectors), [
+    { type: "title", value: "Work" },
+    { type: "glob", value: "Client *" },
+  ]);
+});
+
+test("chip remove sends lens-update without that selector", async () => {
+  const { document, messages } = createHarness({
+    storage: {
+      lenses: [lensFixture({
+        groupSelectors: [{ type: "title", value: "Work" }, { type: "glob", value: "Client *" }],
+      })],
+    },
+  });
+  await settle();
+
+  lensCard(document).querySelector('[aria-label="Remove Work"]').click();
+  await settle();
+
+  const update = lastMessageOfType(messages, "lens-update");
+  assert.deepEqual(clone(update.patch.groupSelectors), [{ type: "glob", value: "Client *" }]);
+});
+
+test("selector chips show no-match and glob match indicators", async () => {
+  const { document } = createHarness({
+    storage: {
+      lenses: [lensFixture({
+        groupSelectors: [
+          { type: "title", value: "Missing" },
+          { type: "glob", value: "Client *" },
+          { type: "glob", value: "Doc?" },
+          { type: "glob", value: "work*" },
+          { type: "title", value: "Work" },
+        ],
+      })],
+    },
+    groups: [
+      { id: 1, title: "Work" },
+      { id: 2, title: "Work" },
+      { id: 3, title: "Client A" },
+      { id: 4, title: "Client B" },
+      { id: 5, title: "Client C" },
+      { id: 6, title: "Client D" },
+      { id: 7, title: "Docs" },
+    ],
+  });
+  await settle();
+
+  const chips = [...lensCard(document).querySelectorAll(".group-chip")];
+  assert.ok(chips.find((chip) => chip.textContent.includes("Missing")).classList.contains("is-muted"));
+  assert.match(chips.find((chip) => chip.textContent.includes("Missing")).textContent, /no match/);
+  assert.match(chips.find((chip) => chip.textContent.includes("Client *")).textContent, /pattern.*matches 4/s);
+  assert.match(chips.find((chip) => chip.textContent.includes("Doc?")).textContent, /pattern.*matches 1/s);
+  assert.ok(chips.find((chip) => chip.textContent.includes("work*")).classList.contains("is-muted"));
+  assert.match(chips.find((chip) => chip.textContent.includes("work*")).textContent, /no match/);
+  assert.match(chips.find((chip) => chip.textContent.includes("Work")).textContent, /in 2 groups/);
+});
+
+test("Activate when picker sends lens-link-focus", async () => {
+  const { document, messages } = createHarness({
+    storage: {
+      connectionState: "connected",
+      lenses: [lensFixture()],
+      focusCatalog: { "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#3366ff" } },
+      seenFocusIds: { "com.apple.focus.work": { firstSeen: 1, lastSeen: 2 } },
+    },
+  });
+  await settle();
+
+  lensCard(document).querySelector(".focus-picker-toggle").click();
+  await settle();
+  const select = lensCard(document).querySelector(".focus-picker");
+  assert.equal(select.hidden, false);
+  select.value = "com.apple.focus.work";
+  select.dispatchEvent(new document.defaultView.Event("change", { bubbles: true }));
+  await settle();
+
+  const link = lastMessageOfType(messages, "lens-link-focus");
+  assert.ok(link);
+  assert.equal(link.lensId, "lens_work");
+  assert.equal(link.focusId, "com.apple.focus.work");
+});
+
+test("unlinking a trigger pill sends lens-link-focus without lensId", async () => {
+  const { document, messages } = createHarness({
+    storage: {
+      lenses: [lensFixture({ triggers: { appleFocusIds: ["com.apple.focus.work"] } })],
+      focusCatalog: { "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#3366ff" } },
+    },
+  });
+  await settle();
+
+  lensCard(document).querySelector(".focus-pill-remove").click();
+  await settle();
+
+  const unlink = lastMessageOfType(messages, "lens-link-focus");
+  assert.ok(unlink);
+  assert.equal("lensId" in unlink, false);
+  assert.equal(unlink.focusId, "com.apple.focus.work");
+});
+
+test("lens Show button activates a lens and marks the row active", async () => {
+  const { document, messages } = createHarness({
+    storage: {
+      activeView: { kind: "all" },
+      lenses: [
+        lensFixture(),
+        lensFixture({ id: "lens_personal", name: "Personal", groupSelectors: [{ type: "title", value: "Personal" }] }),
+      ],
+    },
+  });
+  await settle();
+
+  lensCard(document).querySelector(".lens-show-button").click();
+  await settle();
+
+  const activate = lastMessageOfType(messages, "lens-activate");
+  assert.ok(activate);
+  assert.equal(activate.windowId, 7);
+  assert.deepEqual(clone(activate.view), { kind: "lens", lensId: "lens_work" });
+  assert.ok(lensCard(document).classList.contains("is-active"));
+  assert.equal(lensCard(document).querySelector(".lens-active-pill").textContent, "● active");
+});
+
+test("Show all groups control activates the all-groups view", async () => {
+  const { document, messages } = createHarness({
+    storage: {
+      activeView: { kind: "lens", lensId: "lens_work" },
+      lenses: [lensFixture()],
+    },
+  });
+  await settle();
+
+  document.querySelector(".show-all-groups").click();
+  await settle();
+
+  const activate = lastMessageOfType(messages, "lens-activate");
+  assert.ok(activate);
+  assert.equal(activate.windowId, 7);
+  assert.deepEqual(clone(activate.view), { kind: "all" });
+  assert.match(document.querySelector(".active-view-summary").textContent, /Showing: All groups/);
+});
+
+test("delete offers Undo and Undo restores through lens messages", async () => {
+  const { document, messages } = createHarness({
+    storage: {
+      lenses: [
+        lensFixture({
+          icon: "briefcase",
+          color: "#123456",
+          groupSelectors: [{ type: "title", value: "Work" }, { type: "glob", value: "Client *" }],
+          triggers: { appleFocusIds: ["com.apple.focus.work"] },
+        }),
+        lensFixture({ id: "lens_personal", name: "Personal", groupSelectors: [{ type: "title", value: "Personal" }] }),
+      ],
+      focusCatalog: { "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#3366ff" } },
+    },
+  });
+  await settle();
+
+  lensCard(document).querySelector('[aria-label="Delete lens Work lens"]').click();
+  await settle();
+  const status = document.getElementById("status");
+  const undo = status.querySelector("button");
+  assert.match(status.textContent, /Deleted Work lens · Undo/);
+  assert.ok(undo);
+
+  undo.click();
+  await settle();
+
+  const save = [...messages].reverse().find((message) => message.type === "lens-save" && message.name === "Work lens");
+  assert.ok(save);
+  assert.equal(save.source, "empty");
+  const update = [...messages].reverse().find((message) => message.type === "lens-update" && message.lensId === "lens_empty");
+  assert.deepEqual(clone(update.patch), {
+    icon: "briefcase",
+    color: "#123456",
+    groupSelectors: [{ type: "title", value: "Work" }, { type: "glob", value: "Client *" }],
+  });
+  const link = [...messages].reverse().find((message) => message.type === "lens-link-focus" && message.lensId === "lens_empty");
+  assert.equal(link.focusId, "com.apple.focus.work");
+  const reorder = lastMessageOfType(messages, "lens-reorder");
+  assert.deepEqual(clone(reorder.orderedIds), ["lens_empty", "lens_personal"]);
+});
+
+test("Activate when collapses to compact plus when a Focus pill exists", async () => {
+  const { document } = createHarness({
+    storage: {
+      lenses: [lensFixture({ triggers: { appleFocusIds: ["com.apple.focus.work"] } })],
+      focusCatalog: {
+        "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#3366ff" },
+        "com.apple.focus.personal-time": { name: "Personal", icon: "person", color: "#aa66ff" },
+      },
+      seenFocusIds: {
+        "com.apple.focus.work": { firstSeen: 1, lastSeen: 2 },
+        "com.apple.focus.personal-time": { firstSeen: 1, lastSeen: 2 },
+      },
+    },
+  });
+  await settle();
+
+  const card = lensCard(document);
+  const toggle = card.querySelector(".focus-picker-toggle");
+  assert.equal(toggle.textContent, "+");
+  assert.equal(toggle.title, "Link a macOS Focus mode");
+  assert.equal(toggle.getAttribute("aria-label"), "Link a macOS Focus mode to Work lens");
+  assert.equal(card.querySelector(".focus-pill").title, "When macOS Focus “Work” turns on → show this lens");
+});
+
+test("icon-only lens controls expose aria-labels", async () => {
+  const { document } = createHarness({
+    storage: {
+      lenses: [lensFixture({ triggers: { appleFocusIds: ["com.apple.focus.work"] } })],
+      focusCatalog: { "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#3366ff" } },
+    },
+  });
+  await settle();
+
+  const card = lensCard(document);
+  assert.equal(card.querySelector(".drag-handle").getAttribute("aria-label"), "Reorder Work lens");
+  assert.equal(card.querySelector('[aria-label="Move Work lens up"]').tagName, "BUTTON");
+  assert.equal(card.querySelector('[aria-label="Move Work lens down"]').tagName, "BUTTON");
+  assert.equal(card.querySelector(".lens-icon-button").getAttribute("aria-label"), "Edit icon and color for Work lens");
+  assert.equal(card.querySelector(".icon-btn-options").getAttribute("aria-label"), "Advanced options for Work lens");
+  assert.equal(card.querySelector('[aria-label="Delete lens Work lens"]').tagName, "BUTTON");
+  assert.equal(card.querySelector(".focus-picker-toggle").getAttribute("aria-label"), "Link a macOS Focus mode to Work lens");
+});
+
+test("reorder fallback sends lens-reorder", async () => {
+  const { document, messages } = createHarness({
+    storage: {
+      lenses: [
+        lensFixture(),
+        lensFixture({ id: "lens_personal", name: "Personal", groupSelectors: [{ type: "title", value: "Personal" }] }),
+      ],
+    },
+  });
+  await settle();
+
+  lensCard(document).querySelector('[aria-label="Move Work lens down"]').click();
+  await settle();
+
+  const reorder = lastMessageOfType(messages, "lens-reorder");
+  assert.ok(reorder);
+  assert.deepEqual(reorder.orderedIds, ["lens_personal", "lens_work"]);
+});
+
+test("trigger UI is hidden without Apple signals on non-macOS", async () => {
+  const { document } = createHarness({
+    platform: "Win32",
+    storage: { lenses: [lensFixture()] },
+  });
+  await settle();
+
+  assert.equal(lensCard(document).querySelector(".lens-trigger"), null);
+  assert.equal(document.querySelector(".focus-strip"), null);
+  assert.doesNotMatch(document.getElementById("lenses-list").textContent, /Activate when/);
+});
+
+test("migration summary reports imported legacy mappings", async () => {
+  const { document } = createHarness({
+    storage: {
+      legacyFocusMappingsBackup: {
+        "com.apple.focus.work": ["Work"],
+        "com.apple.focus.personal-time": ["Personal"],
+      },
+    },
+  });
+  await settle();
+
+  const summary = document.getElementById("migration-summary");
+  assert.equal(summary.hidden, false);
+  assert.match(summary.textContent, /Imported 2 lenses/);
+});
+
+test("diagnostics card is a collapsed details element", async () => {
+  const { document } = createHarness();
+  await settle();
+
+  const details = document.querySelector(".diagnostics");
+  assert.equal(details.tagName, "DETAILS");
+  assert.equal(details.hasAttribute("open"), false);
+  assert.equal(details.querySelector("summary").textContent.trim(), "Diagnostics");
+});
+
+test("apply-now is removed and no apply-current-focus message is sent", async () => {
+  const { document, messages } = createHarness();
+  await settle();
+
+  assert.equal(document.getElementById("apply-now"), null);
+  assert.equal(messages.some((message) => message.type === "apply-current-focus"), false);
+});
+
+test("diagnostics render daemon connection state live", async () => {
+  const { document, browser } = createHarness({
+    storage: { connectionState: "reconnecting" },
+  });
+  await settle();
+
+  assert.equal(document.getElementById("diag-connection").textContent, "Reconnecting");
+
+  await browser.storage.local.set({ connectionState: "connected" });
+  await settle();
+
+  assert.equal(document.getElementById("diag-connection").textContent, "Helper connected");
+});
+
+test("diagnostics render last error live", async () => {
+  const lastError = {
+    code: "cloud_http_401",
+    message: "Provider returned HTTP 401. Check your API key.",
+    at: Date.now(),
+    source: "ai",
+  };
+  const { document, browser } = createHarness({ storage: { lastError } });
+  await settle();
+
+  assert.match(document.getElementById("diag-last-error").textContent, /Provider returned HTTP 401\. Check your API key\./);
+
+  await browser.storage.local.set({ lastError: null });
+  await settle();
+
+  assert.equal(document.getElementById("diag-last-error").textContent, "None");
+});
+
+test("diagnostics render update failures live", async () => {
+  const { document, browser } = createHarness({
+    storage: { updateFailures: ["Work (window 1)"] },
+  });
+  await settle();
+
+  assert.match(document.getElementById("diag-update-failures").textContent, /Work \(window 1\)/);
+
+  await browser.storage.local.set({ updateFailures: [] });
+  await settle();
+
+  assert.equal(document.getElementById("diag-update-failures").textContent, "None");
 });
 
 test("diagnostics render failed tab-group updates", async () => {
@@ -455,184 +870,76 @@ test("loads an existing custom provider into the form", async () => {
   assert.equal(harness.document.getElementById("provider-key").value, "sk-x");
 });
 
-function dragChipTo(window, chip, target, { alt = false } = {}) {
-  chip.dispatchEvent(new window.Event("dragstart", { bubbles: true }));
-  const drop = new window.Event("drop", { bubbles: true, cancelable: true });
-  if (alt) Object.defineProperty(drop, "altKey", { value: true });
-  target.dispatchEvent(drop);
-}
-
-function rowForFocus(document, id) {
-  return [...document.querySelectorAll("#mappings-body tr")].find(
-    (row) => row.querySelector(".focus-name") && row.querySelector(".focus-name").title === id
-  );
-}
-
 function chipLabels(scope) {
   return [...scope.querySelectorAll(".group-chip-label")].map((c) => c.textContent);
 }
 
-test("cached MCC catalog overrides the bundled focus name", async () => {
+test("lens add input suggests live groups excluding its own title selectors", async () => {
   const { document } = createHarness({
-    storage: {
-      focusMappings: { "com.apple.focus.work": ["Work"] },
-      focusCatalog: { "com.apple.focus.work": { name: "Deep Work", icon: "briefcase", color: "#abc" } },
-    },
-  });
-  await settle();
-
-  assert.equal(document.querySelector("#mappings-body .focus-name").textContent, "Deep Work");
-});
-
-test("unassigned list shows Firefox groups not assigned to any focus", async () => {
-  const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } },
-    groups: [{ id: 1, title: "Work" }, { id: 2, title: "Reading" }, { id: 3, title: "News" }],
-  });
-  await settle();
-
-  assert.deepEqual(chipLabels(document.getElementById("unassigned-list")), ["News", "Reading"]);
-});
-
-test("dragging a chip onto another Focus row moves the group", async () => {
-  const { window, document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work"], "com.apple.focus.personal-time": [] } },
-    groups: [{ id: 1, title: "Work" }],
-  });
-  await settle();
-
-  const chip = rowForFocus(document, "com.apple.focus.work").querySelector(".group-chip");
-  dragChipTo(window, chip, rowForFocus(document, "com.apple.focus.personal-time"));
-
-  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), []);
-  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.personal-time")), ["Work"]);
-  assert.match(document.getElementById("status").textContent, /Unsaved changes/);
-});
-
-test("dragging a chip to the unassigned list unassigns the group", async () => {
-  const { window, document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } },
-    groups: [{ id: 1, title: "Work" }],
-  });
-  await settle();
-
-  const chip = rowForFocus(document, "com.apple.focus.work").querySelector(".group-chip");
-  dragChipTo(window, chip, document.getElementById("unassigned-list"));
-
-  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), []);
-  assert.deepEqual(chipLabels(document.getElementById("unassigned-list")), ["Work"]);
-});
-
-test("dragging an unassigned group onto a Focus row assigns it", async () => {
-  const { window, document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": [] } },
-    groups: [{ id: 1, title: "Reading" }],
-  });
-  await settle();
-
-  const chip = document.getElementById("unassigned-list").querySelector(".group-chip");
-  dragChipTo(window, chip, rowForFocus(document, "com.apple.focus.work"));
-
-  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), ["Reading"]);
-  assert.deepEqual(chipLabels(document.getElementById("unassigned-list")), []);
-});
-
-test("the row add input suggests groups from other modes, excluding its own", async () => {
-  const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work"], "com.apple.focus.personal-time": [] } },
+    storage: { lenses: [lensFixture({ groupSelectors: [{ type: "title", value: "Work" }] })] },
     groups: [{ id: 1, title: "Work" }, { id: 2, title: "Research" }, { id: 3, title: "Reading" }],
   });
   await settle();
 
-  const personalList = rowForFocus(document, "com.apple.focus.personal-time")
-    .querySelector(".group-chip-input").getAttribute("list");
-  const personalOptions = [...document.getElementById(personalList).querySelectorAll("option")].map((o) => o.value);
-  assert.deepEqual(personalOptions, ["Reading", "Research", "Work"]);
-
-  const workList = rowForFocus(document, "com.apple.focus.work")
-    .querySelector(".group-chip-input").getAttribute("list");
-  const workOptions = [...document.getElementById(workList).querySelectorAll("option")].map((o) => o.value);
-  assert.deepEqual(workOptions, ["Reading", "Research"]);
+  const listId = lensCard(document).querySelector(".group-chip-input").getAttribute("list");
+  const options = [...document.getElementById(listId).querySelectorAll("option")].map((o) => o.value);
+  assert.deepEqual(options, ["Reading", "Research"]);
 });
 
-test("Alt-dragging a chip copies the group to another mode, keeping the source", async () => {
-  const { window, document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work"], "com.apple.focus.personal-time": [] } },
-    groups: [{ id: 1, title: "Work" }],
-  });
-  await settle();
-
-  const chip = rowForFocus(document, "com.apple.focus.work").querySelector(".group-chip");
-  dragChipTo(window, chip, rowForFocus(document, "com.apple.focus.personal-time"), { alt: true });
-
-  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.work")), ["Work"]);
-  assert.deepEqual(chipLabels(rowForFocus(document, "com.apple.focus.personal-time")), ["Work"]);
-});
-
-test("glob entries render as pattern chips behind the options panel, not as main chips", async () => {
+test("glob selectors render as visible pattern chips in Shows", async () => {
   const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work", "Work-*"] } },
+    storage: {
+      lenses: [lensFixture({
+        groupSelectors: [{ type: "title", value: "Work" }, { type: "glob", value: "Work-*" }],
+      })],
+    },
   });
   await settle();
 
-  const row = document.querySelector("#mappings-body tr:not(.unassigned-row)");
-  // The exact title is a main chip; the glob is not.
-  const mainChips = [...row.querySelector(".group-chips").querySelectorAll(".group-chip-label")].map((c) => c.textContent);
-  assert.deepEqual(mainChips, ["Work"]);
-  // The options button flags that the row holds patterns; the panel is collapsed.
-  const optionsBtn = row.querySelector(".icon-btn-options");
-  assert.ok(optionsBtn.classList.contains("has-content"));
-  assert.equal(optionsBtn.getAttribute("aria-expanded"), "false");
-  const panel = row.querySelector(".row-options");
-  assert.equal(panel.hidden, true);
-  const patternChips = [...panel.querySelectorAll(".group-chip-label")].map((c) => c.textContent);
-  assert.deepEqual(patternChips, ["Work-*"]);
+  const card = lensCard(document);
+  assert.deepEqual(chipLabels(card.querySelector(".shows-zone")), ["Work", "Work-*"]);
+  assert.equal(card.querySelector(".group-chip-pattern .group-chip-badge").textContent, "pattern");
+  assert.equal(card.querySelector(".row-options").hidden, true);
 });
 
-test("the row options panel toggles open and closed", async () => {
+test("the lens advanced panel toggles open and closed", async () => {
   const { document } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work-*"] } },
+    storage: { lenses: [lensFixture({ groupSelectors: [{ type: "glob", value: "Work-*" }] })] },
   });
   await settle();
 
-  const row = document.querySelector("#mappings-body tr:not(.unassigned-row)");
-  const optionsBtn = row.querySelector(".icon-btn-options");
-  const panel = row.querySelector(".row-options");
-  assert.equal(panel.hidden, true);
+  let card = lensCard(document);
+  let optionsBtn = card.querySelector(".icon-btn-options");
+  assert.equal(card.querySelector(".row-options").hidden, true);
 
   optionsBtn.click();
-  assert.equal(panel.hidden, false);
+  await settle();
+  card = lensCard(document);
+  optionsBtn = card.querySelector(".icon-btn-options");
+  assert.equal(card.querySelector(".row-options").hidden, false);
   assert.equal(optionsBtn.getAttribute("aria-expanded"), "true");
   assert.ok(optionsBtn.classList.contains("is-open"));
 
   optionsBtn.click();
-  assert.equal(panel.hidden, true);
-  assert.equal(optionsBtn.getAttribute("aria-expanded"), "false");
+  await settle();
+  card = lensCard(document);
+  assert.equal(card.querySelector(".row-options").hidden, true);
+  assert.equal(card.querySelector(".icon-btn-options").getAttribute("aria-expanded"), "false");
 });
 
-test("adding a pattern via the options input saves it as a plain mapping string", async () => {
-  const { window, document, storageData } = createHarness({
-    storage: { focusMappings: { "com.apple.focus.work": ["Work"] } },
+test("advanced panel shows glob help and icon color editors", async () => {
+  const { document } = createHarness({
+    storage: { lenses: [lensFixture()] },
   });
   await settle();
 
-  const patternInput = document.querySelector("#mappings-body .pattern-input");
-  assert.ok(patternInput);
-  patternInput.value = "Work-*";
-  patternInput.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  lensCard(document).querySelector(".icon-btn-options").click();
   await settle();
 
-  // Adding opens the panel and shows the new pattern chip.
-  const row = document.querySelector("#mappings-body tr:not(.unassigned-row)");
-  assert.equal(row.querySelector(".row-options").hidden, false);
-  const patternChips = [...row.querySelector(".row-options").querySelectorAll(".group-chip-label")].map((c) => c.textContent);
-  assert.deepEqual(patternChips, ["Work-*"]);
-  assert.match(document.getElementById("status").textContent, /Unsaved changes/);
-
-  document.getElementById("mappings-form").dispatchEvent(new window.Event("submit", { cancelable: true, bubbles: true }));
-  await settle();
-
-  assert.deepEqual(storageData.focusMappings["com.apple.focus.work"], ["Work", "Work-*"]);
+  const panel = lensCard(document).querySelector(".row-options");
+  assert.match(panel.textContent, /\* = any text, \? = one character, e\.g\. Client \*/);
+  assert.ok(panel.querySelector('input[aria-label="Icon for Work lens"]'));
+  assert.ok(panel.querySelector('input[aria-label="Color for Work lens"]'));
 });
 
 test("saving an edited grouping prompt stores it as the override", async () => {

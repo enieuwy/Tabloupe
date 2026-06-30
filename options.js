@@ -9,6 +9,16 @@ const DEFAULT_FOCUS_ORDER = [
 
 const DEFAULT_TAB_SEARCH_SHORTCUT = Object.freeze({ ctrl: true, alt: false, shift: false, meta: false, key: "s" });
 const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent || "");
+const LENS_COLOR_PALETTE = Object.freeze([
+  "#0060df",
+  "#00a7e0",
+  "#12bc00",
+  "#ff9400",
+  "#d70022",
+  "#b5007f",
+  "#7c5cff",
+  "#d7b600",
+]);
 
 // Default AI grouping system prompt. MUST stay identical to GROUPING_SYSTEM_PROMPT
 // in background.js so a field equal to the default can be stored as an empty
@@ -21,7 +31,10 @@ const DEFAULT_GROUPING_PROMPT =
   '{"groups":[{"topic":"...","tabIndices":[0,1]}]} and nothing else.';
 
 const STORAGE_KEYS = [
-  "focusMappings",
+  "lenses",
+  "activeView",
+  "lastActivation",
+  "legacyFocusMappingsBackup",
   "seenFocusIds",
   "lastFocusSeen",
   "lastAction",
@@ -32,6 +45,8 @@ const STORAGE_KEYS = [
   "expandedGroups",
   "collapsedGroups",
   "updateFailures",
+  "connectionState",
+  "lastError",
   "tabSearchShortcut",
   "aiProvider",
   "aiGroupingPrompt",
@@ -39,31 +54,43 @@ const STORAGE_KEYS = [
 ];
 
 const state = {
-  focusMappings: {},
+  windowId: undefined,
+  lenses: [],
+  activeView: { kind: "all" },
+  lastActivation: null,
+  legacyFocusMappingsBackup: null,
   seenFocusIds: {},
   lastFocusSeen: null,
   lastAction: null,
   groupTitles: [],
   firefoxGroupTitles: [],
+  firefoxGroupTitleCounts: {},
+  currentGroups: [],
   unmappedFocusId: null,
   missingGroup: null,
   emptyGroup: null,
   expandedGroups: [],
   collapsedGroups: [],
   updateFailures: [],
+  connectionState: "disconnected",
+  lastError: null,
   tabSearchShortcut: { ...DEFAULT_TAB_SEARCH_SHORTCUT },
   aiProvider: { kind: "foundation" },
   aiGroupingPrompt: "",
   focusCatalog: {},
 };
 
-let draftMappings = {};
-let dirty = false;
 let recordingShortcut = false;
 let activeAdderId = null;
-let activePatternAdderId = null;
-const expandedPatternRows = new Set();
-
+let activeFocusPickerId = null;
+let pendingNameEditId = null;
+let openIconEditorId = null;
+let dragState = null;
+let rowDragState = null;
+let statusUndoTimer = null;
+const expandedLensRows = new Set();
+const untouchedDefaultLensIds = new Set();
+const userNamedLensIds = new Set();
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -76,47 +103,71 @@ function isGlobPattern(entry) {
   return /[*?]/.test(entry);
 }
 
-// A focus maps to a list of tab-group titles. [] means "seen but ignored".
-function normalizeTitles(value) {
+function normalizeSelector(value) {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const type = value.type === "glob" ? "glob" : value.type === "title" ? "title" : null;
+  const selectorValue = typeof value.value === "string" ? value.value.trim() : "";
+  if (!type || !selectorValue) {
+    return null;
+  }
+  return { type, value: selectorValue };
+}
+
+function normalizeSelectors(value) {
   if (!Array.isArray(value)) {
     return [];
   }
   const seen = new Set();
-  const titles = [];
+  const selectors = [];
   for (const item of value) {
-    if (typeof item !== "string") continue;
-    const title = item.trim();
-    if (title && !seen.has(title)) {
-      seen.add(title);
-      titles.push(title);
-    }
+    const selector = normalizeSelector(item);
+    if (!selector) continue;
+    const key = `${selector.type}:${selector.value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    selectors.push(selector);
   }
-  return titles;
+  return selectors;
 }
 
-function normalizeMappings(value) {
-  const output = {};
-  if (!isRecord(value)) {
-    return output;
+function normalizeLens(value) {
+  if (!isRecord(value) || typeof value.id !== "string" || value.id.length === 0) {
+    return null;
   }
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof key === "string") {
-      output[key] = normalizeTitles(entry);
-    }
-  }
-  return output;
+  return {
+    id: value.id,
+    name: typeof value.name === "string" && value.name.trim() ? value.name.trim() : "Untitled lens",
+    icon: typeof value.icon === "string" && value.icon.trim() ? value.icon.trim() : "target",
+    color: typeof value.color === "string" && value.color.trim() ? value.color.trim() : null,
+    groupSelectors: normalizeSelectors(value.groupSelectors),
+    triggers: {
+      appleFocusIds: isRecord(value.triggers) ? normalizeStringArray(value.triggers.appleFocusIds) : [],
+    },
+    createdAt: typeof value.createdAt === "number" ? value.createdAt : Date.now(),
+    updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : Date.now(),
+    migratedFrom: isRecord(value.migratedFrom) ? value.migratedFrom : undefined,
+  };
 }
 
-function cloneMappings(mappings) {
-  const output = {};
-  for (const [id, titles] of Object.entries(mappings)) {
-    output[id] = [...titles];
+function normalizeLenses(value) {
+  if (!Array.isArray(value)) {
+    return [];
   }
-  return output;
+  return value.map(normalizeLens).filter(Boolean);
 }
 
 function normalizeSeen(value) {
   const output = {};
+  if (Array.isArray(value)) {
+    for (const id of value) {
+      if (typeof id === "string" && id) {
+        output[id] = { firstSeen: null, lastSeen: null };
+      }
+    }
+    return output;
+  }
   if (!isRecord(value)) {
     return output;
   }
@@ -132,8 +183,40 @@ function normalizeSeen(value) {
   return output;
 }
 
+function normalizeCurrentGroups(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((group) => isRecord(group) && typeof group.title === "string" && group.title.length > 0)
+    .map((group) => ({
+      title: group.title,
+      color: typeof group.color === "string" ? group.color : null,
+      savedIn: Array.isArray(group.savedIn) ? normalizeStringArray(group.savedIn) : null,
+      active: Boolean(group.active),
+    }));
+}
+
 function normalizeStringArray(value) {
   return Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+}
+
+function normalizeLastError(value) {
+  if (
+    isRecord(value) &&
+    typeof value.code === "string" &&
+    typeof value.message === "string" &&
+    typeof value.at === "number" &&
+    value.source === "ai"
+  ) {
+    return {
+      code: value.code,
+      message: value.message,
+      at: value.at,
+      source: "ai",
+    };
+  }
+  return null;
 }
 
 function normalizeShortcut(value) {
@@ -161,91 +244,165 @@ function formatShortcut(shortcut) {
   return parts.join(" + ");
 }
 
-function uniqueSortedTitles(groups) {
-  return [...new Set(groups.map((group) => group.title).filter((title) => typeof title === "string" && title.length > 0))]
+function uniqueSortedTitlesFromValues(titles) {
+  return [...new Set(titles.filter((title) => typeof title === "string" && title.length > 0))]
     .sort((a, b) => a.localeCompare(b));
 }
 
-async function queryGroupTitles() {
+async function queryFirefoxGroupSnapshot() {
   try {
     const groups = await browser.tabGroups.query({});
-    return uniqueSortedTitles(groups);
+    const counts = {};
+    const currentGroups = [];
+    for (const group of groups) {
+      if (typeof group.title !== "string" || group.title.length === 0) continue;
+      counts[group.title] = (counts[group.title] || 0) + 1;
+      currentGroups.push({
+        title: group.title,
+        color: typeof group.color === "string" ? group.color : null,
+        savedIn: null,
+        active: Boolean(group.active),
+      });
+    }
+    return {
+      titles: uniqueSortedTitlesFromValues(Object.keys(counts)),
+      counts,
+      currentGroups,
+    };
   } catch (error) {
     console.error("Firefox tab group query failed:", error);
-    return [];
+    return { titles: [], counts: {}, currentGroups: [] };
+  }
+}
+
+function normalizeConnectionState(value) {
+  if (value === "connected") {
+    return "connected";
+  }
+  if (value === "reconnecting" || value === "connecting") {
+    return "reconnecting";
+  }
+  return "disconnected";
+}
+
+async function currentWindowId() {
+  if (!browser.windows || typeof browser.windows.getCurrent !== "function") {
+    return undefined;
+  }
+  try {
+    const current = await browser.windows.getCurrent();
+    return current && typeof current.id === "number" ? current.id : undefined;
+  } catch (error) {
+    console.error("Current window lookup failed:", error);
+    return undefined;
+  }
+}
+
+async function requestLensState(windowId) {
+  try {
+    return await browser.runtime.sendMessage({ type: "lens-state", windowId });
+  } catch (error) {
+    console.error("Lens state request failed:", error);
+    return null;
+  }
+}
+
+function mergeLensStateSummaries(lensSummaries) {
+  if (!Array.isArray(lensSummaries)) {
+    return;
+  }
+  const byId = new Map(state.lenses.map((lens) => [lens.id, lens]));
+  for (const summary of lensSummaries) {
+    if (!isRecord(summary) || typeof summary.id !== "string") continue;
+    const existing = byId.get(summary.id);
+    if (!existing) continue;
+    if (typeof summary.name === "string" && summary.name.trim()) {
+      existing.name = summary.name.trim();
+    }
+    if (typeof summary.icon === "string" && summary.icon.trim()) {
+      existing.icon = summary.icon.trim();
+    }
+    if (typeof summary.color === "string" && summary.color.trim()) {
+      existing.color = summary.color.trim();
+    }
+    if (summary.active) {
+      state.activeView = { kind: "lens", lensId: summary.id };
+    }
   }
 }
 
 async function loadAll() {
-  const [stored, firefoxGroupTitles] = await Promise.all([
+  const windowId = await currentWindowId();
+  state.windowId = windowId;
+  const [stored, firefoxSnapshot, lensState] = await Promise.all([
     browser.storage.local.get(STORAGE_KEYS),
-    queryGroupTitles(),
+    queryFirefoxGroupSnapshot(),
+    requestLensState(windowId),
   ]);
 
-  state.focusMappings = normalizeMappings(stored.focusMappings);
+  state.lenses = normalizeLenses(stored.lenses);
+  state.activeView = isRecord(stored.activeView) ? stored.activeView : { kind: "all" };
+  state.lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : null;
+  state.legacyFocusMappingsBackup = isRecord(stored.legacyFocusMappingsBackup) ? stored.legacyFocusMappingsBackup : null;
   state.seenFocusIds = normalizeSeen(stored.seenFocusIds);
   state.lastFocusSeen = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
   state.lastAction = typeof stored.lastAction === "string" ? stored.lastAction : null;
   state.groupTitles = normalizeStringArray(stored.groupTitles);
-  state.firefoxGroupTitles = firefoxGroupTitles;
+  state.firefoxGroupTitles = firefoxSnapshot.titles;
+  state.firefoxGroupTitleCounts = firefoxSnapshot.counts;
+  state.currentGroups = firefoxSnapshot.currentGroups;
   state.unmappedFocusId = typeof stored.unmappedFocusId === "string" ? stored.unmappedFocusId : null;
   state.missingGroup = typeof stored.missingGroup === "string" ? stored.missingGroup : null;
   state.emptyGroup = typeof stored.emptyGroup === "string" ? stored.emptyGroup : null;
   state.expandedGroups = normalizeStringArray(stored.expandedGroups);
   state.collapsedGroups = normalizeStringArray(stored.collapsedGroups);
   state.updateFailures = normalizeStringArray(stored.updateFailures);
+  state.connectionState = normalizeConnectionState(stored.connectionState);
+  state.lastError = normalizeLastError(stored.lastError);
   state.tabSearchShortcut = "tabSearchShortcut" in stored
     ? normalizeShortcut(stored.tabSearchShortcut)
     : { ...DEFAULT_TAB_SEARCH_SHORTCUT };
   state.aiProvider = normalizeProvider(stored.aiProvider);
   state.aiGroupingPrompt = normalizeGroupingPrompt(stored.aiGroupingPrompt);
   state.focusCatalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
-  if (!dirty) {
-    draftMappings = cloneMappings(state.focusMappings);
+  if (isRecord(lensState)) {
+    if (isRecord(lensState.activeView)) {
+      state.activeView = lensState.activeView;
+    }
+    if (isRecord(lensState.lastActivation)) {
+      state.lastActivation = lensState.lastActivation;
+    }
+    if (Array.isArray(lensState.currentGroups)) {
+      const liveGroups = normalizeCurrentGroups(lensState.currentGroups);
+      const liveCounts = {};
+      for (const group of liveGroups) {
+        liveCounts[group.title] = (liveCounts[group.title] || 0) + 1;
+      }
+      state.currentGroups = liveGroups;
+      state.firefoxGroupTitles = uniqueSortedTitlesFromValues(Object.keys(liveCounts));
+      state.firefoxGroupTitleCounts = liveCounts;
+    }
+    mergeLensStateSummaries(lensState.lenses);
   }
+  syncUntouchedDefaultLenses();
 
   render();
   renderProvider();
   renderGroupingPrompt();
 }
 
-function sortedFocusIds() {
-  const ids = new Set([
-    ...Object.keys(draftMappings),
-    ...Object.keys(state.seenFocusIds),
-  ]);
-  const order = new Map(DEFAULT_FOCUS_ORDER.map((id, index) => [id, index]));
-
-  return [...ids].sort((a, b) => {
-    const aIndex = order.has(a) ? order.get(a) : Number.MAX_SAFE_INTEGER;
-    const bIndex = order.has(b) ? order.get(b) : Number.MAX_SAFE_INTEGER;
-    if (aIndex !== bIndex) {
-      return aIndex - bIndex;
-    }
-    return a.localeCompare(b);
-  });
+function clearStatusUndoTimer() {
+  window.clearTimeout(statusUndoTimer);
+  statusUndoTimer = null;
 }
 
 function setStatus(message, kind = "") {
+  clearStatusUndoTimer();
   const status = document.getElementById("status");
-  status.textContent = message;
+  status.replaceChildren(document.createTextNode(message));
   status.className = kind;
 }
 
-function markDirty() {
-  dirty = true;
-  setStatus("Unsaved changes", "");
-}
-
-function makeStatus(kind, label) {
-  const tag = document.createElement("span");
-  tag.className = `status-tag status-${kind}`;
-  const dot = document.createElement("span");
-  dot.className = "status-dot";
-  dot.setAttribute("aria-hidden", "true");
-  tag.append(dot, document.createTextNode(label));
-  return tag;
-}
 
 const TRASH_ICON =
   '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
@@ -305,18 +462,92 @@ function makeFocusIcon(iconName, color) {
   return wrap;
 }
 
-function assignedTitles() {
-  const set = new Set();
-  for (const titles of Object.values(draftMappings)) {
-    for (const title of titles) set.add(title);
+function findLens(lensId) {
+  return state.lenses.find((lens) => lens.id === lensId) || null;
+}
+
+function cloneLensForRestore(lens) {
+  return {
+    ...lens,
+    groupSelectors: lens.groupSelectors.map((selector) => ({ ...selector })),
+    triggers: { appleFocusIds: [...lens.triggers.appleFocusIds] },
+  };
+}
+
+function lensIsActive(lens) {
+  return state.activeView && state.activeView.kind === "lens" && state.activeView.lensId === lens.id;
+}
+
+function provisionalDefaultName() {
+  return `Lens ${state.lenses.length + 1}`;
+}
+
+function isProvisionalDefaultName(name) {
+  return typeof name === "string" && /^Lens \d+$/.test(name.trim());
+}
+
+function lensHasNoBindings(lens) {
+  return lens.groupSelectors.length === 0 && lens.triggers.appleFocusIds.length === 0;
+}
+
+function syncUntouchedDefaultLenses() {
+  const liveIds = new Set(state.lenses.map((lens) => lens.id));
+  for (const lens of state.lenses) {
+    if (!userNamedLensIds.has(lens.id) && isProvisionalDefaultName(lens.name) && lensHasNoBindings(lens)) {
+      untouchedDefaultLensIds.add(lens.id);
+    } else {
+      untouchedDefaultLensIds.delete(lens.id);
+    }
   }
-  return set;
+  for (const lensId of [...untouchedDefaultLensIds]) {
+    if (!liveIds.has(lensId)) {
+      untouchedDefaultLensIds.delete(lensId);
+      userNamedLensIds.delete(lensId);
+    }
+  }
+  for (const lensId of [...userNamedLensIds]) {
+    if (!liveIds.has(lensId)) {
+      userNamedLensIds.delete(lensId);
+    }
+  }
+}
+
+function lensHasUntouchedDefaultName(lens) {
+  return !userNamedLensIds.has(lens.id) &&
+    isProvisionalDefaultName(lens.name) &&
+    (untouchedDefaultLensIds.has(lens.id) || lensHasNoBindings(lens));
+}
+
+function firstBindingAutoNamePatch(lens, proposedName, isFirstBinding) {
+  const name = typeof proposedName === "string" ? proposedName.trim() : "";
+  if (!isFirstBinding || !name || !lensHasUntouchedDefaultName(lens)) {
+    return {};
+  }
+  untouchedDefaultLensIds.delete(lens.id);
+  return { name };
+}
+
+function nextLensColor() {
+  const used = new Set(state.lenses.map((lens) => (lens.color || "").toLowerCase()).filter(Boolean));
+  const unused = LENS_COLOR_PALETTE.find((color) => !used.has(color.toLowerCase()));
+  return unused || LENS_COLOR_PALETTE[state.lenses.length % LENS_COLOR_PALETTE.length];
+}
+
+function selectorKey(selector) {
+  return `${selector.type}:${selector.value}`;
+}
+
+function lensSelectorValues(lens, type) {
+  return lens.groupSelectors
+    .filter((selector) => selector.type === type)
+    .map((selector) => selector.value);
 }
 
 function makeRowDatalist(listId, excluded) {
   const datalist = document.createElement("datalist");
   datalist.id = listId;
-  const available = state.firefoxGroupTitles.filter((title) => !excluded.includes(title));
+  const excludedSet = new Set(excluded);
+  const available = state.firefoxGroupTitles.filter((title) => !excludedSet.has(title));
   datalist.replaceChildren(...available.map((title) => {
     const option = document.createElement("option");
     option.value = title;
@@ -325,367 +556,1051 @@ function makeRowDatalist(listId, excluded) {
   return datalist;
 }
 
-function addTitleToFocus(id, rawTitle) {
-  const title = rawTitle.trim();
-  if (!title) return;
-  if (!hasOwn(draftMappings, id)) draftMappings[id] = [];
-  if (draftMappings[id].includes(title)) return;
-  draftMappings[id].push(title);
-  markDirty();
-  activeAdderId = id;
-  renderMappings();
-}
-
-function addPatternToFocus(id, rawValue) {
-  const value = rawValue.trim();
-  if (!value) return;
-  if (!hasOwn(draftMappings, id)) draftMappings[id] = [];
-  if (draftMappings[id].includes(value)) return;
-  draftMappings[id].push(value);
-  expandedPatternRows.add(id);
-  markDirty();
-  activePatternAdderId = id;
-  renderMappings();
-}
-
-function removeTitleFromFocus(id, title) {
-  if (!hasOwn(draftMappings, id)) return;
-  draftMappings[id] = draftMappings[id].filter((existing) => existing !== title);
-  markDirty();
-  renderMappings();
-}
-
-let dragState = null;
-
-// Assign a group title to a Focus row. A truthy fromId removes it from that
-// source row (move); fromId null adds without removing (copy via Alt-drag, or
-// from the unassigned bucket).
-function moveTitleToFocus(title, fromId, toId) {
-  const clean = (title || "").trim();
-  if (!clean || !toId || fromId === toId) return;
-  if (fromId && hasOwn(draftMappings, fromId)) {
-    draftMappings[fromId] = draftMappings[fromId].filter((existing) => existing !== clean);
+function replaceLensInState(lensId, patch) {
+  const index = state.lenses.findIndex((lens) => lens.id === lensId);
+  if (index === -1) {
+    return null;
   }
-  if (!hasOwn(draftMappings, toId)) draftMappings[toId] = [];
-  if (!draftMappings[toId].includes(clean)) draftMappings[toId].push(clean);
-  markDirty();
-  renderMappings();
+  const current = state.lenses[index];
+  const next = normalizeLens({
+    ...current,
+    ...patch,
+    triggers: patch.triggers || current.triggers,
+    groupSelectors: patch.groupSelectors || current.groupSelectors,
+    updatedAt: Date.now(),
+  });
+  if (!next) {
+    return null;
+  }
+  state.lenses.splice(index, 1, next);
+  return next;
 }
 
-function makeDraggable(chip, title, sourceId) {
-  chip.draggable = true;
-  chip.addEventListener("dragstart", (event) => {
-    dragState = { title, sourceId };
-    chip.classList.add("dragging");
-    if (event.dataTransfer) {
-      event.dataTransfer.effectAllowed = "copyMove";
-      event.dataTransfer.setData("text/plain", title);
-    }
-  });
-  chip.addEventListener("dragend", () => {
-    dragState = null;
-    chip.classList.remove("dragging");
+async function persistLensPatch(lensId, patch, statusMessage = "Saved") {
+  const next = replaceLensInState(lensId, patch);
+  if (!next) {
+    setStatus("Lens not found.", "error");
+    return null;
+  }
+  render();
+  await browser.runtime.sendMessage({ type: "lens-update", lensId, patch });
+  setStatus(statusMessage, "ok");
+  return next;
+}
+
+function selectorFromText(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed) {
+    return null;
+  }
+  return { type: isGlobPattern(trimmed) ? "glob" : "title", value: trimmed };
+}
+
+function addSelectorToLens(lensId, selector) {
+  const lens = findLens(lensId);
+  const normalized = normalizeSelector(selector);
+  if (!lens || !normalized) return;
+  if (lens.groupSelectors.some((existing) => selectorKey(existing) === selectorKey(normalized))) return;
+  const groupSelectors = [...lens.groupSelectors, normalized];
+  const patch = {
+    groupSelectors,
+    ...firstBindingAutoNamePatch(lens, normalized.type === "title" ? normalized.value : "", lens.groupSelectors.length === 0),
+  };
+  activeAdderId = lensId;
+  if (normalized.type === "glob") {
+    expandedLensRows.add(lensId);
+  }
+  persistLensPatch(lensId, patch, "Group saved").catch((error) => {
+    console.error("Lens group save failed:", error);
+    setStatus("Save failed. See extension console.", "error");
   });
 }
 
-function makeDropTarget(el, onDrop) {
-  el.addEventListener("dragover", (event) => {
-    if (!dragState) return;
-    event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = event.altKey ? "copy" : "move";
-    el.classList.add("drop-target");
-  });
-  el.addEventListener("dragleave", () => el.classList.remove("drop-target"));
-  el.addEventListener("drop", (event) => {
-    event.preventDefault();
-    el.classList.remove("drop-target");
-    if (dragState) onDrop(dragState, event);
+function removeSelectorFromLens(lensId, selector) {
+  const lens = findLens(lensId);
+  const normalized = normalizeSelector(selector);
+  if (!lens || !normalized) return;
+  const removeKey = selectorKey(normalized);
+  const groupSelectors = lens.groupSelectors.filter((existing) => selectorKey(existing) !== removeKey);
+  persistLensPatch(lensId, { groupSelectors }, "Group removed").catch((error) => {
+    console.error("Lens group removal failed:", error);
+    setStatus("Save failed. See extension console.", "error");
   });
 }
 
-function makeUnassignedChip(title) {
+function globToRegExp(pattern) {
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const body = escaped.replace(/\\\*/g, ".*").replace(/\\\?/g, ".");
+  return new RegExp(`^${body}$`);
+}
+
+function selectorMatchesTitle(selector, title) {
+  if (selector.type === "title") {
+    return selector.value === title;
+  }
+  return globToRegExp(selector.value).test(title);
+}
+
+function selectorMatchCount(selector) {
+  if (selector.type === "title") {
+    return state.firefoxGroupTitleCounts[selector.value] || 0;
+  }
+  const regex = globToRegExp(selector.value);
+  return Object.entries(state.firefoxGroupTitleCounts).reduce((count, [title, titleCount]) => {
+    return regex.test(title) ? count + titleCount : count;
+  }, 0);
+}
+
+function makeChip(lensId, selector) {
   const chip = document.createElement("span");
-  chip.className = "group-chip group-chip-unassigned";
+  const count = selectorMatchCount(selector);
+  chip.className = `group-chip${selector.type === "glob" ? " group-chip-pattern" : ""}${count === 0 ? " is-muted" : ""}`;
   const label = document.createElement("span");
   label.className = "group-chip-label";
-  label.textContent = title;
+  label.textContent = selector.value;
   chip.append(label);
-  makeDraggable(chip, title, null);
+
+  if (selector.type === "glob") {
+    const badge = document.createElement("span");
+    badge.className = "group-chip-badge";
+    badge.textContent = "pattern";
+    chip.append(badge);
+  }
+  if (count === 0) {
+    const meta = document.createElement("span");
+    meta.className = "group-chip-meta";
+    meta.textContent = "no match";
+    chip.append(meta);
+  } else if (selector.type === "glob") {
+    const meta = document.createElement("span");
+    meta.className = "group-chip-meta";
+    meta.textContent = `matches ${count}`;
+    chip.append(meta);
+  } else if (count > 1) {
+    const meta = document.createElement("span");
+    meta.className = "group-chip-meta";
+    meta.textContent = `in ${count} groups`;
+    chip.append(meta);
+  }
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "group-chip-remove";
+  remove.setAttribute("aria-label", `Remove ${selector.value}`);
+  remove.textContent = "\u00d7";
+  remove.addEventListener("click", () => removeSelectorFromLens(lensId, selector));
+  chip.append(remove);
   return chip;
 }
 
-function renderUnassigned() {
-  const list = document.getElementById("unassigned-list");
-  if (!list) return;
-  const assigned = assignedTitles();
-  const titles = state.firefoxGroupTitles.filter((title) => !assigned.has(title));
-  if (titles.length === 0) {
-    const empty = document.createElement("span");
-    empty.className = "unassigned-empty";
-    empty.textContent = state.firefoxGroupTitles.length === 0
-      ? "No Firefox tab groups found."
-      : "Every tab group is assigned to a Focus mode.";
-    list.replaceChildren(empty);
+function makePatternChip(lensId, selector) {
+  const chip = makeChip(lensId, selector);
+  chip.querySelector(".group-chip-remove").setAttribute("aria-label", `Remove pattern ${selector.value}`);
+  return chip;
+}
+
+function lensIconGlyph(icon) {
+  const glyphs = {
+    briefcase: "\ud83d\udcbc",
+    book: "\ud83d\udcd6",
+    circle: "\u25e6",
+    moon: "\ud83c\udf19",
+    person: "\ud83d\udc64",
+    reading: "\ud83d\udcd6",
+    sparkles: "\u2726",
+    target: "\u25ce",
+  };
+  if (!icon) return "L";
+  return glyphs[icon] || icon.slice(0, 2);
+}
+
+function makeLensStyleEditor(lens) {
+  const editor = document.createElement("div");
+  editor.className = "lens-style-editor";
+
+  const iconLabel = document.createElement("label");
+  const iconText = document.createElement("span");
+  iconText.textContent = "Icon";
+  const iconInput = document.createElement("input");
+  iconInput.type = "text";
+  iconInput.value = lens.icon || "";
+  iconInput.placeholder = "briefcase";
+  iconInput.setAttribute("aria-label", `Icon for ${lens.name}`);
+  iconInput.addEventListener("change", () => {
+    const icon = iconInput.value.trim() || "circle";
+    persistLensPatch(lens.id, { icon }, "Icon saved").catch((error) => {
+      console.error("Lens icon save failed:", error);
+      setStatus("Save failed. See extension console.", "error");
+    });
+  });
+  iconLabel.append(iconText, iconInput);
+
+  const colorLabel = document.createElement("label");
+  const colorText = document.createElement("span");
+  colorText.textContent = "Color";
+  const colorInput = document.createElement("input");
+  colorInput.type = "color";
+  colorInput.value = /^#[0-9a-f]{6}$/i.test(lens.color || "") ? lens.color : "#7c5cff";
+  colorInput.setAttribute("aria-label", `Color for ${lens.name}`);
+  colorInput.addEventListener("change", () => {
+    persistLensPatch(lens.id, { color: colorInput.value || null }, "Color saved").catch((error) => {
+      console.error("Lens color save failed:", error);
+      setStatus("Save failed. See extension console.", "error");
+    });
+  });
+  colorLabel.append(colorText, colorInput);
+
+  editor.append(iconLabel, colorLabel);
+  return editor;
+}
+
+function makeLensIcon(lens) {
+  const wrap = document.createElement("span");
+  wrap.className = "lens-icon-wrap";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "lens-icon-button";
+  button.textContent = lensIconGlyph(lens.icon || lens.name);
+  button.title = "Edit lens icon and color";
+  button.setAttribute("aria-label", `Edit icon and color for ${lens.name}`);
+  if (lens.color) {
+    button.style.color = lens.color;
+  }
+  button.addEventListener("click", () => {
+    openIconEditorId = openIconEditorId === lens.id ? null : lens.id;
+    render();
+  });
+  wrap.append(button);
+  if (openIconEditorId === lens.id) {
+    const popover = document.createElement("div");
+    popover.className = "lens-icon-popover";
+    popover.append(makeLensStyleEditor(lens));
+    wrap.append(popover);
+  }
+  return wrap;
+}
+
+function dragPayloadFromEvent(event) {
+  if (dragState) {
+    return dragState;
+  }
+  const raw = event.dataTransfer && event.dataTransfer.getData("application/x-tab-lens");
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    return null;
+  }
+}
+
+function makeDraggable(element, payload) {
+  element.draggable = true;
+  element.addEventListener("dragstart", (event) => {
+    dragState = payload;
+    element.classList.add("is-dragging");
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = payload.type === "focus" ? "move" : "copy";
+      event.dataTransfer.setData("application/x-tab-lens", JSON.stringify(payload));
+      event.dataTransfer.setData("text/plain", payload.value);
+    }
+  });
+  element.addEventListener("dragend", () => {
+    dragState = null;
+    element.classList.remove("is-dragging");
+  });
+  return element;
+}
+
+function makeDropTarget(element, acceptedType, onDrop) {
+  const accepts = (event) => {
+    const payload = dragPayloadFromEvent(event);
+    return payload && payload.type === acceptedType;
+  };
+  element.addEventListener("dragenter", (event) => {
+    if (!accepts(event)) return;
+    event.preventDefault();
+    element.classList.add("is-drop-active");
+  });
+  element.addEventListener("dragover", (event) => {
+    if (!accepts(event)) return;
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = acceptedType === "focus" ? "move" : "copy";
+    }
+    element.classList.add("is-drop-active");
+  });
+  element.addEventListener("dragleave", () => {
+    element.classList.remove("is-drop-active");
+  });
+  element.addEventListener("drop", (event) => {
+    const payload = dragPayloadFromEvent(event);
+    element.classList.remove("is-drop-active");
+    if (!payload || payload.type !== acceptedType) return;
+    event.preventDefault();
+    onDrop(payload.value);
+  });
+  return element;
+}
+
+function focusUiGated() {
+  return IS_MAC ||
+    Object.keys(state.seenFocusIds).length > 0 ||
+    Object.keys(state.focusCatalog).length > 0 ||
+    state.lenses.some((lens) => lens.triggers.appleFocusIds.length > 0);
+}
+
+function sortedFocusIds() {
+  const ids = new Set([
+    ...Object.keys(state.focusCatalog),
+    ...Object.keys(state.seenFocusIds),
+  ]);
+  for (const lens of state.lenses) {
+    for (const id of lens.triggers.appleFocusIds) {
+      ids.add(id);
+    }
+  }
+  const order = new Map(DEFAULT_FOCUS_ORDER.map((id, index) => [id, index]));
+  return [...ids].sort((a, b) => {
+    const aIndex = order.has(a) ? order.get(a) : Number.MAX_SAFE_INTEGER;
+    const bIndex = order.has(b) ? order.get(b) : Number.MAX_SAFE_INTEGER;
+    if (aIndex !== bIndex) {
+      return aIndex - bIndex;
+    }
+    return focusCatalogEntry(a).name.localeCompare(focusCatalogEntry(b).name);
+  });
+}
+
+function lensBoundToAppleFocusId(focusId) {
+  return state.lenses.find((lens) => lens.triggers.appleFocusIds.includes(focusId)) || null;
+}
+
+function unlinkedFocusIds() {
+  return sortedFocusIds().filter((id) => !lensBoundToAppleFocusId(id));
+}
+
+async function linkFocusToLens(lensId, focusId) {
+  if (!focusId) return;
+  const targetLens = lensId ? findLens(lensId) : null;
+  const entry = focusCatalogEntry(focusId);
+  const namePatch = targetLens
+    ? firstBindingAutoNamePatch(targetLens, entry.name, targetLens.triggers.appleFocusIds.length === 0)
+    : {};
+  for (const lens of state.lenses) {
+    const ids = lens.triggers.appleFocusIds.filter((id) => id !== focusId);
+    if (lens.id === lensId) {
+      ids.push(focusId);
+      if (namePatch.name) {
+        lens.name = namePatch.name;
+      }
+    }
+    lens.triggers = { ...lens.triggers, appleFocusIds: [...new Set(ids)].sort() };
+  }
+  activeFocusPickerId = null;
+  render();
+  const message = { type: "lens-link-focus", focusId };
+  if (lensId) {
+    message.lensId = lensId;
+  }
+  await browser.runtime.sendMessage(message);
+  if (lensId && namePatch.name) {
+    await browser.runtime.sendMessage({ type: "lens-update", lensId, patch: namePatch });
+  }
+  setStatus(lensId ? "Focus link saved." : "Focus link removed.", "ok");
+}
+
+function makeFocusPill(lens, focusId) {
+  const entry = focusCatalogEntry(focusId);
+  const pill = document.createElement("span");
+  pill.className = "focus-pill";
+  pill.title = `When macOS Focus “${entry.name}” turns on → show this lens`;
+  pill.append(document.createTextNode(`\u26a1 ${entry.name}`));
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "focus-pill-remove";
+  remove.textContent = "\u00d7";
+  remove.setAttribute("aria-label", `Unlink ${entry.name}`);
+  remove.addEventListener("click", () => {
+    linkFocusToLens(null, focusId).catch((error) => {
+      console.error("Focus unlink failed:", error);
+      setStatus("Save failed. See extension console.", "error");
+    });
+  });
+  pill.append(remove);
+  return pill;
+}
+
+function renderTriggerAffordance(lens) {
+  if (!focusUiGated()) {
+    return null;
+  }
+  const trigger = document.createElement("div");
+  trigger.className = "lens-trigger";
+  makeDropTarget(trigger, "focus", (focusId) => {
+    linkFocusToLens(lens.id, focusId).catch((error) => {
+      console.error("Focus link failed:", error);
+      setStatus("Save failed. See extension console.", "error");
+    });
+  });
+
+  for (const focusId of lens.triggers.appleFocusIds) {
+    trigger.append(makeFocusPill(lens, focusId));
+  }
+
+  const pickerWrap = document.createElement("span");
+  pickerWrap.className = "focus-picker-wrap";
+  const pickerButton = document.createElement("button");
+  const hasFocusPills = lens.triggers.appleFocusIds.length > 0;
+  const pickerId = `focus-picker-${lens.id}`;
+  pickerButton.type = "button";
+  pickerButton.className = `secondary focus-picker-toggle${hasFocusPills ? " compact" : ""}`;
+  pickerButton.textContent = hasFocusPills ? "+" : "Activate when\u2026";
+  pickerButton.title = "Link a macOS Focus mode";
+  pickerButton.setAttribute("aria-label", `Link a macOS Focus mode to ${lens.name}`);
+  pickerButton.setAttribute("aria-expanded", String(activeFocusPickerId === lens.id));
+  pickerButton.setAttribute("aria-controls", pickerId);
+  pickerButton.addEventListener("click", () => {
+    activeFocusPickerId = activeFocusPickerId === lens.id ? null : lens.id;
+    render();
+  });
+  const picker = document.createElement("select");
+  picker.id = pickerId;
+  picker.className = "focus-picker";
+  picker.hidden = activeFocusPickerId !== lens.id;
+  picker.setAttribute("aria-label", `Activate ${lens.name} when Focus starts`);
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  const available = unlinkedFocusIds();
+  placeholder.textContent = available.length > 0 ? "Choose Focus mode" : "No unlinked modes";
+  picker.append(placeholder);
+  for (const focusId of available) {
+    const option = document.createElement("option");
+    option.value = focusId;
+    option.textContent = focusCatalogEntry(focusId).name;
+    picker.append(option);
+  }
+  picker.disabled = available.length === 0;
+  picker.addEventListener("change", () => {
+    linkFocusToLens(lens.id, picker.value).catch((error) => {
+      console.error("Focus link failed:", error);
+      setStatus("Save failed. See extension console.", "error");
+    });
+  });
+  pickerWrap.append(pickerButton, picker);
+  trigger.append(pickerWrap);
+  if (activeFocusPickerId === lens.id) {
+    window.setTimeout(() => {
+      const nextPicker = document.getElementById(pickerId);
+      if (nextPicker && !nextPicker.hidden && !nextPicker.disabled) nextPicker.focus();
+    }, 0);
+  }
+  return trigger;
+}
+
+function helperStatusText() {
+  if (state.connectionState === "connected") {
+    return "Helper connected";
+  }
+  if (state.connectionState === "reconnecting") {
+    return "Reconnecting";
+  }
+  return "No helper connected";
+}
+
+function commitLensName(lens, input) {
+  const name = input.value.trim();
+  if (!name || name === lens.name) {
+    input.value = lens.name;
     return;
   }
-  list.replaceChildren(...titles.map((title) => makeUnassignedChip(title)));
-}
-
-function makeChip(id, title) {
-  const chip = document.createElement("span");
-  chip.className = "group-chip";
-  const label = document.createElement("span");
-  label.className = "group-chip-label";
-  label.textContent = title;
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "group-chip-remove";
-  remove.setAttribute("aria-label", `Remove ${title}`);
-  remove.textContent = "\u00d7";
-  remove.draggable = false;
-  remove.addEventListener("click", () => removeTitleFromFocus(id, title));
-  chip.append(label, remove);
-  makeDraggable(chip, title, id);
-  return chip;
-}
-
-function makePatternChip(id, pattern) {
-  const chip = document.createElement("span");
-  chip.className = "group-chip group-chip-pattern";
-  const label = document.createElement("span");
-  label.className = "group-chip-label";
-  label.textContent = pattern;
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "group-chip-remove";
-  remove.setAttribute("aria-label", `Remove pattern ${pattern}`);
-  remove.textContent = "\u00d7";
-  remove.addEventListener("click", () => removeTitleFromFocus(id, pattern));
-  chip.append(label, remove);
-  return chip;
-}
-
-function makeUnseenDot() {
-  const dot = document.createElement("span");
-  dot.className = "status-dot status-unseen";
-  dot.title = "Not seen yet";
-  dot.setAttribute("aria-hidden", "true");
-  return dot;
-}
-
-function makeUnassignedRow() {
-  const row = document.createElement("tr");
-  row.className = "unassigned-row";
-
-  const labelCell = document.createElement("td");
-  labelCell.className = "col-focus";
-  const label = document.createElement("span");
-  label.className = "focus-cell unassigned-label";
-  label.textContent = "Unassigned";
-  labelCell.append(label);
-
-  const arrowCell = document.createElement("td");
-  arrowCell.className = "col-arrow";
-
-  const groupsCell = document.createElement("td");
-  groupsCell.className = "col-groups";
-  const list = document.createElement("div");
-  list.id = "unassigned-list";
-  list.className = "unassigned-list";
-  groupsCell.append(list);
-
-  const actionCell = document.createElement("td");
-  actionCell.className = "col-action";
-
-  row.append(labelCell, arrowCell, groupsCell, actionCell);
-  makeDropTarget(row, (drag) => {
-    if (drag.sourceId) removeTitleFromFocus(drag.sourceId, drag.title);
+  untouchedDefaultLensIds.delete(lens.id);
+  userNamedLensIds.add(lens.id);
+  persistLensPatch(lens.id, { name }, "Lens renamed").catch((error) => {
+    console.error("Lens rename failed:", error);
+    setStatus("Save failed. See extension console.", "error");
   });
-  return row;
 }
 
-function renderMappings() {
-  const body = document.getElementById("mappings-body");
-  const ids = sortedFocusIds();
+async function persistLensOrder(orderedIds) {
+  await browser.runtime.sendMessage({ type: "lens-reorder", orderedIds });
+  setStatus("Lens order saved.", "ok");
+}
 
+function moveLensToIndex(lensId, nextIndex) {
+  const currentIndex = state.lenses.findIndex((lens) => lens.id === lensId);
+  if (currentIndex === -1) return;
+  const boundedIndex = Math.max(0, Math.min(nextIndex, state.lenses.length - 1));
+  if (boundedIndex === currentIndex) return;
+  const [lens] = state.lenses.splice(currentIndex, 1);
+  state.lenses.splice(boundedIndex, 0, lens);
+  const orderedIds = state.lenses.map((entry) => entry.id);
+  render();
+  persistLensOrder(orderedIds).catch((error) => {
+    console.error("Lens reorder failed:", error);
+    setStatus("Save failed. See extension console.", "error");
+  });
+}
+
+function makeRowDragHandle(card, lens) {
+  const handle = document.createElement("button");
+  handle.type = "button";
+  handle.className = "drag-handle";
+  handle.textContent = "\u283f";
+  handle.title = "Drag to reorder";
+  handle.setAttribute("aria-label", `Reorder ${lens.name}`);
+  handle.draggable = true;
+  handle.addEventListener("dragstart", (event) => {
+    rowDragState = { lensId: lens.id };
+    card.classList.add("is-dragging");
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", lens.id);
+    }
+  });
+  handle.addEventListener("dragend", () => {
+    rowDragState = null;
+    card.classList.remove("is-dragging");
+  });
+  return handle;
+}
+
+function makeRowDropTarget(card, lens) {
+  card.addEventListener("dragenter", (event) => {
+    if (!rowDragState || rowDragState.lensId === lens.id) return;
+    event.preventDefault();
+    card.classList.add("is-row-drop-target");
+  });
+  card.addEventListener("dragover", (event) => {
+    if (!rowDragState || rowDragState.lensId === lens.id) return;
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "move";
+    }
+  });
+  card.addEventListener("dragleave", () => {
+    card.classList.remove("is-row-drop-target");
+  });
+  card.addEventListener("drop", (event) => {
+    card.classList.remove("is-row-drop-target");
+    if (!rowDragState || rowDragState.lensId === lens.id) return;
+    event.preventDefault();
+    moveLensToIndex(rowDragState.lensId, state.lenses.findIndex((entry) => entry.id === lens.id));
+    rowDragState = null;
+  });
+}
+
+function renderLensCard(lens, index) {
+  const card = document.createElement("article");
+  const isActive = lensIsActive(lens);
+  card.className = "lens-card lens-row";
+  card.dataset.lensId = lens.id;
+  if (lens.color) {
+    card.style.setProperty("--lens-color", lens.color);
+  }
+  if (isActive) {
+    card.classList.add("is-active");
+  }
+  makeRowDropTarget(card, lens);
+
+  const header = document.createElement("div");
+  header.className = "lens-card-header";
+  header.append(makeRowDragHandle(card, lens));
+  header.append(makeLensIcon(lens));
+
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.className = "lens-name-input";
+  nameInput.value = lens.name;
+  nameInput.setAttribute("aria-label", `Lens name for ${lens.name}`);
+  nameInput.addEventListener("blur", () => commitLensName(lens, nameInput));
+  nameInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      nameInput.blur();
+    } else if (event.key === "Escape") {
+      nameInput.value = lens.name;
+      nameInput.blur();
+    }
+  });
+  nameInput.addEventListener("input", () => {
+    if (pendingNameEditId === lens.id) pendingNameEditId = null;
+  });
+  nameInput.addEventListener("blur", () => {
+    if (pendingNameEditId === lens.id) pendingNameEditId = null;
+  });
+  header.append(nameInput);
+
+  const active = document.createElement("span");
+  if (isActive) {
+    active.className = "lens-active-pill";
+    active.textContent = "\u25cf active";
+  }
+  header.append(active);
+
+  const trigger = renderTriggerAffordance(lens);
+  if (trigger) {
+    header.append(trigger);
+  } else {
+    header.append(document.createElement("span"));
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "lens-card-actions";
+  const showButton = document.createElement("button");
+  showButton.type = "button";
+  showButton.className = "secondary lens-show-button";
+  showButton.textContent = isActive ? "Showing" : "Show";
+  showButton.disabled = isActive;
+  showButton.setAttribute("aria-label", `Show lens ${lens.name}`);
+  showButton.addEventListener("click", () => {
+    activateLensView({ kind: "lens", lensId: lens.id }).catch((error) => {
+      console.error("Lens activation failed:", error);
+      setStatus("Switch failed. See extension console.", "error");
+    });
+  });
+  const orderActions = document.createElement("span");
+  orderActions.className = "row-order-actions";
+  const moveUp = document.createElement("button");
+  moveUp.type = "button";
+  moveUp.textContent = "\u2191";
+  moveUp.disabled = index === 0;
+  moveUp.setAttribute("aria-label", `Move ${lens.name} up`);
+  moveUp.addEventListener("click", () => moveLensToIndex(lens.id, index - 1));
+  const moveDown = document.createElement("button");
+  moveDown.type = "button";
+  moveDown.textContent = "\u2193";
+  moveDown.disabled = index === state.lenses.length - 1;
+  moveDown.setAttribute("aria-label", `Move ${lens.name} down`);
+  moveDown.addEventListener("click", () => moveLensToIndex(lens.id, index + 1));
+  orderActions.append(moveUp, moveDown);
+
+  const optionsBtn = document.createElement("button");
+  optionsBtn.type = "button";
+  optionsBtn.className = "icon-btn icon-btn-options";
+  const optionsOpen = expandedLensRows.has(lens.id);
+  optionsBtn.classList.toggle("is-open", optionsOpen);
+  optionsBtn.setAttribute("aria-expanded", String(optionsOpen));
+  optionsBtn.title = "Advanced";
+  optionsBtn.setAttribute("aria-label", `Advanced options for ${lens.name}`);
+  optionsBtn.innerHTML = CHEVRON_ICON;
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "icon-btn";
+  remove.title = "Delete this lens";
+  remove.setAttribute("aria-label", `Delete lens ${lens.name}`);
+  remove.innerHTML = TRASH_ICON;
+  remove.addEventListener("click", () => deleteLens(lens.id));
+  actions.append(showButton, orderActions, optionsBtn, remove);
+  header.append(actions);
+  card.append(header);
+
+  const selectorSection = document.createElement("div");
+  selectorSection.className = "selector-section";
+  const selectorHeading = document.createElement("p");
+  selectorHeading.className = "selector-heading";
+  selectorHeading.textContent = "Shows";
+  const chips = document.createElement("span");
+  chips.className = "group-chips shows-zone";
+  makeDropTarget(chips, "group", (title) => addSelectorToLens(lens.id, { type: "title", value: title }));
+  for (const selector of lens.groupSelectors) {
+    chips.append(selector.type === "glob" ? makePatternChip(lens.id, selector) : makeChip(lens.id, selector));
+  }
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "group-chip-input";
+  input.setAttribute("list", "firefox-groups-lens-" + index);
+  input.autocomplete = "off";
+  input.setAttribute("aria-label", `Add a group selector to ${lens.name}`);
+  input.placeholder = "+ add group\u2026";
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const selector = selectorFromText(input.value);
+      if (selector) {
+        addSelectorToLens(lens.id, selector);
+      }
+    } else if (event.key === "Escape") {
+      input.value = "";
+      input.blur();
+    }
+  });
+  chips.append(input);
+  selectorSection.append(selectorHeading, chips);
+  selectorSection.append(makeRowDatalist("firefox-groups-lens-" + index, lensSelectorValues(lens, "title")));
+
+  const panel = document.createElement("div");
+  panel.className = "row-options";
+  panel.hidden = !optionsOpen;
+  const hint = document.createElement("p");
+  hint.className = "pattern-hint";
+  hint.textContent = "* = any text, ? = one character, e.g. Client *";
+  panel.append(hint, makeLensStyleEditor(lens));
+  selectorSection.append(panel);
+  card.append(selectorSection);
+
+  optionsBtn.addEventListener("click", () => {
+    const open = !expandedLensRows.has(lens.id);
+    if (open) {
+      expandedLensRows.add(lens.id);
+    } else {
+      expandedLensRows.delete(lens.id);
+    }
+    render();
+  });
+
+  if (lens.id === activeAdderId) {
+    window.setTimeout(() => {
+      const nextInput = document.querySelector(`.lens-card[data-lens-id="${lens.id}"] .group-chip-input`);
+      if (nextInput) nextInput.focus();
+      activeAdderId = null;
+    }, 0);
+  }
+  return card;
+}
+
+function renderMigrationSummary() {
+  const summary = document.getElementById("migration-summary");
+  if (!summary) return;
+  if (!state.legacyFocusMappingsBackup) {
+    summary.hidden = true;
+    summary.textContent = "";
+    return;
+  }
+  const count = Object.keys(state.legacyFocusMappingsBackup).length;
+  summary.textContent = `Imported ${count} ${count === 1 ? "lens" : "lenses"} from your previous Apple Focus mappings.`;
+  summary.hidden = false;
+}
+
+function currentGroupSavedIn(group) {
+  if (Array.isArray(group.savedIn)) {
+    return group.savedIn;
+  }
+  return state.lenses
+    .filter((lens) => lens.groupSelectors.some((selector) => selectorMatchesTitle(selector, group.title)))
+    .map((lens) => lens.name);
+}
+
+function makeGroupPaletteChip(group) {
+  const chip = document.createElement("span");
+  chip.className = "palette-chip group-palette-chip";
+  const label = document.createElement("span");
+  label.textContent = group.title;
+  const savedIn = currentGroupSavedIn(group);
+  const meta = document.createElement("span");
+  meta.className = "palette-chip-meta";
+  meta.textContent = savedIn.length === 0
+    ? "unused"
+    : `in ${savedIn.length} ${savedIn.length === 1 ? "lens" : "lenses"}`;
+  chip.append(label, meta);
+  makeDraggable(chip, { type: "group", value: group.title });
+  return chip;
+}
+
+function renderGroupPalette() {
+  const section = document.createElement("section");
+  section.className = "lens-palette";
+  const heading = document.createElement("p");
+  heading.className = "strip-heading";
+  heading.textContent = "Tab groups — drag onto a lens, or use \u201c+ add group\u201d:";
+  section.append(heading);
+  if (state.currentGroups.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "field-hint";
+    empty.textContent = "No tab groups in this window yet. Create one in Firefox or use Organize tabs in the toolbar, then add it to a lens.";
+    section.append(empty);
+    return section;
+  }
+  const chips = document.createElement("div");
+  chips.className = "group-chips";
+  for (const group of state.currentGroups) {
+    chips.append(makeGroupPaletteChip(group));
+  }
+  section.append(chips);
+  return section;
+}
+
+function makeFocusPaletteChip(focusId) {
+  const entry = focusCatalogEntry(focusId);
+  const chip = document.createElement("span");
+  chip.className = "palette-chip focus-palette-chip";
+  chip.append(makeFocusIcon(entry.icon, entry.color));
+  const label = document.createElement("span");
+  label.textContent = entry.name;
+  chip.append(label);
+  makeDraggable(chip, { type: "focus", value: focusId });
+  return chip;
+}
+
+function renderFocusStrip() {
+  if (!focusUiGated()) {
+    return null;
+  }
+  const section = document.createElement("section");
+  section.className = "focus-strip";
+  const heading = document.createElement("p");
+  heading.className = "strip-heading";
+  heading.append(document.createTextNode("macOS Focus · not yet linked"));
+  const helper = document.createElement("span");
+  helper.className = `helper-status ${state.connectionState}`.trim();
+  helper.textContent = helperStatusText();
+  heading.append(helper);
+  section.append(heading);
+
+  const ids = unlinkedFocusIds();
   if (ids.length === 0) {
-    const row = document.createElement("tr");
-    const cell = document.createElement("td");
-    cell.colSpan = 4;
-    cell.className = "empty-row";
-    cell.textContent = "No Focus IDs yet. Toggle a macOS Focus mode or add a custom mapping.";
-    row.append(cell);
-    body.replaceChildren(row, makeUnassignedRow());
-    renderUnassigned();
+    const empty = document.createElement("p");
+    empty.className = "field-hint";
+    empty.textContent = sortedFocusIds().length === 0 ? "No Focus modes detected yet." : "All detected Focus modes are linked.";
+    section.append(empty);
+    return section;
+  }
+  const chips = document.createElement("div");
+  chips.className = "group-chips";
+  for (const id of ids) {
+    chips.append(makeFocusPaletteChip(id));
+  }
+  section.append(chips);
+  return section;
+}
+
+function renderEmptyLenses() {
+  const empty = document.createElement("div");
+  empty.className = "lens-empty";
+  const title = document.createElement("strong");
+  title.textContent = "No lenses yet.";
+  const copy = document.createElement("p");
+  copy.textContent = "A lens shows only the tab groups you pick. To start, create a tab group in Firefox (or use Organize tabs in the toolbar), then add it to a lens.";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "+ New lens";
+  button.addEventListener("click", () => {
+    createEmptyLens().catch((error) => {
+      console.error("Create empty lens failed:", error);
+      setStatus("Create failed. See extension console for details.", "error");
+    });
+  });
+  empty.append(title, copy, button);
+  return empty;
+}
+
+function activeViewLabel() {
+  if (!state.activeView || state.activeView.kind !== "lens") {
+    return "All groups";
+  }
+  const lens = findLens(state.activeView.lensId);
+  return lens ? lens.name : "Unknown lens";
+}
+
+function renderActiveViewSummary() {
+  const summary = document.createElement("div");
+  summary.className = "active-view-summary";
+  const label = document.createElement("span");
+  label.textContent = `Showing: ${activeViewLabel()}`;
+  const showAll = document.createElement("button");
+  showAll.type = "button";
+  showAll.className = "secondary show-all-groups";
+  showAll.textContent = "Show all groups";
+  showAll.disabled = !state.activeView || state.activeView.kind !== "lens";
+  showAll.addEventListener("click", () => {
+    activateLensView({ kind: "all" }).catch((error) => {
+      console.error("Show all groups failed:", error);
+      setStatus("Switch failed. See extension console.", "error");
+    });
+  });
+  summary.append(label, showAll);
+  return summary;
+}
+
+function applyLensStateSnapshot(lensState) {
+  if (!isRecord(lensState)) {
     return;
   }
-
-  let adderInput = null;
-  let patternAdderInput = null;
-
-  const rows = ids.map((id, index) => {
-    const row = document.createElement("tr");
-    const hasMapping = hasOwn(draftMappings, id);
-    const titles = hasMapping ? draftMappings[id] : [];
-    const exactTitles = titles.filter((title) => !isGlobPattern(title));
-    const patternTitles = titles.filter((title) => isGlobPattern(title));
-    const hasSeen = hasOwn(state.seenFocusIds, id);
-    const isActive = state.lastFocusSeen === id;
-    const entry = focusCatalogEntry(id);
-    if (isActive) {
-      row.className = "is-active";
+  if (isRecord(lensState.activeView)) {
+    state.activeView = lensState.activeView;
+  }
+  if (isRecord(lensState.lastActivation)) {
+    state.lastActivation = lensState.lastActivation;
+  }
+  if (Array.isArray(lensState.currentGroups)) {
+    const liveGroups = normalizeCurrentGroups(lensState.currentGroups);
+    const liveCounts = {};
+    for (const group of liveGroups) {
+      liveCounts[group.title] = (liveCounts[group.title] || 0) + 1;
     }
+    state.currentGroups = liveGroups;
+    state.firefoxGroupTitles = uniqueSortedTitlesFromValues(Object.keys(liveCounts));
+    state.firefoxGroupTitleCounts = liveCounts;
+  }
+  mergeLensStateSummaries(lensState.lenses);
+}
 
-    const idCell = document.createElement("td");
-    idCell.className = "col-focus";
-    const focusCell = document.createElement("span");
-    focusCell.className = "focus-cell";
-    focusCell.append(makeFocusIcon(entry.icon, entry.color));
-    const name = document.createElement("span");
-    name.className = "focus-name";
-    name.textContent = entry.name;
-    name.title = id;
-    focusCell.append(name);
-    if (isActive) {
-      focusCell.append(makeStatus("active", "active"));
-    } else if (!hasSeen) {
-      focusCell.append(makeUnseenDot());
-    }
-    idCell.append(focusCell);
+async function refreshLensState(windowId = state.windowId) {
+  const resolvedWindowId = windowId === undefined ? await currentWindowId() : windowId;
+  state.windowId = resolvedWindowId;
+  const lensState = await requestLensState(resolvedWindowId);
+  applyLensStateSnapshot(lensState);
+  render();
+}
 
-    const arrowCell = document.createElement("td");
-    arrowCell.className = "col-arrow";
-    arrowCell.setAttribute("aria-hidden", "true");
-    arrowCell.textContent = "\u2192";
+async function activateLensView(view) {
+  const windowId = state.windowId === undefined ? await currentWindowId() : state.windowId;
+  state.windowId = windowId;
+  state.activeView = view;
+  render();
+  await browser.runtime.sendMessage({ type: "lens-activate", windowId, view });
+  await refreshLensState(windowId);
+  setStatus(view.kind === "all" ? "Showing all groups." : "Showing lens.", "ok");
+}
 
-    const groupsCell = document.createElement("td");
-    groupsCell.className = "col-groups";
-    const chips = document.createElement("span");
-    chips.className = "group-chips";
-    for (const title of exactTitles) {
-      chips.append(makeChip(id, title));
-    }
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "group-chip-input";
-    input.setAttribute("list", "firefox-groups-row-" + index);
-    input.autocomplete = "off";
-    input.placeholder = exactTitles.length === 0 ? "+ add tab group" : "+ add";
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        addTitleToFocus(id, input.value);
-      } else if (event.key === "Escape") {
-        input.value = "";
-        input.blur();
-      }
-    });
-    chips.append(input);
-    groupsCell.append(chips);
-    groupsCell.append(makeRowDatalist("firefox-groups-row-" + index, titles));
-    if (id === activeAdderId) {
-      adderInput = input;
-    }
+function renderLenses() {
+  const list = document.getElementById("lenses-list");
+  if (!list) return;
+  renderMigrationSummary();
+  if (state.lenses.length === 0) {
+    list.replaceChildren(renderActiveViewSummary(), renderEmptyLenses());
+    return;
+  }
+  const rows = document.createElement("div");
+  rows.className = "lens-rows";
+  rows.replaceChildren(...state.lenses.map((lens, index) => renderLensCard(lens, index)));
+  const children = [renderActiveViewSummary(), rows, renderGroupPalette()];
+  const focusStrip = renderFocusStrip();
+  if (focusStrip) {
+    children.push(focusStrip);
+  }
+  list.replaceChildren(...children);
+}
 
-    // "More options": title-pattern (glob) matching, revealed by the row's
-    // options button so the common exact-title case stays uncluttered.
-    const optionsOpen = expandedPatternRows.has(id);
-    const panel = document.createElement("div");
-    panel.className = "row-options";
-    panel.hidden = !optionsOpen;
-    const patternChips = document.createElement("span");
-    patternChips.className = "group-chips group-chips-patterns";
-    for (const pattern of patternTitles) {
-      patternChips.append(makePatternChip(id, pattern));
-    }
-    const patternInput = document.createElement("input");
-    patternInput.type = "text";
-    patternInput.className = "group-chip-input pattern-input";
-    patternInput.autocomplete = "off";
-    patternInput.placeholder = "+ add title pattern, e.g. Work-*";
-    patternInput.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        addPatternToFocus(id, patternInput.value);
-      } else if (event.key === "Escape") {
-        patternInput.value = "";
-        patternInput.blur();
-      }
-    });
-    patternChips.append(patternInput);
-    const hint = document.createElement("p");
-    hint.className = "pattern-hint";
-    hint.textContent = "Patterns match tab-group titles by glob: * = any text, ? = one character.";
-    panel.append(patternChips, hint);
-    groupsCell.append(panel);
-    if (id === activePatternAdderId) {
-      patternAdderInput = patternInput;
-    }
+function defaultWindowLensName() {
+  const activeGroup = state.currentGroups.find((group) => group.active);
+  return activeGroup ? activeGroup.title : "Window lens";
+}
 
-    const actionCell = document.createElement("td");
-    actionCell.className = "col-action";
-    const actions = document.createElement("div");
-    actions.className = "row-actions";
-
-    const optionsBtn = document.createElement("button");
-    optionsBtn.type = "button";
-    optionsBtn.className = "icon-btn icon-btn-options";
-    if (optionsOpen) {
-      optionsBtn.classList.add("is-open");
-    }
-    if (patternTitles.length > 0) {
-      optionsBtn.classList.add("has-content");
-    }
-    optionsBtn.setAttribute("aria-expanded", String(optionsOpen));
-    optionsBtn.title = patternTitles.length > 0 ? `Title patterns (${patternTitles.length})` : "Title patterns";
-    optionsBtn.setAttribute("aria-label", `Title pattern options for ${id}`);
-    optionsBtn.innerHTML = CHEVRON_ICON;
-    optionsBtn.addEventListener("click", () => {
-      const open = !expandedPatternRows.has(id);
-      if (open) {
-        expandedPatternRows.add(id);
-      } else {
-        expandedPatternRows.delete(id);
-      }
-      panel.hidden = !open;
-      optionsBtn.classList.toggle("is-open", open);
-      optionsBtn.setAttribute("aria-expanded", String(open));
-      if (open) {
-        patternInput.focus();
-      }
-    });
-
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "icon-btn";
-    remove.title = "Delete this focus mapping";
-    remove.setAttribute("aria-label", `Delete mapping for ${id}`);
-    remove.disabled = !hasMapping;
-    remove.innerHTML = TRASH_ICON;
-    remove.addEventListener("click", () => {
-      delete draftMappings[id];
-      expandedPatternRows.delete(id);
-      markDirty();
-      renderMappings();
-    });
-    actions.append(optionsBtn, remove);
-    actionCell.append(actions);
-
-    row.append(idCell, arrowCell, groupsCell, actionCell);
-    makeDropTarget(row, (drag, event) => moveTitleToFocus(drag.title, event && event.altKey ? null : drag.sourceId, id));
-    return row;
+async function saveWindowAsLens() {
+  const cleanName = defaultWindowLensName();
+  const color = nextLensColor();
+  const windowId = state.windowId === undefined ? await currentWindowId() : state.windowId;
+  state.windowId = windowId;
+  const response = await browser.runtime.sendMessage({
+    type: "lens-save",
+    windowId,
+    source: "window",
+    name: cleanName,
+    color,
   });
+  if (isRecord(response) && isRecord(response.lens)) {
+    const lens = normalizeLens({ ...response.lens, color: response.lens.color || color });
+    if (lens) {
+      pendingNameEditId = lens.id;
+      state.lenses = normalizeLenses([...state.lenses.filter((existing) => existing.id !== lens.id), lens]);
+      render();
+    }
+  }
+  setStatus("Saved current window as a lens.", "ok");
+}
 
-  body.replaceChildren(...rows, makeUnassignedRow());
-  renderUnassigned();
-  if (adderInput) {
-    adderInput.focus();
-    activeAdderId = null;
+async function createEmptyLens() {
+  const name = provisionalDefaultName();
+  const color = nextLensColor();
+  const response = await browser.runtime.sendMessage({
+    type: "lens-save",
+    source: "empty",
+    name,
+    color,
+  });
+  if (isRecord(response) && isRecord(response.lens)) {
+    const lens = normalizeLens({ ...response.lens, color: response.lens.color || color });
+    if (lens) {
+      pendingNameEditId = lens.id;
+      untouchedDefaultLensIds.add(lens.id);
+      state.lenses = normalizeLenses([...state.lenses.filter((existing) => existing.id !== lens.id), lens]);
+      render();
+    }
   }
-  if (patternAdderInput) {
-    patternAdderInput.focus();
-    activePatternAdderId = null;
+  setStatus("Created a new lens.", "ok");
+}
+
+function showDeletedLensUndo(deletedLens, originalIndex) {
+  clearStatusUndoTimer();
+  const status = document.getElementById("status");
+  const undo = document.createElement("button");
+  undo.type = "button";
+  undo.className = "status-undo";
+  undo.textContent = "Undo";
+  undo.addEventListener("click", () => {
+    clearStatusUndoTimer();
+    undo.disabled = true;
+    restoreDeletedLens(deletedLens, originalIndex).catch((error) => {
+      console.error("Lens restore failed:", error);
+      setStatus("Restore failed. See extension console.", "error");
+    });
+  });
+  status.className = "ok";
+  status.replaceChildren(document.createTextNode(`Deleted ${deletedLens.name} \u00b7 `), undo);
+  statusUndoTimer = window.setTimeout(() => {
+    if (status.contains(undo)) {
+      status.replaceChildren();
+      status.className = "";
+    }
+    statusUndoTimer = null;
+  }, 6000);
+}
+
+async function restoreDeletedLens(deletedLens, originalIndex) {
+  const response = await browser.runtime.sendMessage({
+    type: "lens-save",
+    source: "empty",
+    name: deletedLens.name,
+    color: deletedLens.color,
+  });
+  if (!isRecord(response) || !isRecord(response.lens) || typeof response.lens.id !== "string") {
+    throw new Error("Lens restore save failed");
   }
+  const lensId = response.lens.id;
+  const patch = {
+    icon: deletedLens.icon,
+    color: deletedLens.color,
+    groupSelectors: deletedLens.groupSelectors.map((selector) => ({ ...selector })),
+  };
+  await browser.runtime.sendMessage({ type: "lens-update", lensId, patch });
+  let restored = normalizeLens({
+    ...response.lens,
+    ...patch,
+    triggers: { appleFocusIds: [] },
+  });
+  if (restored) {
+    state.lenses = normalizeLenses([...state.lenses.filter((lens) => lens.id !== lensId), restored]);
+  }
+  for (const focusId of deletedLens.triggers.appleFocusIds) {
+    await browser.runtime.sendMessage({ type: "lens-link-focus", lensId, focusId });
+    restored = replaceLensInState(lensId, {
+      triggers: { appleFocusIds: [...((restored && restored.triggers.appleFocusIds) || []), focusId] },
+    });
+  }
+  const orderedIds = state.lenses.map((lens) => lens.id).filter((id) => id !== lensId);
+  orderedIds.splice(Math.max(0, Math.min(originalIndex, orderedIds.length)), 0, lensId);
+  await browser.runtime.sendMessage({ type: "lens-reorder", orderedIds });
+  const byId = new Map(state.lenses.map((lens) => [lens.id, lens]));
+  state.lenses = orderedIds.map((id) => byId.get(id)).filter(Boolean);
+  await refreshLensState();
+  setStatus(`Restored ${deletedLens.name}.`, "ok");
+}
+
+async function deleteLens(lensId) {
+  const lens = findLens(lensId);
+  if (!lens) return;
+  const originalIndex = state.lenses.findIndex((existing) => existing.id === lensId);
+  const deletedLens = cloneLensForRestore(lens);
+  state.lenses = state.lenses.filter((existing) => existing.id !== lensId);
+  untouchedDefaultLensIds.delete(lensId);
+  expandedLensRows.delete(lensId);
+  if (activeFocusPickerId === lensId) activeFocusPickerId = null;
+  if (openIconEditorId === lensId) openIconEditorId = null;
+  render();
+  await browser.runtime.sendMessage({ type: "lens-delete", lensId });
+  showDeletedLensUndo(deletedLens, originalIndex);
 }
 
 function formatValue(value) {
@@ -696,15 +1611,63 @@ function formatList(values) {
   return values.length > 0 ? values.join(", ") : "—";
 }
 
+function formatRelativeTime(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) {
+    return "unknown time";
+  }
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (elapsedSeconds < 5) {
+    return "just now";
+  }
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds}s ago`;
+  }
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) {
+    return `${elapsedMinutes}m ago`;
+  }
+  return `${Math.floor(elapsedMinutes / 60)}h ago`;
+}
+
 function renderDiagnostics() {
-  document.getElementById("diag-last-focus").textContent = formatValue(state.lastFocusSeen);
-  document.getElementById("diag-last-action").textContent = formatValue(state.lastAction);
+  const connection = document.getElementById("diag-connection");
+  const connected = state.connectionState === "connected";
+  connection.textContent = helperStatusText();
+  connection.classList.toggle("diag-ok", connected);
+  connection.classList.toggle("diag-warn", !connected);
+
+  const lastError = document.getElementById("diag-last-error");
+  if (state.lastError) {
+    lastError.textContent = `${state.lastError.message} (${formatRelativeTime(state.lastError.at)})`;
+    lastError.classList.add("diag-warn");
+  } else {
+    lastError.textContent = "None";
+    lastError.classList.remove("diag-warn");
+  }
+
+  const updateFailures = document.getElementById("diag-update-failures");
+  if (state.updateFailures.length > 0) {
+    updateFailures.textContent = state.updateFailures.join(", ");
+    updateFailures.classList.add("diag-warn");
+  } else {
+    updateFailures.textContent = "None";
+    updateFailures.classList.remove("diag-warn");
+  }
+
+  const lastTriggerId = state.lastActivation && typeof state.lastActivation.triggerId === "string"
+    ? state.lastActivation.triggerId
+    : state.lastFocusSeen;
+  const lastAction = state.lastActivation && typeof state.lastActivation.trigger === "string"
+    ? `${state.lastActivation.trigger}${typeof state.lastActivation.at === "number" ? ` (${formatRelativeTime(state.lastActivation.at)})` : ""}`
+    : state.lastAction;
+  document.getElementById("diag-last-focus").textContent = formatValue(lastTriggerId);
+  document.getElementById("diag-last-action").textContent = formatValue(lastAction);
   document.getElementById("diag-current-groups").textContent = formatList(state.firefoxGroupTitles);
   document.getElementById("diag-group-titles").textContent = formatList(state.groupTitles);
 
   const details = [];
   if (state.unmappedFocusId) {
-    details.push(`unmapped Focus ID: ${state.unmappedFocusId}`);
+    details.push(`unmapped trigger ID: ${state.unmappedFocusId}`);
   }
   if (state.missingGroup) {
     details.push(`missing group: ${state.missingGroup}`);
@@ -724,29 +1687,21 @@ function renderDiagnostics() {
   document.getElementById("diag-action-details").textContent = details.length > 0 ? details.join("; ") : "—";
 }
 
-function renderCallout() {
-  const callout = document.getElementById("unmapped-callout");
-  const codeEl = document.getElementById("callout-focus-id");
 
-  const showCallout =
-    state.lastAction === "unmapped_focus_id" &&
-    typeof state.unmappedFocusId === "string" &&
-    state.unmappedFocusId.length > 0 &&
-    !hasOwn(draftMappings, state.unmappedFocusId);
-
-  if (showCallout) {
-    codeEl.textContent = state.unmappedFocusId;
-    callout.hidden = false;
-  } else {
-    callout.hidden = true;
+function applyPendingFocus() {
+  if (!pendingNameEditId) return;
+  const input = document.querySelector(`.lens-card[data-lens-id="${pendingNameEditId}"] .lens-name-input`);
+  if (input && document.activeElement !== input) {
+    input.focus();
+    input.select();
   }
 }
 
 function render() {
-  renderMappings();
+  renderLenses();
   renderDiagnostics();
-  renderCallout();
   renderShortcut();
+  applyPendingFocus();
 }
 
 function renderShortcut() {
@@ -816,79 +1771,20 @@ function onShortcutKeydown(event) {
   });
 }
 
-function buildMappingsForSave() {
-  const output = {};
-  for (const [id, titles] of Object.entries(draftMappings)) {
-    const normalizedId = id.trim();
-    if (!normalizedId) continue;
-    output[normalizedId] = normalizeTitles(titles);
-  }
-  return output;
-}
-
-function addCustomMapping() {
-  const idInput = document.getElementById("new-focus-id");
-  const id = idInput.value.trim();
-  if (!id) {
-    setStatus("Enter an Apple Focus ID.", "error");
-    return;
-  }
-  if (!hasOwn(draftMappings, id)) {
-    draftMappings[id] = [];
-    markDirty();
-  }
-  hideAddFocusRow();
-  // Focus the new row's group adder so the user can map groups immediately.
-  activeAdderId = id;
-  renderMappings();
-}
-
-function showAddFocusRow() {
-  const rowEl = document.getElementById("add-focus-row");
-  const idInput = document.getElementById("new-focus-id");
-  if (rowEl) {
-    rowEl.hidden = false;
-  }
-  if (idInput) {
-    idInput.focus();
-  }
-}
-
-function hideAddFocusRow() {
-  const rowEl = document.getElementById("add-focus-row");
-  const idInput = document.getElementById("new-focus-id");
-  if (idInput) {
-    idInput.value = "";
-  }
-  if (rowEl) {
-    rowEl.hidden = true;
-  }
-}
-
-async function saveMappings(event) {
-  event.preventDefault();
-  const focusMappings = buildMappingsForSave();
-  await browser.storage.local.set({ focusMappings });
-  state.focusMappings = focusMappings;
-  draftMappings = cloneMappings(focusMappings);
-  dirty = false;
-  render();
-  setStatus("Saved", "ok");
-}
-
-function discardChanges() {
-  draftMappings = cloneMappings(state.focusMappings);
-  dirty = false;
-  render();
-  setStatus("Discarded changes", "");
-}
 
 function applyStorageChange(changes) {
-  if (changes.focusMappings) {
-    state.focusMappings = normalizeMappings(changes.focusMappings.newValue);
-    if (!dirty) {
-      draftMappings = cloneMappings(state.focusMappings);
-    }
+  if (changes.lenses) {
+    state.lenses = normalizeLenses(changes.lenses.newValue);
+    syncUntouchedDefaultLenses();
+  }
+  if (changes.activeView) {
+    state.activeView = isRecord(changes.activeView.newValue) ? changes.activeView.newValue : { kind: "all" };
+  }
+  if (changes.lastActivation) {
+    state.lastActivation = isRecord(changes.lastActivation.newValue) ? changes.lastActivation.newValue : null;
+  }
+  if (changes.legacyFocusMappingsBackup) {
+    state.legacyFocusMappingsBackup = isRecord(changes.legacyFocusMappingsBackup.newValue) ? changes.legacyFocusMappingsBackup.newValue : null;
   }
   if (changes.seenFocusIds) {
     state.seenFocusIds = normalizeSeen(changes.seenFocusIds.newValue);
@@ -920,6 +1816,12 @@ function applyStorageChange(changes) {
   if (changes.updateFailures) {
     state.updateFailures = normalizeStringArray(changes.updateFailures.newValue);
   }
+  if (changes.connectionState) {
+    state.connectionState = normalizeConnectionState(changes.connectionState.newValue);
+  }
+  if (changes.lastError) {
+    state.lastError = normalizeLastError(changes.lastError.newValue);
+  }
   if (changes.tabSearchShortcut) {
     state.tabSearchShortcut = normalizeShortcut(changes.tabSearchShortcut.newValue);
     renderShortcut();
@@ -938,7 +1840,10 @@ function applyStorageChange(changes) {
 }
 
 async function refreshFirefoxGroups() {
-  state.firefoxGroupTitles = await queryGroupTitles();
+  const snapshot = await queryFirefoxGroupSnapshot();
+  state.firefoxGroupTitles = snapshot.titles;
+  state.firefoxGroupTitleCounts = snapshot.counts;
+  state.currentGroups = snapshot.currentGroups;
   render();
 }
 
@@ -1118,39 +2023,17 @@ async function saveProvider() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  document.getElementById("mappings-form").addEventListener("submit", (event) => {
-    saveMappings(event).catch((error) => {
-      console.error("Focus mapping save failed:", error);
+  document.getElementById("save-window-lens").addEventListener("click", () => {
+    saveWindowAsLens().catch((error) => {
+      console.error("Save current window lens failed:", error);
       setStatus("Save failed. See extension console for details.", "error");
     });
   });
-  document.getElementById("discard").addEventListener("click", discardChanges);
-  document.getElementById("add-mapping").addEventListener("click", addCustomMapping);
-  document.getElementById("reveal-add-focus").addEventListener("click", showAddFocusRow);
-  document.getElementById("cancel-add-focus").addEventListener("click", hideAddFocusRow);
-  document.getElementById("new-focus-id").addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      addCustomMapping();
-    } else if (event.key === "Escape") {
-      hideAddFocusRow();
-    }
-  });
-
-  document.getElementById("apply-now").addEventListener("click", () => {
-    browser.runtime.sendMessage({ type: "apply-current-focus" })
-      .then(() => setStatus("Reapplied current Focus", "ok"))
-      .catch((error) => {
-        console.error("Apply current Focus failed:", error);
-        setStatus("Apply failed. See extension console.", "error");
-      });
-  });
-
-  document.getElementById("callout-map-btn").addEventListener("click", () => {
-    const rawId = state.unmappedFocusId;
-    if (!rawId) return;
-    document.getElementById("new-focus-id").value = rawId;
-    addCustomMapping();
+  document.getElementById("new-empty-lens").addEventListener("click", () => {
+    createEmptyLens().catch((error) => {
+      console.error("Create empty lens failed:", error);
+      setStatus("Create failed. See extension console for details.", "error");
+    });
   });
 
   const shortcutRecord = document.getElementById("shortcut-record");
@@ -1216,7 +2099,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   loadAll().catch((error) => {
-    console.error("Focus options load failed:", error);
+    console.error("Tab Lens options load failed:", error);
     setStatus("Load failed. See extension console for details.", "error");
   });
 });

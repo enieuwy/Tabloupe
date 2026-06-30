@@ -6,32 +6,80 @@
   <script defer src="popup.js"></script>
 </head>
 <body>
-  <header class="popup-header">
-    <h1>AI Tab Groups</h1>
+  <main id="lens-view">
+    <header class="popup-header">
+      <h1>Tab Lens</h1>
+      <a id="lens-options" href="#" class="options-link">Options</a>
+    </header>
+
+    <section class="panel showing-panel" aria-labelledby="lens-showing">
+      <p id="lens-showing" class="showing-line">Showing: All groups</p>
+      <p id="lens-trigger" class="trigger-line" hidden></p>
+      <button id="lens-show-all" type="button">Show all groups</button>
+    </section>
+
+    <section class="section" aria-labelledby="lenses-heading">
+      <div class="section-header">
+        <h2 id="lenses-heading">Lenses</h2>
+      </div>
+      <div id="lens-chips" class="lens-chips"></div>
+    </section>
+
+    <section id="groups-section" class="section" aria-labelledby="groups-heading">
+      <div class="section-header">
+        <h2 id="groups-heading">This window's groups</h2>
+        <button id="lens-save-window" type="button" class="secondary compact">Save current groups as a lens</button>
+      </div>
+      <div id="current-groups" class="window-groups"></div>
+    </section>
+
+    <section id="empty-state" class="empty-state" hidden>
+      <p>Tab Lens works with Firefox tab groups. Create a tab group in Firefox, or use Organize tabs to group this window.</p>
+      <button id="empty-organize" type="button">Organize tabs…</button>
+    </section>
+
+    <div class="footer-actions">
+      <button id="open-ai" type="button" class="secondary">Organize tabs…</button>
+    </div>
+    <p id="lens-status" class="status" role="status" aria-live="polite"></p>
+  </main>
+
+  <section id="ai-view" class="ai-view" hidden>
+    <header class="popup-header">
+      <h1>Organize tabs</h1>
+      <button id="ai-back" type="button" class="secondary compact">Back</button>
+    </header>
+
     <label class="toggle">
       <input id="ai-enabled" type="checkbox">
       <span>Enabled</span>
     </label>
-  </header>
 
-  <p id="ai-summary" class="summary"></p>
+    <p id="popup-connection" class="conn" role="status"></p>
 
-  <label id="ai-pin-row" class="toggle pin-toggle" hidden>
-    <input id="ai-pin" type="checkbox">
-    <span id="ai-pin-label">Pin new groups to active Focus</span>
-  </label>
+    <p id="ai-summary" class="summary"></p>
 
-  <div id="ai-groups" class="groups" hidden></div>
+    <label id="ai-pin-row" class="toggle pin-toggle" hidden>
+      <input id="ai-pin" type="checkbox">
+      <span id="ai-pin-label">Add new groups to current lens</span>
+    </label>
+    <label id="ai-auto-row" class="toggle" hidden>
+      <input id="ai-auto" type="checkbox">
+      <span>Auto-group new tabs</span>
+    </label>
 
-  <p id="ai-status" class="status" role="status" aria-live="polite"></p>
+    <div id="ai-groups" class="groups" hidden></div>
 
-  <div class="actions">
-    <button id="ai-apply" type="button" hidden>Apply</button>
-    <button id="ai-regroup" type="button" class="secondary" hidden>Regroup</button>
-    <button id="ai-dismiss" type="button" class="secondary" hidden>Dismiss</button>
-    <button id="ai-organize" type="button" hidden>Organize tabs</button>
-  </div>
+    <p id="ai-status" class="status" role="status" aria-live="polite"></p>
 
-  <a id="ai-options" href="#" class="options-link">Open options</a>
+    <div class="actions">
+      <button id="ai-apply" type="button" hidden>Apply</button>
+      <button id="ai-regroup" type="button" class="secondary" hidden>Regroup</button>
+      <button id="ai-dismiss" type="button" class="secondary" hidden>Dismiss</button>
+      <button id="ai-organize" type="button" hidden>Organize tabs</button>
+    </div>
+
+    <a id="ai-options" href="#" class="options-link">Open options</a>
+  </section>
 </body>
 </html>
