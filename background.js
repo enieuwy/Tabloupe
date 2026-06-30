@@ -12,6 +12,9 @@ const AI_PROVIDER_KEY = "aiProvider";
 const AI_PIN_TO_FOCUS_KEY = "aiPinToFocus";
 const AI_GROUPING_PROMPT_KEY = "aiGroupingPrompt";
 const AI_GROUPING_PROMPT_MAX = 4000;
+const AI_AUTO_GROUP_KEY = "aiAutoGroup";
+const AUTO_GROUP_DEBOUNCE_MS = 5000;
+const AUTO_GROUP_COOLDOWN_MS = 30000;
 // Default system prompt. The user can replace it wholesale from Options (stored
 // in aiGroupingPrompt); an empty override falls back to this default.
 const GROUPING_SYSTEM_PROMPT =
@@ -30,16 +33,12 @@ const TAB_GROUP_COLORS = ["blue", "cyan", "green", "orange", "pink", "purple", "
 // tab groups still produces a readable, deliverable notification.
 const NOTIFICATION_LIST_MAX = 12;
 
-const DEFAULT_FOCUS_MAPPINGS = Object.freeze({
-  "com.apple.focus.work": ["Work"],
-  "com.apple.focus.personal-time": ["Personal"],
-  "com.apple.donotdisturb.mode.default": ["Do Not Disturb"],
-  "com.apple.sleep.sleep-mode": ["Sleep"],
-  "com.apple.donotdisturb.mode.graduationcapfill": ["Study"],
-  "com.apple.focus.reduce-interruptions": ["Reduce Interruptions"],
-});
+const LEGACY_MAP_KEY = "focus" + "Mappings";
 
-let lastDispatchedRawId;
+let lastAppliedAppleFocusId = null;
+let focusBadge = { text: "", color: null, title: "Tab Lens" };
+const transientViewsByWindow = new Map();
+let lastError = null;
 let socket = null;
 let reconnectDelay = MIN_RECONNECT_MS;
 let reconnectTimer = null;
@@ -55,6 +54,14 @@ const lastProposalByWindow = new Map();
 // AI previews collapse onto one in-flight request per window so re-opening the
 // popup or clicking Regroup mid-compute can't fan out duplicate daemon/LLM calls.
 const inflightPreviews = new Map();
+let autoGroupEnabled = false;
+const autoGroupDebounceTimers = new Map();
+const autoGroupCooldown = new Set();
+// True single-flight guard: a per-window run holds this for the whole
+// compute+commit. The cooldown alone can't serialize runs because on-device
+// clustering can outlive AUTO_GROUP_COOLDOWN_MS, letting a later run start and
+// then fail re-validation ("no_groups") on tabs the first run already grouped.
+const autoGroupInflight = new Set();
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -89,12 +96,6 @@ function enqueueFocusWork(task) {
   return queued;
 }
 
-async function ensureDefaultMappings() {
-  const stored = await browser.storage.local.get("focusMappings");
-  if (!isRecord(stored.focusMappings)) {
-    await browser.storage.local.set({ focusMappings: { ...DEFAULT_FOCUS_MAPPINGS } });
-  }
-}
 
 function clearReconnectTimer() {
   if (reconnectTimer !== null) {
@@ -138,11 +139,186 @@ async function recordSeen(rawId) {
   });
 }
 
-function mappedFocus(rawId, focusMappings) {
-  if (rawId === null || !hasOwn(focusMappings, rawId)) {
+function normalizedSelectors(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set();
+  const selectors = [];
+  for (const selector of value) {
+    if (!isRecord(selector) || (selector.type !== "title" && selector.type !== "glob")) {
+      continue;
+    }
+    const raw = typeof selector.value === "string" ? selector.value.trim() : "";
+    if (raw === "") {
+      continue;
+    }
+    const key = `${selector.type}\u0000${raw}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      selectors.push({ type: selector.type, value: raw });
+    }
+  }
+  return selectors;
+}
+
+function normalizeLens(lens) {
+  if (!isRecord(lens) || typeof lens.id !== "string" || typeof lens.name !== "string") {
     return null;
   }
-  return normalizeTitles(focusMappings[rawId]);
+  const triggers = isRecord(lens.triggers) ? lens.triggers : {};
+  return {
+    id: lens.id,
+    name: lens.name,
+    icon: typeof lens.icon === "string" && lens.icon ? lens.icon : "target",
+    color: typeof lens.color === "string" ? lens.color : null,
+    groupSelectors: normalizedSelectors(lens.groupSelectors),
+    triggers: {
+      appleFocusIds: Array.isArray(triggers.appleFocusIds)
+        ? [...new Set(triggers.appleFocusIds.filter((id) => typeof id === "string" && id !== ""))]
+        : [],
+    },
+    createdAt: typeof lens.createdAt === "number" ? lens.createdAt : Date.now(),
+    updatedAt: typeof lens.updatedAt === "number" ? lens.updatedAt : Date.now(),
+    ...(isRecord(lens.migratedFrom) && Array.isArray(lens.migratedFrom.focusIds)
+      ? { migratedFrom: { focusIds: lens.migratedFrom.focusIds.filter((id) => typeof id === "string") } }
+      : {}),
+  };
+}
+
+async function getLenses() {
+  const stored = await browser.storage.local.get("lenses");
+  return Array.isArray(stored.lenses) ? stored.lenses.map(normalizeLens).filter(Boolean) : [];
+}
+
+async function saveLenses(arr) {
+  await browser.storage.local.set({ lenses: Array.isArray(arr) ? arr.map(normalizeLens).filter(Boolean) : [] });
+}
+
+function generateLensId() {
+  return `lens_${Math.random().toString(36).slice(2, 10) || Date.now().toString(36)}`;
+}
+
+function isPersistedView(view) {
+  return isRecord(view) && (view.kind === "all" || (view.kind === "lens" && typeof view.lensId === "string"));
+}
+
+async function getActiveView() {
+  const stored = await browser.storage.local.get("activeView");
+  return isPersistedView(stored.activeView) ? stored.activeView : { kind: "all" };
+}
+
+async function setActiveView(view, lastActivation) {
+  if (!isPersistedView(view)) {
+    return;
+  }
+  await browser.storage.local.set({
+    activeView: view,
+    lastActivation: {
+      trigger: lastActivation && typeof lastActivation.trigger === "string" ? lastActivation.trigger : "manual",
+      ...(lastActivation && typeof lastActivation.triggerId === "string" ? { triggerId: lastActivation.triggerId } : {}),
+      at: Date.now(),
+    },
+  });
+}
+
+async function getAutomationFallback() {
+  const stored = await browser.storage.local.get("automationFallback");
+  return isPersistedView(stored.automationFallback) ? stored.automationFallback : { kind: "all" };
+}
+
+function selectorMatcher(selectors) {
+  const exact = new Set();
+  const globValues = [];
+  for (const selector of normalizedSelectors(selectors)) {
+    if (selector.type === "glob") {
+      globValues.push(selector.value);
+    } else {
+      exact.add(selector.value);
+    }
+  }
+  const globMatches = buildTitleMatcher(globValues);
+  return (title) => exact.has(title) || globMatches(title);
+}
+
+function lensSelectorsMatch(lens, title) {
+  return selectorMatcher(lens && lens.groupSelectors)(title);
+}
+
+function lensesMatchingTitle(title, lenses) {
+  return (Array.isArray(lenses) ? lenses : [])
+    .filter((lens) => lensSelectorsMatch(lens, title))
+    .map((lens) => lens.name);
+}
+
+function selectorsFromTitles(titles) {
+  return normalizeTitles(titles).map((title) => ({
+    type: isGlobPattern(title) ? "glob" : "title",
+    value: title,
+  }));
+}
+
+function selectorSetKey(selectors) {
+  return normalizedSelectors(selectors)
+    .map((selector) => `${selector.type}:${selector.value}`)
+    .sort()
+    .join("\n");
+}
+
+function readableFallbackName(id) {
+  const tail = id.split(".").filter(Boolean).pop() || id;
+  return tail
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+async function migrateToLensesV2() {
+  const stored = await browser.storage.local.get(null);
+  if (!hasOwn(stored, LEGACY_MAP_KEY) || stored.schemaVersion === 2) {
+    return;
+  }
+  const now = Date.now();
+  const legacy = isRecord(stored[LEGACY_MAP_KEY]) ? stored[LEGACY_MAP_KEY] : {};
+  const catalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
+  const merged = new Map();
+  const ignoredAppleFocusIds = [];
+
+  for (const [id, value] of Object.entries(legacy)) {
+    const titles = normalizeTitles(value);
+    if (titles.length === 0) {
+      if (Array.isArray(value) && value.length === 0) {
+        ignoredAppleFocusIds.push(id);
+      }
+      continue;
+    }
+    const selectors = selectorsFromTitles(titles);
+    const key = selectorSetKey(selectors);
+    const catalogEntry = isRecord(catalog[id]) ? catalog[id] : {};
+    let lens = merged.get(key);
+    if (!lens) {
+      lens = {
+        id: generateLensId(),
+        name: typeof catalogEntry.name === "string" && catalogEntry.name ? catalogEntry.name : readableFallbackName(id),
+        icon: typeof catalogEntry.icon === "string" && catalogEntry.icon ? catalogEntry.icon : "target",
+        color: typeof catalogEntry.color === "string" ? catalogEntry.color : null,
+        groupSelectors: selectors,
+        triggers: { appleFocusIds: [] },
+        createdAt: now,
+        updatedAt: now,
+        migratedFrom: { focusIds: [] },
+      };
+      merged.set(key, lens);
+    }
+    lens.triggers.appleFocusIds.push(id);
+    lens.migratedFrom.focusIds.push(id);
+  }
+
+  await browser.storage.local.set({
+    lenses: [...merged.values()],
+    ignoredAppleFocusIds,
+    legacyFocusMappingsBackup: stored[LEGACY_MAP_KEY],
+    schemaVersion: 2,
+  });
 }
 
 // A mapping entry containing * or ? is a glob: * matches any run of characters,
@@ -157,9 +333,6 @@ function globToRegExp(pattern) {
   return new RegExp(`^${body}$`);
 }
 
-// Build a predicate over tab-group titles from a focus's mapped entries (a mix
-// of exact titles and globs). A title matches if it equals an exact entry or
-// matches any glob.
 function buildTitleMatcher(titles) {
   const exact = new Set();
   const globs = [];
@@ -168,7 +341,7 @@ function buildTitleMatcher(titles) {
       try {
         globs.push(globToRegExp(entry));
       } catch (error) {
-        console.error("Invalid focus mapping glob:", entry, error);
+        console.error("Invalid title selector glob:", entry, error);
       }
     } else {
       exact.add(entry);
@@ -177,20 +350,6 @@ function buildTitleMatcher(titles) {
   return (title) => exact.has(title) || globs.some((re) => re.test(title));
 }
 
-async function applyRawFocus(rawId, { force = false } = {}) {
-  if (!force && rawId === lastDispatchedRawId) {
-    return;
-  }
-
-  const stored = await browser.storage.local.get("focusMappings");
-  const focusMappings = isRecord(stored.focusMappings) ? stored.focusMappings : {};
-  const titles = mappedFocus(rawId, focusMappings);
-
-  const applied = await applyFocus(titles, { rawId });
-  if (applied !== false) {
-    lastDispatchedRawId = rawId;
-  }
-}
 // MCC owns the Focus catalog (id -> {name, icon, color}); cache what it
 // broadcasts so the options UI and the badge can show names without hardcoding.
 async function mergeFocusCatalog(entries) {
@@ -225,13 +384,67 @@ async function focusDisplayName(rawId) {
   return entry && typeof entry.name === "string" && entry.name ? entry.name : rawId;
 }
 
+async function findLensForAppleFocusId(rawId) {
+  const lenses = await getLenses();
+  return lenses.find((lens) => lens.triggers.appleFocusIds.includes(rawId)) || null;
+}
+
+async function notifyUnboundAppleFocus(rawId) {
+  const focusName = await focusDisplayName(rawId);
+  await setFocusBadge({ text: "?", color: "#D50000", title: `Tab Lens: ${focusName}` });
+  await browser.storage.local.set({
+    ...CLEAR_ACTION_DIAGNOSTICS,
+    lastAction: "unmapped_focus_id",
+    unmappedFocusId: rawId,
+  });
+  await notify({
+    type: "basic",
+    title: "Tab Lens",
+    message: `Unbound automation mode ${focusName} — open options to bind it to a lens`,
+  }, `${OPTIONS_NOTIFICATION_PREFIX}${rawId}`);
+}
+
+async function handleAppleFocusOff() {
+  const triggerId = lastAppliedAppleFocusId;
+  lastAppliedAppleFocusId = null;
+  if (typeof triggerId !== "string") {
+    return;
+  }
+  const stored = await browser.storage.local.get(["activeView", "lastActivation"]);
+  const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
+  if (lastActivation.trigger !== "appleFocus" || lastActivation.triggerId !== triggerId) {
+    return;
+  }
+  await activateView(await getAutomationFallback(), { trigger: "appleFocus", triggerId });
+}
+
+async function handleAppleFocus(rawId) {
+  if (rawId === null) {
+    await handleAppleFocusOff();
+    return;
+  }
+  const stored = await browser.storage.local.get("lastActivation");
+  const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
+  if (rawId === lastAppliedAppleFocusId && lastActivation.trigger === "manual") {
+    return;
+  }
+  const lens = await findLensForAppleFocusId(rawId);
+  if (!lens) {
+    await notifyUnboundAppleFocus(rawId);
+    return;
+  }
+  const applied = await activateView({ kind: "lens", lensId: lens.id }, { trigger: "appleFocus", triggerId: rawId });
+  if (applied !== false) {
+    lastAppliedAppleFocusId = rawId;
+  }
+}
+
 async function handleMessage(event) {
   const msg = JSON.parse(event.data);
   // MCC multiplexes several state subsystems on this socket (focus, bluetooth,
   // wireguard, ...), each wrapped in a StateEnvelope { type, schemaVersion, ts,
-  // payload }. Focus envelopes drive tab grouping; focusCatalog carries the
-  // id -> {name, icon, color} table. Ignore everything else so an unrelated
-  // state change can't reset focus and expand all groups.
+  // payload }. Apple Focus envelopes optionally trigger a lens; focusCatalog
+  // carries the id -> {name, icon, color} table.
   if (!isRecord(msg)) {
     return;
   }
@@ -244,8 +457,6 @@ async function handleMessage(event) {
     return;
   }
   const payload = isRecord(msg.payload) ? msg.payload : {};
-  // payload.focus is null (Focus off) or an enriched { id, name, icon, color }
-  // object. Cache the enriched entry so the badge/notifications can name it.
   const focus = payload.focus;
   let rawId = null;
   if (isRecord(focus) && typeof focus.id === "string") {
@@ -254,7 +465,7 @@ async function handleMessage(event) {
   }
 
   await recordSeen(rawId);
-  await applyRawFocus(rawId);
+  await handleAppleFocus(rawId);
 }
 
 async function connect() {
@@ -263,12 +474,18 @@ async function connect() {
   }
 
   clearReconnectTimer();
+  setConnectionState("reconnecting").catch((error) => {
+    console.error("Connection state error:", error);
+  });
   const ws = new WebSocket(WS_URL);
   socket = ws;
 
   ws.onopen = () => {
     reconnectDelay = MIN_RECONNECT_MS;
     clearReconnectTimer();
+    setConnectionState("connected").catch((error) => {
+      console.error("Connection state error:", error);
+    });
   };
   ws.onmessage = (event) => {
     if (tryResolveGroupingResponse(event)) {
@@ -283,16 +500,204 @@ async function connect() {
     if (socket === ws) {
       socket = null;
       rejectPendingGrouping(new Error("daemon_disconnected"));
+      setConnectionState("reconnecting").catch((error) => {
+        console.error("Connection state error:", error);
+      });
       scheduleReconnect();
     }
   };
   ws.onerror = () => ws.close();
 }
 
+async function handleLensState(windowId) {
+  const [lenses, persistedActiveView, stored, aiEnabled] = await Promise.all([
+    getLenses(),
+    getActiveView(),
+    browser.storage.local.get("lastActivation"),
+    aiGroupingEnabled(),
+  ]);
+  const activeView = typeof windowId === "number" && transientViewsByWindow.has(windowId)
+    ? transientViewsByWindow.get(windowId)
+    : persistedActiveView;
+  const query = typeof windowId === "number" ? { windowId } : {};
+  const groups = await browser.tabGroups.query(query);
+  const hasAppleBinding = lenses.some((lens) => lens.triggers.appleFocusIds.length > 0) ||
+    Boolean(socket && socket.readyState === WebSocket.OPEN);
+  return {
+    activeView,
+    lastActivation: isRecord(stored.lastActivation) ? stored.lastActivation : null,
+    lenses: lenses.map((lens) => ({
+      id: lens.id,
+      name: lens.name,
+      icon: lens.icon,
+      color: lens.color,
+      active: activeView.kind === "lens" && activeView.lensId === lens.id,
+    })),
+    currentGroups: groups.map((group) => ({
+      title: typeof group.title === "string" ? group.title : "",
+      color: typeof group.color === "string" ? group.color : null,
+      savedIn: lensesMatchingTitle(typeof group.title === "string" ? group.title : "", lenses),
+    })),
+    hasGroups: groups.length > 0,
+    hasAppleBinding,
+    aiEnabled,
+  };
+}
+
+async function handleLensActivate(windowId, view) {
+  const ok = await activateView(view, { trigger: "manual", windowId });
+  return ok === false ? { ok: false } : { ok: true };
+}
+
+async function handleLensSave(msg) {
+  const source = msg && msg.source;
+  const name = typeof msg.name === "string" && msg.name.trim() ? msg.name.trim() : "";
+  if (name === "") {
+    return { ok: false, error: "missing_name" };
+  }
+  let titles = [];
+  if (source === "window") {
+    const query = typeof msg.windowId === "number" ? { windowId: msg.windowId } : {};
+    titles = (await browser.tabGroups.query(query)).map((group) => group.title);
+  } else if (source === "group" && typeof msg.groupTitle === "string") {
+    titles = [msg.groupTitle];
+  }
+  const now = Date.now();
+  const lens = {
+    id: generateLensId(),
+    name,
+    icon: typeof msg.icon === "string" && msg.icon ? msg.icon : "target",
+    color: typeof msg.color === "string" ? msg.color : null,
+    groupSelectors: selectorsFromTitles(titles),
+    triggers: { appleFocusIds: [] },
+    createdAt: now,
+    updatedAt: now,
+  };
+  const lenses = await getLenses();
+  lenses.push(lens);
+  await saveLenses(lenses);
+  return { ok: true, lens };
+}
+
+async function handleLensUpdate(msg) {
+  if (!msg || typeof msg.lensId !== "string" || !isRecord(msg.patch)) {
+    return { ok: false, error: "invalid_lens" };
+  }
+  const lenses = await getLenses();
+  const index = lenses.findIndex((lens) => lens.id === msg.lensId);
+  if (index === -1) {
+    return { ok: false, error: "missing_lens" };
+  }
+  const patch = msg.patch;
+  const updated = { ...lenses[index] };
+  if (typeof patch.name === "string" && patch.name.trim()) updated.name = patch.name.trim();
+  if (typeof patch.icon === "string" && patch.icon) updated.icon = patch.icon;
+  if (hasOwn(patch, "color")) updated.color = typeof patch.color === "string" ? patch.color : null;
+  if (hasOwn(patch, "groupSelectors")) updated.groupSelectors = normalizedSelectors(patch.groupSelectors);
+  if (isRecord(patch.triggers)) {
+    updated.triggers = {
+      appleFocusIds: Array.isArray(patch.triggers.appleFocusIds)
+        ? [...new Set(patch.triggers.appleFocusIds.filter((id) => typeof id === "string" && id !== ""))]
+        : updated.triggers.appleFocusIds,
+    };
+  }
+  updated.updatedAt = Date.now();
+  lenses[index] = updated;
+  await saveLenses(lenses);
+  return { ok: true };
+}
+
+async function handleLensDelete(msg) {
+  const lensId = msg && typeof msg.lensId === "string" ? msg.lensId : null;
+  if (lensId === null) {
+    return { ok: false, error: "invalid_lens" };
+  }
+  const lenses = await getLenses();
+  await saveLenses(lenses.filter((lens) => lens.id !== lensId));
+  const activeView = await getActiveView();
+  if (activeView.kind === "lens" && activeView.lensId === lensId) {
+    await setActiveView({ kind: "all" }, { trigger: "manual" });
+  }
+  return { ok: true };
+}
+
+async function handleLensLinkFocus(msg) {
+  const focusId = msg && typeof msg.focusId === "string" && msg.focusId !== "" ? msg.focusId : null;
+  if (focusId === null) {
+    return { ok: false, error: "invalid_focus" };
+  }
+  const lensId = msg && typeof msg.lensId === "string" && msg.lensId !== "" ? msg.lensId : null;
+  const lenses = await getLenses();
+  let changed = false;
+  // Exclusivity: a Focus mode links to exactly one lens. Strip it everywhere first.
+  for (const lens of lenses) {
+    const ids = Array.isArray(lens.triggers?.appleFocusIds) ? lens.triggers.appleFocusIds : [];
+    if (ids.includes(focusId)) {
+      lens.triggers = { appleFocusIds: ids.filter((id) => id !== focusId) };
+      lens.updatedAt = Date.now();
+      changed = true;
+    }
+  }
+  if (lensId !== null) {
+    const target = lenses.find((lens) => lens.id === lensId);
+    if (!target) {
+      return { ok: false, error: "missing_lens" };
+    }
+    const ids = Array.isArray(target.triggers?.appleFocusIds) ? target.triggers.appleFocusIds : [];
+    target.triggers = { appleFocusIds: [...new Set([...ids, focusId])] };
+    target.updatedAt = Date.now();
+    changed = true;
+  }
+  if (changed) {
+    await saveLenses(lenses);
+  }
+  return { ok: true };
+}
+
+async function handleLensReorder(msg) {
+  const orderedIds = msg && Array.isArray(msg.orderedIds)
+    ? msg.orderedIds.filter((id) => typeof id === "string")
+    : null;
+  if (orderedIds === null) {
+    return { ok: false, error: "invalid_order" };
+  }
+  const lenses = await getLenses();
+  const byId = new Map(lenses.map((lens) => [lens.id, lens]));
+  const reordered = [];
+  for (const id of orderedIds) {
+    const lens = byId.get(id);
+    if (lens) {
+      reordered.push(lens);
+      byId.delete(id);
+    }
+  }
+  for (const lens of lenses) {
+    if (byId.has(lens.id)) {
+      reordered.push(lens);
+    }
+  }
+  await saveLenses(reordered);
+  return { ok: true };
+}
+
 function start() {
-  ensureDefaultMappings()
+  setConnectionState("reconnecting").catch((error) => {
+    console.error("Connection state error:", error);
+  });
+  browser.storage.local.get("lastError")
+    .then((stored) => {
+      lastError = normalizeLastError(stored.lastError);
+      return refreshBadge();
+    })
     .catch((error) => {
-      console.error("Default focus mapping seed error:", error);
+      console.error("Last error init error:", error);
+    });
+  browser.storage.local.get(AI_AUTO_GROUP_KEY)
+    .then((stored) => { autoGroupEnabled = stored[AI_AUTO_GROUP_KEY] === true; })
+    .catch((error) => console.error("Auto-group init error:", error));
+  migrateToLensesV2()
+    .catch((error) => {
+      console.error("Lens migration error:", error);
     })
     .finally(() => {
       connect();
@@ -304,13 +709,26 @@ function start() {
 // since this is a persistent background page.
 
 browser.runtime.onMessage.addListener((message) => {
-  if (message && message.type === "apply-current-focus") {
-    return enqueueFocusWork(() =>
-      browser.storage.local.get("lastFocusSeen").then((stored) => {
-        const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
-        return applyRawFocus(rawId, { force: true });
-      })
-    );
+  if (message && message.type === "lens-state") {
+    return handleLensState(message.windowId);
+  }
+  if (message && message.type === "lens-activate") {
+    return enqueueFocusWork(() => handleLensActivate(message.windowId, message.view));
+  }
+  if (message && message.type === "lens-save") {
+    return enqueueFocusWork(() => handleLensSave(message));
+  }
+  if (message && message.type === "lens-update") {
+    return enqueueFocusWork(() => handleLensUpdate(message));
+  }
+  if (message && message.type === "lens-delete") {
+    return enqueueFocusWork(() => handleLensDelete(message));
+  }
+  if (message && message.type === "lens-link-focus") {
+    return enqueueFocusWork(() => handleLensLinkFocus(message));
+  }
+  if (message && message.type === "lens-reorder") {
+    return enqueueFocusWork(() => handleLensReorder(message));
   }
   if (message && message.type === "ai-group-state") {
     return handleGroupState(message.windowId);
@@ -319,7 +737,7 @@ browser.runtime.onMessage.addListener((message) => {
     return handleGroupPreview(message.windowId);
   }
   if (message && message.type === "ai-group-apply") {
-    return handleGroupApply(message.windowId, message.groups);
+    return enqueueFocusWork(() => handleGroupApply(message.windowId, message.groups));
   }
   if (message && message.type === "ai-group-clear") {
     return Promise.resolve(handleGroupClear(message.windowId));
@@ -363,6 +781,26 @@ browser.runtime.onMessage.addListener((message) => {
 if (browser.windows && browser.windows.onRemoved) {
   browser.windows.onRemoved.addListener((windowId) => {
     lastProposalByWindow.delete(windowId);
+    transientViewsByWindow.delete(windowId);
+    const timer = autoGroupDebounceTimers.get(windowId);
+    if (timer) { clearTimeout(timer); autoGroupDebounceTimers.delete(windowId); }
+    autoGroupCooldown.delete(windowId);
+    autoGroupInflight.delete(windowId);
+  });
+}
+
+if (browser.tabs && browser.tabs.onCreated && browser.tabs.onCreated.addListener) {
+  browser.tabs.onCreated.addListener((tab) => {
+    if (tab && typeof tab.windowId === "number") {
+      scheduleAutoGroup(tab.windowId);
+    }
+  });
+}
+if (browser.tabs && browser.tabs.onUpdated && browser.tabs.onUpdated.addListener) {
+  browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo && changeInfo.status === "complete" && tab && typeof tab.windowId === "number") {
+      scheduleAutoGroup(tab.windowId);
+    }
   });
 }
 
@@ -383,37 +821,88 @@ if (browser.notifications.onButtonClicked) {
 }
 
 browser.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "local" || !changes.focusMappings) {
+  if (areaName !== "local") {
     return;
   }
 
-  enqueueFocusWork(() =>
-    browser.storage.local.get("lastFocusSeen").then((stored) => {
-      const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
-      lastDispatchedRawId = undefined;
-      if (rawId !== null) {
-        return applyRawFocus(rawId, { force: true });
-      }
-      return undefined;
-    })
-  ).catch((error) => {
-    console.error("Focus mapping refresh error:", error);
-  });
+  if (changes.lastError) {
+    lastError = normalizeLastError(changes.lastError.newValue);
+    refreshBadge().catch((error) => {
+      console.error("Badge error:", error);
+    });
+  }
+
+  if (changes.aiAutoGroup) {
+    autoGroupEnabled = changes.aiAutoGroup.newValue === true;
+    if (autoGroupEnabled) {
+      browser.tabs.query({})
+        .then((tabs) => {
+          const windowIds = new Set(tabs.map((tab) => tab.windowId).filter((id) => typeof id === "number"));
+          for (const id of windowIds) { scheduleAutoGroup(id); }
+        })
+        .catch((error) => console.error("Auto-group enable error:", error));
+    }
+  }
 });
 
 // ── Tab group logic ────────────────────────────────────────
 
-async function updateBadge(text, color) {
+function normalizeLastError(value) {
+  return isRecord(value) && typeof value.message === "string" ? value : null;
+}
+
+async function refreshBadge() {
   try {
-    if (browser.browserAction) {
-      await browser.browserAction.setBadgeText({ text });
-      if (color) {
-        await browser.browserAction.setBadgeBackgroundColor({ color });
-      }
+    if (!browser.browserAction) {
+      return;
     }
+    if (lastError) {
+      await browser.browserAction.setBadgeText({ text: "!" });
+      await browser.browserAction.setBadgeBackgroundColor({ color: "#B71C1C" });
+      await browser.browserAction.setTitle({ title: `Tab Lens — ${lastError.message}` });
+      return;
+    }
+    const badge = focusBadge || {};
+    const text = typeof badge.text === "string" ? badge.text : "";
+    await browser.browserAction.setBadgeText({ text });
+    if (badge.color) {
+      await browser.browserAction.setBadgeBackgroundColor({ color: badge.color });
+    }
+    await browser.browserAction.setTitle({ title: badge.title || "Tab Lens" });
   } catch (error) {
     console.error("Badge error:", error);
   }
+}
+
+async function setFocusBadge(badge) {
+  focusBadge = {
+    text: typeof badge.text === "string" ? badge.text : "",
+    color: badge.color || null,
+    title: badge.title || "Tab Lens",
+  };
+  await refreshBadge();
+}
+
+async function setConnectionState(state) {
+  await browser.storage.local.set({ connectionState: state });
+  await refreshBadge();
+}
+
+async function setLastError(code, message) {
+  lastError = {
+    code: typeof code === "string" ? code : "ai_failed",
+    message: typeof message === "string" ? message : "AI operation failed.",
+    at: Date.now(),
+    source: "ai",
+  };
+  await browser.storage.local.set({ lastError });
+  await refreshBadge();
+}
+
+async function clearLastError() {
+  lastError = null;
+  await browser.storage.local.set({ lastError: null });
+  await refreshBadge();
 }
 
 async function notify(options, notificationId) {
@@ -531,59 +1020,75 @@ async function activateMatchingGroups(groups) {
   return { activated, failures };
 }
 
-async function applyFocus(titles, { rawId }) {
-  const allGroups = await browser.tabGroups.query({});
+async function resolveActivation(view, windowId) {
+  if (isRecord(view) && view.kind === "all") {
+    return { ok: true, view: { kind: "all" }, name: "All groups", selectors: null, badgeText: "", badgeColor: null };
+  }
+  if (isRecord(view) && view.kind === "lens" && typeof view.lensId === "string") {
+    const lens = (await getLenses()).find((candidate) => candidate.id === view.lensId);
+    if (!lens) {
+      return { ok: false, error: "missing_lens" };
+    }
+    return {
+      ok: true,
+      view: { kind: "lens", lensId: lens.id },
+      name: lens.name,
+      selectors: lens.groupSelectors,
+      badgeText: lens.name.substring(0, 1).toUpperCase(),
+      badgeColor: lens.color || "#00C853",
+    };
+  }
+  if (isRecord(view) && view.kind === "transient") {
+    return {
+      ok: true,
+      view: {
+        kind: "transient",
+        label: typeof view.label === "string" && view.label ? view.label : "Temporary view",
+        selectors: normalizedSelectors(view.selectors),
+        windowId,
+      },
+      name: typeof view.label === "string" && view.label ? view.label : "Temporary view",
+      selectors: normalizedSelectors(view.selectors),
+      badgeText: "",
+      badgeColor: null,
+    };
+  }
+  return { ok: false, error: "invalid_view" };
+}
+
+async function rememberActivatedView(resolvedView, activation) {
+  if (resolvedView.kind === "transient") {
+    if (typeof resolvedView.windowId === "number") {
+      transientViewsByWindow.set(resolvedView.windowId, resolvedView);
+    }
+    return;
+  }
+  transientViewsByWindow.clear();
+  await setActiveView(resolvedView, activation);
+}
+
+async function activateView(view, activation = {}) {
+  const resolved = await resolveActivation(view, activation.windowId);
+  if (!resolved.ok) {
+    return false;
+  }
+  const query = resolved.view.kind === "transient" && typeof activation.windowId === "number"
+    ? { windowId: activation.windowId }
+    : {};
+  const allGroups = await browser.tabGroups.query(query);
   await browser.storage.local.set({
     groupTitles: allGroups.map((group) => group.title),
   });
-  const focusName = rawId !== null ? await focusDisplayName(rawId) : null;
 
-  const groupList = truncateList(
-    allGroups.map((group) => `${group.title} (${group.collapsed ? "collapsed" : "expanded"})`),
-    "\n",
-  );
-
-  if (titles === null && rawId === null) {
-    await updateBadge("", null);
+  if (resolved.view.kind === "all") {
     const updateFailures = await setGroupsCollapsed(allGroups, false);
+    await setFocusBadge({ text: "", color: null, title: "Tab Lens" });
     await browser.storage.local.set({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: updateFailures.length === 0 ? "expanded_all" : "expanded_all_with_errors",
       updateFailures,
     });
-    await notify({
-      type: "basic",
-      title: "Focus Tab Groups",
-      message: `Focus off — ${
-        updateFailures.length === 0 ? `expanded all ${allGroups.length} groups` : "some groups could not be expanded"
-      }${groupList ? `:\n${groupList}` : ""}${updateFailures.length === 0 ? "" : `\nFailed: ${truncateList(updateFailures)}`}`,
-    });
-    return updateFailures.length === 0;
-  }
-
-  if (titles === null && rawId !== null) {
-    await updateBadge("?", "#D50000"); // Red for unmapped
-    const notificationId = `${OPTIONS_NOTIFICATION_PREFIX}${rawId}`;
-    await browser.storage.local.set({
-      ...CLEAR_ACTION_DIAGNOSTICS,
-      lastAction: "unmapped_focus_id",
-      unmappedFocusId: rawId,
-    });
-    await notify({
-      type: "basic",
-      title: "Focus Tab Groups",
-      message: `Unmapped Focus mode ${focusName} — click this notification to open Focus Tab Groups options and assign it`,
-    }, notificationId);
-    return true;
-  }
-
-  // Mapped but no titles → seen and intentionally ignored.
-  if (titles.length === 0) {
-    await updateBadge("", null);
-    await browser.storage.local.set({
-      ...CLEAR_ACTION_DIAGNOSTICS,
-      lastAction: "ignored",
-    });
+    await rememberActivatedView(resolved.view, activation);
     return true;
   }
 
@@ -592,66 +1097,45 @@ async function applyFocus(titles, { rawId }) {
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "no_groups",
     });
-    await notify({
-      type: "basic",
-      title: "Focus Tab Groups",
-      message: "No tab groups found in Firefox",
-    });
+    await rememberActivatedView(resolved.view, activation);
     return true;
   }
 
-  const matches = buildTitleMatcher(titles);
+  const matches = selectorMatcher(resolved.selectors);
   const matching = allGroups.filter((group) => matches(group.title));
   const others = allGroups.filter((group) => !matches(group.title));
-  const titlesText = titles.join(", ");
+  const selectorText = normalizedSelectors(resolved.selectors).map((selector) => selector.value).join(", ");
 
   if (matching.length === 0) {
-    await updateBadge("!", "#FF9800"); // Orange for missing group
+    await setFocusBadge({ text: "!", color: "#FF9800", title: `Tab Lens: ${resolved.name}` });
     const updateFailures = await setGroupsCollapsed(allGroups, false);
     await browser.storage.local.set({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "no_matching_group",
-      missingGroup: titlesText,
+      missingGroup: selectorText,
       updateFailures,
     });
-    await notify({
-      type: "basic",
-      title: "Focus Tab Groups",
-      message: `No group called ${titles.map((title) => `"${title}"`).join(" or ")} found.\n\nYour groups:\n${groupList}`,
-    });
-    return updateFailures.length === 0;
+    await rememberActivatedView(resolved.view, activation);
+    return true;
   }
 
-  // Activate a tab inside every target group before collapsing other groups.
-  // Firefox rejects collapsing a group that contains its window's active tab;
-  // activating matching groups first prevents one window from aborting the batch.
-  const activation = await activateMatchingGroups(matching);
-
-  if (activation.failures.length > 0) {
+  const handoff = await activateMatchingGroups(matching);
+  if (handoff.failures.length > 0) {
     await browser.storage.local.set({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "activation_failed",
-      updateFailures: activation.failures,
-    });
-    await notify({
-      type: "basic",
-      title: "Focus Tab Groups",
-      message: `Could not activate every target tab group — not changing groups\nFailed: ${truncateList(activation.failures)}`,
+      updateFailures: handoff.failures,
     });
     return false;
   }
 
-  if (!activation.activated) {
+  if (!handoff.activated) {
     await browser.storage.local.set({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "matching_group_empty",
-      emptyGroup: titlesText,
+      emptyGroup: selectorText,
     });
-    await notify({
-      type: "basic",
-      title: "Focus Tab Groups",
-      message: `${titles.map((title) => `"${title}"`).join(", ")} ${matching.length === 1 ? "group is" : "groups are"} empty — not changing anything`,
-    });
+    await rememberActivatedView(resolved.view, activation);
     return true;
   }
 
@@ -660,31 +1144,20 @@ async function applyFocus(titles, { rawId }) {
     setGroupsCollapsed(others, true),
   ]);
   const updateFailures = expandFailures.concat(collapseFailures);
-  const lastAction = updateFailures.length === 0 ? "applied" : "applied_with_errors";
-
-  await updateBadge(
-    updateFailures.length === 0 ? focusName.substring(0, 1).toUpperCase() : "!",
-    updateFailures.length === 0 ? "#00C853" : "#FF9800",
-  );
-
-  const expanded = truncateList(matching.map((group) => group.title));
-  const collapsed = truncateList(others.map((group) => group.title)) || "(none)";
-  const failureText = updateFailures.length === 0 ? "" : `\nFailed: ${truncateList(updateFailures)}`;
-
+  await setFocusBadge({
+    text: updateFailures.length === 0 ? resolved.badgeText : "!",
+    color: updateFailures.length === 0 ? resolved.badgeColor : "#FF9800",
+    title: `Tab Lens: ${resolved.name}`,
+  });
   await browser.storage.local.set({
     ...CLEAR_ACTION_DIAGNOSTICS,
-    lastAction,
+    lastAction: updateFailures.length === 0 ? "applied" : "applied_with_errors",
     expandedGroups: matching.map((group) => group.title),
     collapsedGroups: others.map((group) => group.title),
     updateFailures,
   });
-
-  await notify({
-    type: "basic",
-    title: `Focus: ${focusName}`,
-    message: `Expanded: ${expanded}\nCollapsed: ${collapsed}${failureText}`,
-  });
-  return updateFailures.length === 0;
+  await rememberActivatedView(resolved.view, activation);
+  return true;
 }
 
 // ── AI tab grouping ────────────────────────────────────────
@@ -1101,35 +1574,51 @@ async function aiPinToFocusEnabled() {
   return stored[AI_PIN_TO_FOCUS_KEY] === true;
 }
 
-async function activeFocusName() {
-  const stored = await browser.storage.local.get("lastFocusSeen");
-  const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
-  return rawId === null ? null : await focusDisplayName(rawId);
+async function aiAutoGroupEnabled() {
+  const stored = await browser.storage.local.get(AI_AUTO_GROUP_KEY);
+  return stored[AI_AUTO_GROUP_KEY] === true;
 }
 
-// When the user opts in, append freshly applied AI topics to the active Focus's
-// mapping so the new groups aren't collapsed on the next Focus change.
+async function activeFocusName() {
+  const activeView = await getActiveView();
+  if (activeView.kind !== "lens") {
+    return null;
+  }
+  const lens = (await getLenses()).find((candidate) => candidate.id === activeView.lensId);
+  return lens ? lens.name : null;
+}
+
 async function pinTopicsToActiveFocus(topics) {
   if (topics.length === 0 || !(await aiPinToFocusEnabled())) {
     return;
   }
-  const stored = await browser.storage.local.get(["lastFocusSeen", "focusMappings"]);
-  const rawId = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
-  if (rawId === null) {
+  const activeView = await getActiveView();
+  if (activeView.kind !== "lens") {
     return;
   }
-  const mappings = isRecord(stored.focusMappings) ? { ...stored.focusMappings } : {};
-  const titles = Array.isArray(mappings[rawId]) ? mappings[rawId].slice() : [];
+  const lenses = await getLenses();
+  const index = lenses.findIndex((lens) => lens.id === activeView.lensId);
+  if (index === -1) {
+    return;
+  }
+  const selectors = normalizedSelectors(lenses[index].groupSelectors);
+  const seen = new Set(selectors.map((selector) => `${selector.type}\u0000${selector.value}`));
   let changed = false;
   for (const topic of topics) {
-    if (!titles.includes(topic)) {
-      titles.push(topic);
+    if (typeof topic !== "string" || topic.trim() === "") {
+      continue;
+    }
+    const value = topic.trim();
+    const key = `title\u0000${value}`;
+    if (!seen.has(key)) {
+      selectors.push({ type: "title", value });
+      seen.add(key);
       changed = true;
     }
   }
   if (changed) {
-    mappings[rawId] = titles;
-    await browser.storage.local.set({ focusMappings: mappings });
+    lenses[index] = { ...lenses[index], groupSelectors: selectors, updatedAt: Date.now() };
+    await saveLenses(lenses);
   }
 }
 
@@ -1146,12 +1635,13 @@ function cachedProposal(windowId) {
 }
 
 async function handleGroupState(windowId) {
-  const [enabled, candidates, provider, pinToFocus, activeFocus] = await Promise.all([
+  const [enabled, candidates, provider, pinToFocus, activeFocus, autoGroup] = await Promise.all([
     aiGroupingEnabled(),
     collectGroupableTabs(windowId),
     getProvider(),
     aiPinToFocusEnabled(),
     activeFocusName(),
+    aiAutoGroupEnabled(),
   ]);
   return {
     enabled,
@@ -1160,6 +1650,7 @@ async function handleGroupState(windowId) {
     providerKind: provider.kind,
     pinToFocus,
     activeFocus,
+    autoGroup,
   };
 }
 
@@ -1184,8 +1675,13 @@ async function handleGroupPreview(windowId) {
   }
   const work = (async () => {
     const result = await computeTabGrouping(windowId);
-    if (result.ok && typeof windowId === "number") {
-      lastProposalByWindow.set(windowId, { groups: result.groups, ts: Date.now() });
+    if (result.ok) {
+      await clearLastError();
+      if (typeof windowId === "number") {
+        lastProposalByWindow.set(windowId, { groups: result.groups, ts: Date.now() });
+      }
+    } else {
+      await setLastError(result.error, result.message);
     }
     return result;
   })();
@@ -1197,10 +1693,7 @@ async function handleGroupPreview(windowId) {
   }
 }
 
-async function handleGroupApply(windowId, groups) {
-  if (!(await aiGroupingEnabled())) {
-    return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
-  }
+async function commitTabGroups(windowId, groups, { notify: doNotify = true, surfaceEmptyError = true, surfaceStatus = true, pinToActiveLens = true } = {}) {
   // Re-validate against live tab state: between preview and apply a tab may have
   // been closed, pinned, manually grouped, or navigated off http(s). Only group
   // ids that are still groupable right now.
@@ -1214,26 +1707,101 @@ async function handleGroupApply(windowId, groups) {
     }))
     .filter((group) => group.tabs.length > 0);
   if (normalized.length === 0) {
-    return { ok: false, error: "no_groups", message: "Those tabs are no longer available to group." };
+    const result = { ok: false, error: "no_groups", message: "Those tabs are no longer available to group." };
+    // In silent auto mode an empty re-validation usually means the tabs were
+    // already grouped (the desired end state) — not a user-facing failure.
+    if (surfaceEmptyError && surfaceStatus) {
+      await setLastError(result.error, result.message);
+    }
+    return result;
   }
 
   const outcome = await applyTabGrouping(normalized, windowId);
   const ok = outcome.failures.length === 0;
   if (ok) {
-    await pinTopicsToActiveFocus(outcome.applied);
+    if (pinToActiveLens) await pinTopicsToActiveFocus(outcome.applied);
     if (typeof windowId === "number") {
       lastProposalByWindow.delete(windowId);
     }
   }
-  await updateBadge(ok ? "AI" : "!", ok ? "#00C853" : "#FF9800");
-  await notify({
-    type: "basic",
-    title: "AI Tab Groups",
-    message: ok
-      ? `Created ${outcome.applied.length} group(s): ${outcome.applied.join(", ")}`
-      : `Created ${outcome.applied.length}; failed: ${outcome.failures.join(", ")}`,
-  });
-  return { ok, applied: outcome.applied, failures: outcome.failures };
+  const message = ok
+    ? `Created ${outcome.applied.length} group(s): ${outcome.applied.join(", ")}`
+    : `Created ${outcome.applied.length}; failed: ${outcome.failures.join(", ")}`;
+  const result = ok
+    ? { ok, applied: outcome.applied, failures: outcome.failures }
+    : { ok, error: "apply_failed", message, applied: outcome.applied, failures: outcome.failures };
+  if (surfaceStatus) {
+    if (ok) {
+      await clearLastError();
+    } else {
+      await setLastError(result.error, result.message);
+    }
+    await setFocusBadge({ text: ok ? "AI" : "!", color: ok ? "#00C853" : "#FF9800", title: "AI Tab Groups" });
+  }
+  if (doNotify) {
+    await notify({ type: "basic", title: "AI Tab Groups", message });
+  }
+  return result;
+}
+
+async function handleGroupApply(windowId, groups) {
+  if (!(await aiGroupingEnabled())) {
+    return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
+  }
+  return commitTabGroups(windowId, groups, { notify: true });
+}
+
+function scheduleAutoGroup(windowId) {
+  if (typeof windowId !== "number" || !autoGroupEnabled) {
+    return;
+  }
+  const existing = autoGroupDebounceTimers.get(windowId);
+  if (existing) {
+    clearTimeout(existing);
+  }
+  const id = setTimeout(() => {
+    autoGroupDebounceTimers.delete(windowId);
+    runAutoGroup(windowId).catch((error) => console.error("Auto-group error:", error));
+  }, AUTO_GROUP_DEBOUNCE_MS);
+  autoGroupDebounceTimers.set(windowId, id);
+}
+
+function startAutoGroupCooldown(windowId) {
+  autoGroupCooldown.add(windowId);
+  setTimeout(() => autoGroupCooldown.delete(windowId), AUTO_GROUP_COOLDOWN_MS);
+}
+
+async function runAutoGroup(windowId) {
+  if (typeof windowId !== "number" || !autoGroupEnabled) {
+    return;
+  }
+  // Skip if a run is already in progress, cooling down, or a manual popup
+  // preview is computing for this window — all three would otherwise let two
+  // clustering passes race over the same tabs.
+  if (autoGroupCooldown.has(windowId) || autoGroupInflight.has(windowId) || inflightPreviews.has(windowId)) {
+    return;
+  }
+  autoGroupInflight.add(windowId);
+  try {
+    if (!(await aiGroupingEnabled())) {
+      return;
+    }
+    const candidates = await collectGroupableTabs(windowId);
+    if (candidates.length < 2) {
+      return;
+    }
+    startAutoGroupCooldown(windowId);
+    const result = await computeTabGrouping(windowId, candidates);
+    if (!result.ok) {
+      console.warn("Auto-group skipped:", result.error, result.message);
+      return;
+    }
+    // surfaceEmptyError: false — if the tabs were grouped out from under us
+    // mid-compute, that's the desired end state, not a red-badge failure.
+    await commitTabGroups(windowId, result.groups, { notify: false, surfaceEmptyError: false, surfaceStatus: false, pinToActiveLens: false });
+  } finally {
+    autoGroupInflight.delete(windowId);
+  }
 }
 
 // ── Tab search ─────────────────────────────────────────────
@@ -1438,8 +2006,10 @@ async function tabsearchAiPreview(windowId, tabIds) {
   }
   const result = await computeTabGrouping(windowId, candidates);
   if (!result.ok) {
+    await setLastError(result.error, result.message);
     return result;
   }
+  await clearLastError();
   return {
     ok: true,
     groups: result.groups.map((group) => ({

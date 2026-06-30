@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "name": "Focus Tab Groups",
+  "name": "Tab Lens",
   "version": "1.2.4",
-  "description": "Collapses and expands Firefox tab groups based on macOS Focus mode via mac-command-centre.",
+  "description": "Save and switch views of your Firefox tab groups. Collapse the groups you don't need; tabs stay open. Optional macOS Focus automation.",
   "browser_specific_settings": {
     "gecko": {
       "id": "focus-tab-groups@local",
@@ -55,7 +55,7 @@
     "128": "icons/icon-128.png"
   },
   "browser_action": {
-    "default_title": "Focus Tab Groups",
+    "default_title": "Tab Lens",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon-16.png",

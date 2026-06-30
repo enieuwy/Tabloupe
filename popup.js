@@ -10,7 +10,13 @@ const TAB_GROUP_COLOR_HEX = {
 };
 
 let windowId = null;
+let lensState = null;
 let proposal = null;
+let aiInitialized = false;
+let connectionStatus = {
+  connectionState: "reconnecting",
+  lastError: null,
+};
 
 const el = (id) => document.getElementById(id);
 
@@ -18,6 +24,53 @@ function setStatus(message, kind = "") {
   const status = el("ai-status");
   status.textContent = message;
   status.className = `status${kind ? ` ${kind}` : ""}`;
+}
+
+function setLensStatus(message, kind = "") {
+  const status = el("lens-status");
+  status.textContent = message;
+  status.className = `status${kind ? ` ${kind}` : ""}`;
+}
+
+function renderConnectionStatus(state = connectionStatus) {
+  const connection = el("popup-connection");
+  const lastError = state.lastError;
+  if (state.connectionState !== "connected") {
+    connection.textContent = "⚠ Not connected to mac-command-centre";
+    connection.className = "conn conn-warn";
+    return;
+  }
+  if (lastError && lastError.message) {
+    connection.textContent = lastError.message;
+    connection.className = "conn conn-warn";
+    return;
+  }
+  connection.textContent = "";
+  connection.className = "conn";
+}
+
+async function initConnectionStatus() {
+  const stored = await browser.storage.local.get(["connectionState", "lastError"]);
+  connectionStatus = {
+    connectionState: stored.connectionState,
+    lastError: stored.lastError || null,
+  };
+  renderConnectionStatus();
+  if (connectionStatus.lastError) {
+    await browser.storage.local.set({ lastError: null });
+    connectionStatus.lastError = null;
+  }
+}
+
+function handleStorageChange(changes, areaName) {
+  if (areaName !== "local" || !changes.connectionState) {
+    return;
+  }
+  connectionStatus = {
+    ...connectionStatus,
+    connectionState: changes.connectionState.newValue,
+  };
+  renderConnectionStatus();
 }
 
 function showButtons({ apply = false, regroup = false, dismiss = false, organize = false }) {
@@ -96,15 +149,252 @@ function renderPin(state) {
   box.checked = state.pinToFocus === true;
   if (state.activeFocus) {
     box.disabled = false;
-    label.textContent = `Pin new groups to Focus: ${state.activeFocus}`;
+    label.textContent = `Add new groups to current lens: ${state.activeFocus}`;
   } else {
     box.disabled = true;
-    label.textContent = "Pin new groups to active Focus (none active)";
+    label.textContent = "Add new groups to current lens (none active)";
   }
+}
+
+function renderAuto(state, checked) {
+  const row = el("ai-auto-row");
+  const box = el("ai-auto");
+  if (!row || !box) return;
+  if (state.enabled !== true) {
+    row.hidden = true;
+    return;
+  }
+  row.hidden = false;
+  box.checked = checked === true;
 }
 
 async function send(message) {
   return browser.runtime.sendMessage({ ...message, windowId });
+}
+
+function getActiveLensName(state) {
+  const activeView = state && state.activeView;
+  if (!activeView || activeView.kind === "all") {
+    return "All groups";
+  }
+  if (activeView.kind === "transient") {
+    return activeView.label || "This group";
+  }
+  const lens = (state.lenses || []).find((item) => item.id === activeView.lensId);
+  return lens ? lens.name : "Selected lens";
+}
+
+function renderTriggerLine(state) {
+  const trigger = el("lens-trigger");
+  const lastActivation = state.lastActivation || {};
+  if (!state.hasAppleBinding) {
+    trigger.hidden = true;
+    trigger.textContent = "";
+    return;
+  }
+  if (lastActivation.trigger === "manual") {
+    trigger.textContent = "Manual override";
+    trigger.hidden = false;
+    return;
+  }
+  if (lastActivation.trigger && lastActivation.trigger !== "manual") {
+    trigger.textContent = "Switched by Apple Focus";
+    trigger.hidden = false;
+    return;
+  }
+  trigger.hidden = true;
+  trigger.textContent = "";
+}
+
+function makeColorDot(color) {
+  const dot = document.createElement("span");
+  dot.className = "color-dot";
+  const hex = TAB_GROUP_COLOR_HEX[color];
+  if (hex) {
+    dot.style.backgroundColor = hex;
+  }
+  return dot;
+}
+
+function renderLensChips(state) {
+  const container = el("lens-chips");
+  container.textContent = "";
+  const lenses = state.lenses || [];
+  if (lenses.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "No saved lenses yet.";
+    container.appendChild(empty);
+    return;
+  }
+
+  for (const lens of lenses) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "lens-chip";
+    if (lens.active || (state.activeView && state.activeView.kind === "lens" && state.activeView.lensId === lens.id)) {
+      chip.classList.add("active");
+      chip.setAttribute("aria-pressed", "true");
+    } else {
+      chip.setAttribute("aria-pressed", "false");
+    }
+    if (lens.color) {
+      chip.appendChild(makeColorDot(lens.color));
+    }
+    const name = document.createElement("span");
+    name.textContent = lens.name;
+    chip.appendChild(name);
+    chip.addEventListener("click", () => activateView({ kind: "lens", lensId: lens.id }));
+    container.appendChild(chip);
+  }
+}
+
+function renderCurrentGroups(state) {
+  const section = el("groups-section");
+  const container = el("current-groups");
+  const saveWindow = el("lens-save-window");
+  const groups = state.currentGroups || [];
+  container.textContent = "";
+  saveWindow.disabled = groups.length === 0;
+  section.hidden = groups.length === 0;
+
+  for (const group of groups) {
+    const row = document.createElement("article");
+    row.className = "window-group";
+
+    const details = document.createElement("div");
+    details.className = "window-group-details";
+    const title = document.createElement("div");
+    title.className = "group-title";
+    title.appendChild(makeColorDot(group.color));
+    const titleText = document.createElement("strong");
+    titleText.textContent = group.title;
+    title.appendChild(titleText);
+    details.appendChild(title);
+
+    const saved = document.createElement("p");
+    saved.className = "group-saved";
+    const savedIn = Array.isArray(group.savedIn) ? group.savedIn : [];
+    saved.textContent = savedIn.length > 0 ? `Saved in: ${savedIn.join(", ")}` : "Not saved";
+    details.appendChild(saved);
+    row.appendChild(details);
+
+    const actions = document.createElement("div");
+    actions.className = "row-actions";
+    const show = document.createElement("button");
+    show.type = "button";
+    show.className = "secondary compact";
+    show.textContent = "Show just this";
+    show.addEventListener("click", () => activateView({
+      kind: "transient",
+      label: group.title,
+      selectors: [{ type: "title", value: group.title }],
+    }));
+    actions.appendChild(show);
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "secondary compact";
+    save.textContent = "Save as lens";
+    save.addEventListener("click", () => saveGroupAsLens(group.title));
+    actions.appendChild(save);
+    row.appendChild(actions);
+    container.appendChild(row);
+  }
+}
+
+function renderLensState(state) {
+  lensState = {
+    activeView: { kind: "all" },
+    lastActivation: null,
+    lenses: [],
+    currentGroups: [],
+    hasGroups: false,
+    hasAppleBinding: false,
+    aiEnabled: false,
+    ...state,
+  };
+  el("lens-showing").textContent = `Showing: ${getActiveLensName(lensState)}`;
+  renderTriggerLine(lensState);
+  renderLensChips(lensState);
+  renderCurrentGroups(lensState);
+  const empty = !lensState.hasGroups && (lensState.lenses || []).length === 0;
+  el("empty-state").hidden = !empty;
+  setLensStatus("");
+}
+
+async function refreshLensState() {
+  try {
+    const state = await send({ type: "lens-state" });
+    renderLensState(state || {});
+  } catch (error) {
+    console.error("Lens state failed:", error);
+    setLensStatus("Could not load Tab Lens state.", "error");
+  }
+}
+
+async function activateView(view) {
+  setLensStatus("");
+  try {
+    const result = await send({ type: "lens-activate", view });
+    if (!result || result.ok !== true) {
+      setLensStatus((result && result.message) || "Could not switch lens.", "error");
+      return;
+    }
+    await refreshLensState();
+  } catch (error) {
+    console.error("Lens activation failed:", error);
+    setLensStatus("Could not switch lens.", "error");
+  }
+}
+
+async function saveGroupAsLens(title) {
+  try {
+    const result = await send({
+      type: "lens-save",
+      source: "group",
+      groupTitle: title,
+      name: title,
+    });
+    if (!result || result.ok !== true) {
+      setLensStatus((result && result.message) || "Could not save lens.", "error");
+      return;
+    }
+    await refreshLensState();
+  } catch (error) {
+    console.error("Lens save failed:", error);
+    setLensStatus("Could not save lens.", "error");
+  }
+}
+
+function promptLensName(defaultName) {
+  if (typeof window.prompt !== "function") {
+    return defaultName;
+  }
+  const name = window.prompt("Name this lens", defaultName);
+  return name && name.trim();
+}
+
+async function saveWindowAsLens() {
+  const name = promptLensName("Current groups");
+  if (!name) {
+    return;
+  }
+  try {
+    const result = await send({
+      type: "lens-save",
+      source: "window",
+      name,
+    });
+    if (!result || result.ok !== true) {
+      setLensStatus((result && result.message) || "Could not save lens.", "error");
+      return;
+    }
+    await refreshLensState();
+  } catch (error) {
+    console.error("Window lens save failed:", error);
+    setLensStatus("Could not save lens.", "error");
+  }
 }
 
 async function runPreview() {
@@ -172,10 +462,10 @@ async function dismiss() {
   } catch (error) {
     console.error("AI dismiss failed:", error);
   }
-  await refresh({ autoPreview: false });
+  await refreshAi({ autoPreview: false });
 }
 
-async function refresh({ autoPreview = true } = {}) {
+async function refreshAi({ autoPreview = false } = {}) {
   let state;
   try {
     state = await send({ type: "ai-group-state" });
@@ -184,9 +474,12 @@ async function refresh({ autoPreview = true } = {}) {
     setStatus("Could not reach the background service.", "error");
     return;
   }
+  state = state || {};
 
   el("ai-enabled").checked = state.enabled === true;
   renderPin(state);
+  const autoStored = await browser.storage.local.get("aiAutoGroup");
+  renderAuto(state, autoStored.aiAutoGroup === true);
 
   if (state.enabled !== true) {
     renderDisabled();
@@ -205,7 +498,52 @@ async function refresh({ autoPreview = true } = {}) {
     return;
   }
 
-  renderIdle(state.groupableCount);
+  renderIdle(state.groupableCount || 0);
+}
+
+async function openAiSubview() {
+  el("lens-view").hidden = true;
+  el("ai-view").hidden = false;
+  await ensureAiInitialized();
+  await refreshAi({ autoPreview: false });
+}
+
+async function closeAiSubview() {
+  el("ai-view").hidden = true;
+  el("lens-view").hidden = false;
+  await refreshLensState();
+}
+
+async function ensureAiInitialized() {
+  if (aiInitialized) {
+    return;
+  }
+  aiInitialized = true;
+  await initConnectionStatus();
+  if (browser.storage.onChanged && browser.storage.onChanged.addListener) {
+    browser.storage.onChanged.addListener(handleStorageChange);
+  }
+
+  el("ai-enabled").addEventListener("change", async (event) => {
+    await browser.storage.local.set({ aiGroupingEnabled: event.target.checked });
+    await refreshAi({ autoPreview: false });
+  });
+  el("ai-pin").addEventListener("change", async (event) => {
+    await browser.storage.local.set({ aiPinToFocus: event.target.checked });
+  });
+  el("ai-auto").addEventListener("change", async (event) => {
+    await browser.storage.local.set({ aiAutoGroup: event.target.checked });
+  });
+  el("ai-organize").addEventListener("click", runPreview);
+  el("ai-regroup").addEventListener("click", runPreview);
+  el("ai-apply").addEventListener("click", applyGroups);
+  el("ai-dismiss").addEventListener("click", dismiss);
+  el("ai-back").addEventListener("click", closeAiSubview);
+  el("ai-options").addEventListener("click", (event) => {
+    event.preventDefault();
+    browser.runtime.openOptionsPage();
+    window.close();
+  });
 }
 
 async function init() {
@@ -213,27 +551,20 @@ async function init() {
     const current = await browser.windows.getCurrent();
     windowId = current.id;
   } catch (error) {
-    console.error("AI window resolve failed:", error);
+    console.error("Popup window resolve failed:", error);
   }
 
-  el("ai-enabled").addEventListener("change", async (event) => {
-    await browser.storage.local.set({ aiGroupingEnabled: event.target.checked });
-    await refresh();
-  });
-  el("ai-pin").addEventListener("change", async (event) => {
-    await browser.storage.local.set({ aiPinToFocus: event.target.checked });
-  });
-  el("ai-organize").addEventListener("click", runPreview);
-  el("ai-regroup").addEventListener("click", runPreview);
-  el("ai-apply").addEventListener("click", applyGroups);
-  el("ai-dismiss").addEventListener("click", dismiss);
-  el("ai-options").addEventListener("click", (event) => {
+  el("lens-show-all").addEventListener("click", () => activateView({ kind: "all" }));
+  el("lens-save-window").addEventListener("click", saveWindowAsLens);
+  el("open-ai").addEventListener("click", openAiSubview);
+  el("empty-organize").addEventListener("click", openAiSubview);
+  el("lens-options").addEventListener("click", (event) => {
     event.preventDefault();
     browser.runtime.openOptionsPage();
     window.close();
   });
 
-  await refresh();
+  await refreshLensState();
 }
 
 document.addEventListener("DOMContentLoaded", init);

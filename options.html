@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Focus Tab Groups Options</title>
+  <title>Tab Lens Options</title>
   <link rel="stylesheet" href="options.css">
   <script defer src="options.js"></script>
 </head>
@@ -11,53 +11,28 @@
   <main>
     <header class="page-header">
       <div>
-        <h1>Focus Tab Groups</h1>
-        <p>Map raw Apple Focus identifiers to the exact Firefox tab group titles you want expanded.</p>
+        <h1>Tab Lens</h1>
+        <p>Save views of your Firefox tab groups. Switching a lens expands matching groups and collapses the rest.</p>
       </div>
     </header>
 
-    <div id="unmapped-callout" class="callout callout-warning" hidden>
-      <strong>Unmapped Focus detected</strong>
-      <p>The Focus ID <code id="callout-focus-id"></code> has no tab group mapping. Add one below or click “Map it now” to pre-fill the form.</p>
-      <button id="callout-map-btn" type="button">Map it now</button>
-    </div>
 
-    <form id="mappings-form">
-      <section class="card">
-        <div class="section-heading section-heading-row">
-          <div>
-            <h2>Focus mappings</h2>
-            <p>Rows combine saved mappings and Focus IDs recently reported by mac-command-centre. Drag a group between rows to reassign it, or to <strong>Unassigned</strong> to remove it.</p>
-          </div>
-          <button id="reveal-add-focus" type="button" class="ghost add-focus-toggle">+ Add Focus ID</button>
+    <section class="card" id="lenses-card">
+      <div class="section-heading section-heading-row">
+        <div>
+          <h2>Lenses — each shows only the tab groups you choose.</h2>
         </div>
-
-        <div id="add-focus-row" class="add-focus-row" hidden>
-          <input id="new-focus-id" type="text" autocomplete="off" spellcheck="false" placeholder="Apple Focus ID you haven't toggled yet, e.g. com.apple.focus.work">
-          <button id="add-mapping" type="button">Add</button>
-          <button id="cancel-add-focus" type="button" class="secondary">Cancel</button>
+        <div class="lens-create-actions">
+          <button id="new-empty-lens" type="button">+ New lens</button>
+          <button id="save-window-lens" type="button" class="secondary">Save current window's groups as a lens</button>
         </div>
-
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th scope="col">Focus mode</th>
-                <th scope="col" aria-hidden="true"></th>
-                <th scope="col">Tab groups</th>
-                <th scope="col"><span class="visually-hidden">Actions</span></th>
-              </tr>
-            </thead>
-            <tbody id="mappings-body"></tbody>
-          </table>
-        </div>
-        <div class="actions">
-          <button id="save" type="submit">Save</button>
-          <button id="discard" type="button" class="secondary">Discard changes</button>
-          <span id="status" role="status" aria-live="polite"></span>
-        </div>
-      </section>
-    </form>
+      </div>
+      <div id="migration-summary" class="callout migration-summary" hidden></div>
+      <div id="lenses-list" class="lenses-list"></div>
+      <div class="actions">
+        <span id="status" role="status" aria-live="polite"></span>
+      </div>
+    </section>
 
     <section class="card">
       <div class="section-heading">
@@ -145,15 +120,28 @@
       <p class="shortcut-hint">The overlay can't run on privileged pages (<code>about:</code>, add-ons, PDF viewer). For a shortcut that works there too, assign one under <a href="about:addons">about:addons &rarr; Manage Extension Shortcuts</a>.</p>
     </section>
 
-    <section class="card diagnostics">
-      <div class="section-heading">
-        <h2>Diagnostics</h2>
+    <details class="card diagnostics diagnostics-details">
+      <summary class="diagnostics-summary">
+        <span class="diagnostics-summary-title">Diagnostics</span>
+      </summary>
+      <div class="section-heading diagnostics-body-heading">
         <p>Read-only state from the background script.</p>
-        <button id="apply-now" type="button" class="secondary">Apply current Focus now</button>
       </div>
       <dl>
         <div>
-          <dt>Last applied Focus ID</dt>
+          <dt>Connection</dt>
+          <dd id="diag-connection">—</dd>
+        </div>
+        <div>
+          <dt>Last error</dt>
+          <dd id="diag-last-error">—</dd>
+        </div>
+        <div>
+          <dt>Update failures</dt>
+          <dd id="diag-update-failures">—</dd>
+        </div>
+        <div>
+          <dt>Last trigger ID</dt>
           <dd><code id="diag-last-focus">—</code></dd>
         </div>
         <div>
@@ -173,8 +161,8 @@
           <dd id="diag-action-details">—</dd>
         </div>
       </dl>
-    </section>
-  <div id="toast-host" class="toast-host" aria-live="polite" aria-atomic="true"></div>
+    </details>
+    <div id="toast-host" class="toast-host" aria-live="polite" aria-atomic="true"></div>
   </main>
 </body>
 </html>
