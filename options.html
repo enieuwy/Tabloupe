@@ -120,6 +120,27 @@
       <p class="shortcut-hint">The overlay can't run on privileged pages (<code>about:</code>, add-ons, PDF viewer). For a shortcut that works there too, assign one under <a href="about:addons">about:addons &rarr; Manage Extension Shortcuts</a>.</p>
     </section>
 
+    <section class="card">
+      <div class="section-heading">
+        <h2>Backup and transfer</h2>
+        <p>Export lenses, schedules, shortcuts, and AI settings as JSON. API keys are excluded.</p>
+      </div>
+      <div class="provider-actions">
+        <button id="settings-export" type="button" class="secondary">Export settings</button>
+        <label class="secondary import-label" for="settings-import">Import settings</label>
+        <input id="settings-import" type="file" accept="application/json,.json" hidden>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-heading">
+        <h2>Activity</h2>
+        <p>Recent lens sessions recorded when Tab Lens switches views.</p>
+      </div>
+      <p id="activity-summary" class="summary">No sessions yet.</p>
+      <ul id="activity-list" class="activity-list"></ul>
+    </section>
+
     <details class="card diagnostics diagnostics-details">
       <summary class="diagnostics-summary">
         <span class="diagnostics-summary-title">Diagnostics</span>

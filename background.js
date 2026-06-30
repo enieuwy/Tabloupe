@@ -15,6 +15,9 @@ const AI_GROUPING_PROMPT_MAX = 4000;
 const AI_AUTO_GROUP_KEY = "aiAutoGroup";
 const AUTO_GROUP_DEBOUNCE_MS = 5000;
 const AUTO_GROUP_COOLDOWN_MS = 30000;
+const SCHEDULE_ALARM_NAME = "lens-schedule-tick";
+const FOCUS_SESSION_HISTORY_KEY = "focusSessionHistory";
+const MAX_FOCUS_SESSION_HISTORY = 1000;
 // Default system prompt. The user can replace it wholesale from Options (stored
 // in aiGroupingPrompt); an empty override falls back to this default.
 const GROUPING_SYSTEM_PROMPT =
@@ -62,6 +65,7 @@ const autoGroupCooldown = new Set();
 // clustering can outlive AUTO_GROUP_COOLDOWN_MS, letting a later run start and
 // then fail re-validation ("no_groups") on tabs the first run already grouped.
 const autoGroupInflight = new Set();
+const windowProfileOverrides = new Map();
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -222,9 +226,110 @@ async function setActiveView(view, lastActivation) {
   });
 }
 
+function viewKey(view) {
+  if (!isRecord(view)) return "all";
+  if (view.kind === "lens") return `lens:${view.lensId}`;
+  return view.kind || "all";
+}
+
+async function recordActivationSession(view, lastActivation) {
+  if (!isPersistedView(view)) return;
+  const now = Date.now();
+  const stored = await browser.storage.local.get([FOCUS_SESSION_HISTORY_KEY, "activeView", "lastActivation", "expandedGroups", "collapsedGroups"]);
+  const history = Array.isArray(stored[FOCUS_SESSION_HISTORY_KEY]) ? stored[FOCUS_SESSION_HISTORY_KEY].filter(isRecord) : [];
+  const previousView = isPersistedView(stored.activeView) ? stored.activeView : null;
+  const previousActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
+  const previousStartedAt = typeof previousActivation.at === "number" ? previousActivation.at : null;
+  if (previousView && previousStartedAt && viewKey(previousView) !== viewKey(view)) {
+    history.push({
+      view: previousView,
+      trigger: typeof previousActivation.trigger === "string" ? previousActivation.trigger : "manual",
+      ...(typeof previousActivation.triggerId === "string" ? { triggerId: previousActivation.triggerId } : {}),
+      startedAt: previousStartedAt,
+      endedAt: now,
+      expandedGroups: Array.isArray(stored.expandedGroups) ? stored.expandedGroups.filter((item) => typeof item === "string") : [],
+      collapsedGroups: Array.isArray(stored.collapsedGroups) ? stored.collapsedGroups.filter((item) => typeof item === "string") : [],
+    });
+  }
+  if (history.length > MAX_FOCUS_SESSION_HISTORY) {
+    history.splice(0, history.length - MAX_FOCUS_SESSION_HISTORY);
+  }
+  await browser.storage.local.set({ [FOCUS_SESSION_HISTORY_KEY]: history });
+}
+
+
 async function getAutomationFallback() {
   const stored = await browser.storage.local.get("automationFallback");
   return isPersistedView(stored.automationFallback) ? stored.automationFallback : { kind: "all" };
+}
+
+function normalizeWindowProfile(value) {
+  if (!isRecord(value)) return { kind: "default" };
+  if (value.kind === "none") return { kind: "none" };
+  if (value.kind === "lens" && typeof value.lensId === "string") return { kind: "lens", lensId: value.lensId };
+  return { kind: "default" };
+}
+
+function getWindowProfile(windowId) {
+  return typeof windowId === "number" ? (windowProfileOverrides.get(windowId) || { kind: "default" }) : { kind: "default" };
+}
+
+async function handleWindowProfileSet(message) {
+  if (!message || typeof message.windowId !== "number") {
+    return { ok: false, error: "missing_window" };
+  }
+  const profile = normalizeWindowProfile(message.profile);
+  if (profile.kind === "default") {
+    windowProfileOverrides.delete(message.windowId);
+  } else {
+    windowProfileOverrides.set(message.windowId, profile);
+  }
+  return { ok: true, profile: getWindowProfile(message.windowId) };
+}
+
+function normalizeLensSchedules(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(isRecord)
+    .map((schedule) => ({
+      lensId: typeof schedule.lensId === "string" ? schedule.lensId : "",
+      enabled: schedule.enabled === true,
+      days: Array.isArray(schedule.days)
+        ? [...new Set(schedule.days.filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))]
+        : [],
+      start: typeof schedule.start === "string" && /^\d{2}:\d{2}$/.test(schedule.start) ? schedule.start : "09:00",
+      end: typeof schedule.end === "string" && /^\d{2}:\d{2}$/.test(schedule.end) ? schedule.end : "17:00",
+    }))
+    .filter((schedule) => schedule.lensId);
+}
+
+async function getLensSchedules() {
+  const stored = await browser.storage.local.get("lensSchedules");
+  return normalizeLensSchedules(stored.lensSchedules);
+}
+
+function minutesForTime(value) {
+  const [hours, minutes] = value.split(":").map((part) => Number.parseInt(part, 10));
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return 0;
+  return hours * 60 + minutes;
+}
+
+function scheduleMatchesNow(schedule, now = new Date()) {
+  if (!schedule.enabled) return false;
+  const day = now.getDay();
+  if (schedule.days.length > 0 && !schedule.days.includes(day)) return false;
+  const current = now.getHours() * 60 + now.getMinutes();
+  const start = minutesForTime(schedule.start);
+  const end = minutesForTime(schedule.end);
+  return start <= end ? current >= start && current < end : current >= start || current < end;
+}
+
+async function handleScheduleTick(now = new Date()) {
+  const schedules = await getLensSchedules();
+  const match = schedules.find((schedule) => scheduleMatchesNow(schedule, now));
+  if (match) {
+    await activateView({ kind: "lens", lensId: match.lensId }, { trigger: "schedule", triggerId: match.lensId });
+  }
 }
 
 function selectorMatcher(selectors) {
@@ -525,6 +630,7 @@ async function handleLensState(windowId) {
     Boolean(socket && socket.readyState === WebSocket.OPEN);
   return {
     activeView,
+    windowProfile: getWindowProfile(windowId),
     lastActivation: isRecord(stored.lastActivation) ? stored.lastActivation : null,
     lenses: lenses.map((lens) => ({
       id: lens.id,
@@ -695,6 +801,7 @@ function start() {
   browser.storage.local.get(AI_AUTO_GROUP_KEY)
     .then((stored) => { autoGroupEnabled = stored[AI_AUTO_GROUP_KEY] === true; })
     .catch((error) => console.error("Auto-group init error:", error));
+  browser.alarms.create(SCHEDULE_ALARM_NAME, { periodInMinutes: 1 });
   migrateToLensesV2()
     .catch((error) => {
       console.error("Lens migration error:", error);
@@ -704,9 +811,9 @@ function start() {
     });
 }
 
-// Initialization is handled by invoking start() at script evaluation.
-// Do not bind to onInstalled/onStartup to prevent duplicate execution
-// since this is a persistent background page.
+// Initialization is handled by invoking start() at script evaluation. In MV2
+// event-page mode the script is re-evaluated on wake, so startup work must stay
+// idempotent and durable state must live in storage.local.
 
 browser.runtime.onMessage.addListener((message) => {
   if (message && message.type === "lens-state") {
@@ -729,6 +836,9 @@ browser.runtime.onMessage.addListener((message) => {
   }
   if (message && message.type === "lens-reorder") {
     return enqueueFocusWork(() => handleLensReorder(message));
+  }
+  if (message && message.type === "window-profile-set") {
+    return enqueueFocusWork(() => handleWindowProfileSet(message));
   }
   if (message && message.type === "ai-group-state") {
     return handleGroupState(message.windowId);
@@ -782,6 +892,7 @@ if (browser.windows && browser.windows.onRemoved) {
   browser.windows.onRemoved.addListener((windowId) => {
     lastProposalByWindow.delete(windowId);
     transientViewsByWindow.delete(windowId);
+    windowProfileOverrides.delete(windowId);
     const timer = autoGroupDebounceTimers.get(windowId);
     if (timer) { clearTimeout(timer); autoGroupDebounceTimers.delete(windowId); }
     autoGroupCooldown.delete(windowId);
@@ -1067,29 +1178,19 @@ async function rememberActivatedView(resolvedView, activation) {
   await setActiveView(resolvedView, activation);
 }
 
-async function activateView(view, activation = {}) {
-  const resolved = await resolveActivation(view, activation.windowId);
-  if (!resolved.ok) {
-    return false;
-  }
-  const query = resolved.view.kind === "transient" && typeof activation.windowId === "number"
-    ? { windowId: activation.windowId }
-    : {};
-  const allGroups = await browser.tabGroups.query(query);
-  await browser.storage.local.set({
-    groupTitles: allGroups.map((group) => group.title),
-  });
-
+async function applyResolvedToGroups(resolved, allGroups, activation, { persist = true } = {}) {
   if (resolved.view.kind === "all") {
     const updateFailures = await setGroupsCollapsed(allGroups, false);
-    await setFocusBadge({ text: "", color: null, title: "Tab Lens" });
     await browser.storage.local.set({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: updateFailures.length === 0 ? "expanded_all" : "expanded_all_with_errors",
       updateFailures,
     });
-    await rememberActivatedView(resolved.view, activation);
-    return true;
+    if (persist) {
+      await setFocusBadge({ text: "", color: null, title: "Tab Lens" });
+      await rememberActivatedView(resolved.view, activation);
+    }
+    return { ok: true, expandedGroups: allGroups.map((group) => group.title), collapsedGroups: [], updateFailures };
   }
 
   if (allGroups.length === 0) {
@@ -1097,8 +1198,8 @@ async function activateView(view, activation = {}) {
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "no_groups",
     });
-    await rememberActivatedView(resolved.view, activation);
-    return true;
+    if (persist) await rememberActivatedView(resolved.view, activation);
+    return { ok: true, expandedGroups: [], collapsedGroups: [], updateFailures: [] };
   }
 
   const matches = selectorMatcher(resolved.selectors);
@@ -1107,7 +1208,6 @@ async function activateView(view, activation = {}) {
   const selectorText = normalizedSelectors(resolved.selectors).map((selector) => selector.value).join(", ");
 
   if (matching.length === 0) {
-    await setFocusBadge({ text: "!", color: "#FF9800", title: `Tab Lens: ${resolved.name}` });
     const updateFailures = await setGroupsCollapsed(allGroups, false);
     await browser.storage.local.set({
       ...CLEAR_ACTION_DIAGNOSTICS,
@@ -1115,8 +1215,11 @@ async function activateView(view, activation = {}) {
       missingGroup: selectorText,
       updateFailures,
     });
-    await rememberActivatedView(resolved.view, activation);
-    return true;
+    if (persist) {
+      await setFocusBadge({ text: "!", color: "#FF9800", title: `Tab Lens: ${resolved.name}` });
+      await rememberActivatedView(resolved.view, activation);
+    }
+    return { ok: true, expandedGroups: allGroups.map((group) => group.title), collapsedGroups: [], updateFailures };
   }
 
   const handoff = await activateMatchingGroups(matching);
@@ -1126,7 +1229,7 @@ async function activateView(view, activation = {}) {
       lastAction: "activation_failed",
       updateFailures: handoff.failures,
     });
-    return false;
+    return { ok: false, expandedGroups: [], collapsedGroups: [], updateFailures: handoff.failures };
   }
 
   if (!handoff.activated) {
@@ -1135,8 +1238,8 @@ async function activateView(view, activation = {}) {
       lastAction: "matching_group_empty",
       emptyGroup: selectorText,
     });
-    await rememberActivatedView(resolved.view, activation);
-    return true;
+    if (persist) await rememberActivatedView(resolved.view, activation);
+    return { ok: true, expandedGroups: [], collapsedGroups: [], updateFailures: [] };
   }
 
   const [expandFailures, collapseFailures] = await Promise.all([
@@ -1144,11 +1247,6 @@ async function activateView(view, activation = {}) {
     setGroupsCollapsed(others, true),
   ]);
   const updateFailures = expandFailures.concat(collapseFailures);
-  await setFocusBadge({
-    text: updateFailures.length === 0 ? resolved.badgeText : "!",
-    color: updateFailures.length === 0 ? resolved.badgeColor : "#FF9800",
-    title: `Tab Lens: ${resolved.name}`,
-  });
   await browser.storage.local.set({
     ...CLEAR_ACTION_DIAGNOSTICS,
     lastAction: updateFailures.length === 0 ? "applied" : "applied_with_errors",
@@ -1156,8 +1254,82 @@ async function activateView(view, activation = {}) {
     collapsedGroups: others.map((group) => group.title),
     updateFailures,
   });
+  if (persist) {
+    await setFocusBadge({
+      text: updateFailures.length === 0 ? resolved.badgeText : "!",
+      color: updateFailures.length === 0 ? resolved.badgeColor : "#FF9800",
+      title: `Tab Lens: ${resolved.name}`,
+    });
+    await rememberActivatedView(resolved.view, activation);
+  }
+  return {
+    ok: true,
+    expandedGroups: matching.map((group) => group.title),
+    collapsedGroups: others.map((group) => group.title),
+    updateFailures,
+  };
+}
+
+async function activateWithWindowProfiles(resolved, activation) {
+  const allGroups = await browser.tabGroups.query({});
+  const byWindow = new Map();
+  for (const group of allGroups) {
+    if (typeof group.windowId !== "number") continue;
+    if (!byWindow.has(group.windowId)) byWindow.set(group.windowId, []);
+    byWindow.get(group.windowId).push(group);
+  }
+  const aggregate = { expandedGroups: [], collapsedGroups: [], updateFailures: [] };
+  for (const [windowId, groups] of byWindow.entries()) {
+    const profile = getWindowProfile(windowId);
+    if (profile.kind === "none") continue;
+    const windowResolved = profile.kind === "lens"
+      ? await resolveActivation({ kind: "lens", lensId: profile.lensId }, windowId)
+      : resolved;
+    if (!windowResolved.ok) continue;
+    const result = await applyResolvedToGroups(windowResolved, groups, activation, { persist: false });
+    if (result.ok === false) return false;
+    aggregate.expandedGroups.push(...result.expandedGroups);
+    aggregate.collapsedGroups.push(...result.collapsedGroups);
+    aggregate.updateFailures.push(...result.updateFailures);
+  }
+  await browser.storage.local.set({
+    groupTitles: allGroups.map((group) => group.title),
+    expandedGroups: aggregate.expandedGroups,
+    collapsedGroups: aggregate.collapsedGroups,
+    updateFailures: aggregate.updateFailures,
+  });
+  await setFocusBadge({
+    text: aggregate.updateFailures.length === 0 ? resolved.badgeText : "!",
+    color: aggregate.updateFailures.length === 0 ? resolved.badgeColor : "#FF9800",
+    title: `Tab Lens: ${resolved.name}`,
+  });
   await rememberActivatedView(resolved.view, activation);
   return true;
+}
+
+async function activateView(view, activation = {}) {
+  const resolved = await resolveActivation(view, activation.windowId);
+  if (!resolved.ok) {
+    return false;
+  }
+  if (isPersistedView(resolved.view)) {
+    await recordActivationSession(resolved.view, activation);
+  }
+  const automationWithProfiles = activation.trigger !== "manual" &&
+    resolved.view.kind !== "transient" &&
+    windowProfileOverrides.size > 0;
+  if (automationWithProfiles) {
+    return activateWithWindowProfiles(resolved, activation);
+  }
+  const query = resolved.view.kind === "transient" && typeof activation.windowId === "number"
+    ? { windowId: activation.windowId }
+    : {};
+  const allGroups = await browser.tabGroups.query(query);
+  await browser.storage.local.set({
+    groupTitles: allGroups.map((group) => group.title),
+  });
+  const result = await applyResolvedToGroups(resolved, allGroups, activation, { persist: true });
+  return result.ok !== false;
 }
 
 // ── AI tab grouping ────────────────────────────────────────
@@ -1941,7 +2113,7 @@ async function moveTabsToNewWindow(tabIds) {
 
 async function moveTabsFromSearch(tabIds, windowId, anchorId, placeAfter, groupId) {
   const validIds = validTabIds(tabIds);
-  if (validIds.length === 0 || typeof windowId !== "number") {
+  if (validIds.length < 1 || typeof windowId !== "number") {
     return listTabsForSearch();
   }
   try {
@@ -2046,6 +2218,8 @@ if (browser.commands && browser.commands.onCommand) {
 browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "reconnect") {
     connect();
+  } else if (alarm.name === SCHEDULE_ALARM_NAME) {
+    enqueueFocusWork(() => handleScheduleTick()).catch((error) => console.error("Schedule activation error:", error));
   }
 });
 
