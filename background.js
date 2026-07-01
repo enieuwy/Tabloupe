@@ -2099,7 +2099,7 @@ async function webSearchFromSearch(query) {
   if (typeof query !== "string" || query.trim() === "") return { ok: false };
   if (!browser.search || typeof browser.search.query !== "function") return { ok: false };
   try {
-    await browser.search.query({ query, disposition: "NEW_TAB" });
+    await browser.search.query({ text: query, disposition: "NEW_TAB" });
     return { ok: true };
   } catch (error) {
     return { ok: false };
