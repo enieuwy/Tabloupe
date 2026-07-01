@@ -885,6 +885,15 @@ browser.runtime.onMessage.addListener((message) => {
   if (message && message.type === "tabsearch-ai-preview") {
     return tabsearchAiPreview(message.windowId, message.tabIds);
   }
+  if (message && message.type === "tabsearch-history") {
+    return searchHistoryFromSearch(message.query);
+  }
+  if (message && message.type === "tabsearch-web-search") {
+    return webSearchFromSearch(message.query);
+  }
+  if (message && message.type === "tabsearch-open-url") {
+    return openUrlFromSearch(message.url);
+  }
   return false;
 });
 
@@ -2033,6 +2042,47 @@ async function closeTabFromSearch(tabId) {
     await browser.tabs.remove(tabId).catch(() => {});
   }
   return listTabsForSearch();
+}
+
+async function searchHistoryFromSearch(query) {
+  if (typeof query !== "string" || query.trim() === "") return { ok: false, results: [] };
+  if (!browser.history || typeof browser.history.search !== "function") return { ok: false, results: [] };
+  try {
+    const items = await browser.history.search({ text: query, maxResults: 6, startTime: 0 });
+    const seen = new Set();
+    const results = [];
+    for (const item of Array.isArray(items) ? items : []) {
+      const url = item && typeof item.url === "string" ? item.url : "";
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      results.push({ title: item.title && item.title.trim() ? item.title : url, url });
+    }
+    return { ok: true, results };
+  } catch (error) {
+    return { ok: false, results: [] };
+  }
+}
+
+async function webSearchFromSearch(query) {
+  if (typeof query !== "string" || query.trim() === "") return { ok: false };
+  if (!browser.search || typeof browser.search.query !== "function") return { ok: false };
+  try {
+    await browser.search.query({ query, disposition: "NEW_TAB" });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false };
+  }
+}
+
+async function openUrlFromSearch(url) {
+  if (typeof url !== "string" || !url) return { ok: false };
+  if (!browser.tabs || typeof browser.tabs.create !== "function") return { ok: false };
+  try {
+    await browser.tabs.create({ url, active: true });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false };
+  }
 }
 
 function validTabIds(tabIds) {

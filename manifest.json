@@ -20,6 +20,8 @@
     "storage",
     "notifications",
     "alarms",
+    "history",
+    "search",
     "ws://127.0.0.1/*"
   ],
   "optional_permissions": [

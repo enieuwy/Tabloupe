@@ -33,6 +33,9 @@ let previewState = null;
 const collapsedGroups = new Set();
 let dragTabIds = [];
 let dropIndicator = null;
+let historyResults = [];
+let historyQuery = "";
+let historyDebounceTimer = null;
 const MAX_RENDERED_RESULTS = 50;
 
 const DEFAULT_TAB_SEARCH_SHORTCUT = { ctrl: true, alt: false, shift: false, meta: false, key: "s" };
@@ -77,6 +80,36 @@ function filterTabs(tabs, query, limit = tabs.length) {
     }
   }
   return matches;
+}
+
+function scheduleHistoryFetch(query) {
+  const trimmed = query.trim();
+  if (trimmed === "") {
+    historyResults = [];
+    historyQuery = "";
+    if (historyDebounceTimer !== null) {
+      clearTimeout(historyDebounceTimer);
+      historyDebounceTimer = null;
+    }
+    return;
+  }
+
+  clearTimeout(historyDebounceTimer);
+  historyDebounceTimer = setTimeout(async () => {
+    historyDebounceTimer = null;
+    try {
+      const res = await browser.runtime.sendMessage({ type: "tabsearch-history", query: trimmed });
+      if (!inputEl || inputEl.value.trim() !== trimmed) return;
+      historyResults = res && res.ok && Array.isArray(res.results) ? res.results : [];
+      historyQuery = trimmed;
+      render(inputEl.value);
+    } catch (error) {
+      historyResults = [];
+      if (!inputEl || inputEl.value.trim() !== trimmed) return;
+      historyQuery = trimmed;
+      render(inputEl.value);
+    }
+  }, 180);
 }
 
 function prepareTabsForSearch(tabs) {
@@ -227,6 +260,11 @@ function buildOverlay() {
     .row .close svg { width: 15px; height: 15px; }
     .row:hover .close, .row[aria-selected="true"] .close { opacity: 1; }
     .row .close:hover { background: rgba(255, 255, 255, 0.10); color: var(--text); }
+    .row.action-row .action-icon {
+      display: flex; align-items: center; justify-content: center;
+      width: 20px; height: 20px; opacity: 0.7;
+    }
+    .row.action-row .action-icon svg { width: 16px; height: 16px; }
     .divider {
       padding: 7px 11px 5px; color: var(--faint); font-size: 10px;
       letter-spacing: 0.06em; text-transform: uppercase;
@@ -255,6 +293,7 @@ function buildOverlay() {
     }
     .empty .empty-icon { display: flex; }
     .empty .empty-icon svg { width: 22px; height: 22px; opacity: 0.7; }
+    .empty-inline { padding: 8px 16px; color: var(--faint); font-size: 12px; }
     .hint {
       display: flex; gap: 16px; align-items: center;
       padding: 9px 16px; font-size: 11px; color: var(--faint);
@@ -372,8 +411,10 @@ function buildOverlay() {
   inputEl.placeholder = "Search tabs\u2026";
   inputEl.setAttribute("aria-label", "Search open tabs");
   inputEl.addEventListener("input", () => {
+    const query = inputEl.value;
     anchorIndex = null;
-    render(inputEl.value);
+    render(query);
+    scheduleHistoryFetch(query);
   });
   inputEl.addEventListener("keydown", onPanelKeydown);
   searchWrap.appendChild(searchIcon);
@@ -403,12 +444,22 @@ function render(query) {
     renderPreview();
     return;
   }
+  const trimmed = query.trim();
   const matches = filterTabs(allTabs, query, MAX_RENDERED_RESULTS);
   const renderedCount = Math.min(matches.length, MAX_RENDERED_RESULTS);
+  const actionRows = [];
+  if (trimmed !== "") {
+    if (historyQuery === trimmed) {
+      for (const item of historyResults.slice(0, 5)) {
+        actionRows.push({ kind: "history", title: item.title, url: item.url });
+      }
+    }
+    actionRows.push({ kind: "web", query: trimmed });
+  }
   listEl.textContent = "";
   listEl.classList.toggle("has-marks", marked.size > 0);
 
-  if (renderedCount === 0) {
+  if (renderedCount === 0 && actionRows.length === 0) {
     const empty = document.createElement("li");
     empty.className = "empty";
     const emptyIcon = document.createElement("span");
@@ -424,9 +475,16 @@ function render(query) {
     return;
   }
 
+  if (renderedCount === 0) {
+    const empty = document.createElement("li");
+    empty.className = "empty-inline";
+    empty.textContent = "No matching tabs";
+    listEl.appendChild(empty);
+  }
+
   // Browse (empty query) shows structured group sections; search shows the flat
   // ranked list with a per-row group pill, since matches scatter across groups.
-  const browse = query.trim() === "";
+  const browse = trimmed === "";
   const spansWindows = new Set(matches.slice(0, renderedCount).map((tab) => tab.windowId)).size > 1;
   const groupSizes = browse ? countGroupSizes() : null;
   const visible = [];
@@ -460,8 +518,17 @@ function render(query) {
     }
   }
 
+  for (const row of actionRows) {
+    const idx = visible.length;
+    visible.push(row);
+    listEl.appendChild(makeActionRow(row, idx));
+  }
+
   filtered = visible;
   if (selectedIndex >= filtered.length) selectedIndex = Math.max(0, filtered.length - 1);
+  listEl.querySelectorAll(".row").forEach((row, i) => {
+    row.setAttribute("aria-selected", String(i === selectedIndex));
+  });
   if (dropIndicator) {
     dropIndicator.style.display = "none";
     listEl.appendChild(dropIndicator);
@@ -593,6 +660,37 @@ function makeTabRow(tab, index, interactive, opts = {}) {
   row.appendChild(text);
   row.appendChild(close);
   return row;
+}
+
+function makeActionRow(row, index) {
+  const item = document.createElement("li");
+  item.className = "row action-row";
+  item.setAttribute("role", "option");
+  item.setAttribute("aria-selected", String(index === selectedIndex));
+  item.addEventListener("mousemove", () => setSelected(index));
+  item.addEventListener("click", () => activate(row));
+
+  const icon = document.createElement("span");
+  icon.className = "action-icon";
+  replaceChildrenWithTrustedHTML(icon, row.kind === "history" ? ICON_SEARCH : ICON_GLOBE);
+  item.appendChild(icon);
+
+  const text = document.createElement("div");
+  text.className = "text";
+  const title = document.createElement("div");
+  title.className = "title";
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = row.kind === "history" ? row.title : "Search the web";
+  title.appendChild(name);
+  const subtitle = document.createElement("div");
+  subtitle.className = "url";
+  subtitle.textContent = row.kind === "history" ? row.url : `\u201c${row.query}\u201d`;
+  text.appendChild(title);
+  text.appendChild(subtitle);
+  item.appendChild(text);
+
+  return item;
 }
 
 function browseMode() {
@@ -794,12 +892,13 @@ function sharedMarkedWindowId(tabs) {
 }
 
 function markRange(index) {
-  if (!filtered[index]) return;
+  const target = filtered[index];
+  if (!target || target.kind) return;
   const anchor = anchorIndex === null ? index : anchorIndex;
   const start = Math.min(anchor, index);
   const end = Math.max(anchor, index);
   for (let i = start; i <= end; i += 1) {
-    if (filtered[i]) marked.add(filtered[i].id);
+    if (filtered[i] && !filtered[i].kind) marked.add(filtered[i].id);
   }
   anchorIndex = index;
   groupDraftOpen = false;
@@ -809,7 +908,7 @@ function markRange(index) {
 
 function toggleMark(index) {
   const tab = filtered[index];
-  if (!tab) return;
+  if (!tab || tab.kind) return;
   if (marked.has(tab.id)) {
     marked.delete(tab.id);
   } else {
@@ -964,7 +1063,7 @@ function setSelected(index) {
 }
 
 function moveSelection(delta) {
-  const renderedCount = Math.min(filtered.length, MAX_RENDERED_RESULTS);
+  const renderedCount = filtered.length;
   if (renderedCount === 0) return;
   const next = (selectedIndex + delta + renderedCount) % renderedCount;
   setSelected(next);
@@ -989,11 +1088,12 @@ function onPanelKeydown(event) {
     event.preventDefault();
     event.stopPropagation();
     if (previewState) return;
-    if (event.metaKey || event.ctrlKey) {
+    const sel = filtered[selectedIndex];
+    if ((event.metaKey || event.ctrlKey) && sel && !sel.kind) {
       toggleMark(selectedIndex);
       moveSelection(1);
-    } else if (filtered[selectedIndex]) {
-      activate(filtered[selectedIndex]);
+    } else if (sel) {
+      activate(sel);
     }
   } else if (event.key === "Escape") {
     event.preventDefault();
@@ -1042,9 +1142,23 @@ function closeOverlay() {
   dropIndicator = null;
 }
 
-function activate(tab) {
+function activate(item) {
+  if (item.kind === "web") {
+    browser.runtime
+      .sendMessage({ type: "tabsearch-web-search", query: item.query })
+      .catch(() => {});
+    closeOverlay();
+    return;
+  }
+  if (item.kind === "history") {
+    browser.runtime
+      .sendMessage({ type: "tabsearch-open-url", url: item.url })
+      .catch(() => {});
+    closeOverlay();
+    return;
+  }
   browser.runtime
-    .sendMessage({ type: "tabsearch-activate", tabId: tab.id, windowId: tab.windowId })
+    .sendMessage({ type: "tabsearch-activate", tabId: item.id, windowId: item.windowId })
     .catch(() => {});
   closeOverlay();
 }
