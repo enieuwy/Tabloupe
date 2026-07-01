@@ -1040,9 +1040,13 @@ function renderFooter() {
     footerEl.className = "hint";
     const sel = filtered[selectedIndex];
     const webRow = filtered.find((row) => row && row.kind === "web");
-    const goVerb = webRow && webRow.url ? "go" : "search";
+    const goVerb = webRow && webRow.url ? "open in new tab" : "search in new tab";
     const verb =
-      sel && sel.kind === "web" ? goVerb : sel && sel.kind === "history" ? "open" : "switch";
+      sel && sel.kind === "web"
+        ? goVerb
+        : sel && sel.kind === "history"
+          ? "open in new tab"
+          : "switch";
     const shiftVerb = webRow && sel && sel.kind !== "web" ? goVerb : null;
     replaceChildrenWithTrustedHTML(footerEl, hintHtml(verb, shiftVerb));
     return;

@@ -2106,10 +2106,24 @@ async function webSearchFromSearch(query) {
   }
 }
 
+// A brand-new/empty tab worth replacing instead of stacking another tab on top.
+function isBlankTab(tab) {
+  return tab && (typeof tab.url !== "string" || tab.url === "" || /^(about:blank|about:newtab|about:home)(?:[?#]|$)/.test(tab.url));
+}
+
 async function openUrlFromSearch(url) {
   if (typeof url !== "string" || !url) return { ok: false };
   if (!browser.tabs || typeof browser.tabs.create !== "function") return { ok: false };
   try {
+    // Reuse the current tab when it's blank (about:blank/newtab/home) so we don't
+    // leave an empty tab behind; otherwise open alongside in a new tab.
+    if (typeof browser.tabs.query === "function" && typeof browser.tabs.update === "function") {
+      const [active] = await browser.tabs.query({ active: true, currentWindow: true });
+      if (isBlankTab(active)) {
+        await browser.tabs.update(active.id, { url });
+        return { ok: true };
+      }
+    }
     await browser.tabs.create({ url, active: true });
     return { ok: true };
   } catch (error) {
