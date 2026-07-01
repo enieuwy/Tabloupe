@@ -1235,6 +1235,23 @@ function onPanelKeydown(event) {
   }
 }
 
+// Reclaim keyboard focus for the search input. On a freshly opened tab the
+// browser's address bar still owns OS-level focus after the page navigates to
+// the extension-hosted search page, and a single inputEl.focus() can't pull it
+// into the content area (the URL bar releases focus asynchronously). So we grab
+// window focus and re-focus across a few animation frames until it sticks.
+function focusInput() {
+  const attempt = (remaining) => {
+    if (!inputEl || !isOpen()) return;
+    if (typeof window.focus === "function") window.focus();
+    inputEl.focus();
+    if (shadow && shadow.activeElement === inputEl) return; // focus landed
+    if (remaining <= 0) return;
+    requestAnimationFrame(() => attempt(remaining - 1));
+  };
+  attempt(10);
+}
+
 async function openOverlay() {
   if (isOpen()) {
     closeOverlay();
@@ -1242,7 +1259,7 @@ async function openOverlay() {
   }
   buildOverlay();
   selectedIndex = 0;
-  inputEl.focus();
+  focusInput();
   try {
     allTabs = prepareTabsForSearch((await browser.runtime.sendMessage({ type: "tabsearch-list" })) || []);
   } catch (error) {

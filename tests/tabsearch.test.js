@@ -1103,3 +1103,13 @@ test("a query with an unknown TLD stays a web search", async () => {
   const webRow = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row")).at(-1);
   assert.equal(webRow.querySelector(".name").textContent, "Search the web");
 });
+
+test("opening the overlay focuses the search input", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  const root = overlayRoot(harness);
+  assert.ok(root, "overlay is open");
+  assert.equal(root.activeElement, root.querySelector(".search"), "the search input holds focus");
+});
