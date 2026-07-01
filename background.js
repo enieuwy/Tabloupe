@@ -2301,7 +2301,16 @@ async function openTabSearchOverlay() {
     await browser.tabs.sendMessage(active.id, { type: "tabsearch-open" });
   } catch (error) {
     if (isNewTabPage(active)) {
-      await browser.tabs.update(active.id, { url: TAB_SEARCH_HOST_URL });
+      // Navigating the new-tab page in place (tabs.update) leaves keyboard focus
+      // stuck in the address bar (Firefox bug 1411465 / 1415860), so typed text
+      // lands in the URL bar. Opening a *fresh* tab instead lands focus in the
+      // content area like a link click; then discard the blank new-tab.
+      await browser.tabs.create({ url: TAB_SEARCH_HOST_URL, active: true });
+      try {
+        await browser.tabs.remove(active.id);
+      } catch (removeError) {
+        // Leaving the blank tab is harmless if it can't be removed.
+      }
       return;
     }
     // No content script on this page (e.g. about:, addons, PDF viewer).

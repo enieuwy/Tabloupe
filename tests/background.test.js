@@ -1771,7 +1771,7 @@ test("search-tabs command relays open to the active tab", async () => {
   assert.equal(harness.notifications.length, 0);
 });
 
-test("search-tabs command opens extension search page from Firefox new-tab page", async () => {
+test("search-tabs command opens extension search page in a fresh tab from Firefox new-tab page", async () => {
   const harness = createHarness({
     currentWindowId: 1,
     failTabMessage: true,
@@ -1782,9 +1782,13 @@ test("search-tabs command opens extension search page from Firefox new-tab page"
   await harness.runCommand("search-tabs");
   await settle();
 
-  assert.deepEqual(harness.tabUpdates, [
-    { id: 20, patch: { url: "moz-extension://tab-lens/tabsearch.html?tabsearchOpen=1" } },
+  // A fresh active tab lands keyboard focus in content; the blank new-tab is
+  // discarded. Navigating in place would leave focus in the address bar.
+  assert.deepEqual(harness.tabCreations, [
+    { url: "moz-extension://tab-lens/tabsearch.html?tabsearchOpen=1", active: true },
   ]);
+  assert.deepEqual(harness.removedTabs, [20]);
+  assert.equal(harness.tabUpdates.some((u) => u.id === 20), false);
   assert.equal(harness.notifications.length, 0);
 });
 
