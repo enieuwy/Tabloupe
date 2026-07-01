@@ -369,6 +369,11 @@ function createHarness({
   if (!noSearchApi) {
     browser.search = {
       async query(props) {
+        // Real Firefox requires `text`; reject the wrong param shape so a
+        // regression (e.g. passing `query` instead of `text`) is caught.
+        if (!props || typeof props.text !== "string" || props.text === "") {
+          throw new Error("search.query requires a non-empty text");
+        }
         searchQueries.push(clone(props));
         if (failSearch) throw new Error("no engine");
       },
@@ -1613,7 +1618,7 @@ test("tabsearch-web-search calls search.query with NEW_TAB disposition", async (
   const result = await harness.messageListeners[0]({ type: "tabsearch-web-search", query: "cats" });
 
   assert.equal(result.ok, true);
-  assert.equal(harness.searchQueries[0].query, "cats");
+  assert.equal(harness.searchQueries[0].text, "cats");
   assert.equal(harness.searchQueries[0].disposition, "NEW_TAB");
 });
 
