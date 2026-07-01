@@ -28,7 +28,11 @@
   "content_security_policy": "script-src 'self'; object-src 'self'; connect-src 'self' https: ws://127.0.0.1:8767;",
   "commands": {
     "search-tabs": {
-      "description": "Open the tab search overlay"
+      "description": "Open the tab search overlay",
+      "suggested_key": {
+        "default": "Ctrl+S",
+        "mac": "MacCtrl+S"
+      }
     }
   },
   "options_ui": {

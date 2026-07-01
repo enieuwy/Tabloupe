@@ -22,7 +22,7 @@ async function settle() {
   }
 }
 
-function createHarness({ tabs = SAMPLE_TABS, respond, shortcut } = {}) {
+function createHarness({ tabs = SAMPLE_TABS, respond, shortcut, url = "https://host.example/" } = {}) {
   const sent = [];
   const messageListeners = [];
   const storageListeners = [];
@@ -40,6 +40,9 @@ function createHarness({ tabs = SAMPLE_TABS, respond, shortcut } = {}) {
       async sendMessage(message) {
         sent.push(message);
         return (respond || defaultRespond)(message);
+      },
+      getURL(path = "") {
+        return `moz-extension://tab-lens/${path}`;
       },
       onMessage: {
         addListener(listener) {
@@ -65,7 +68,7 @@ function createHarness({ tabs = SAMPLE_TABS, respond, shortcut } = {}) {
   };
 
   const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>", {
-    url: "https://host.example/",
+    url,
     runScripts: "dangerously",
     beforeParse(window) {
       window.browser = browser;
@@ -318,6 +321,14 @@ test("tabsearch-open message from the command relay opens the overlay", async ()
   assert.equal(harness.messageListeners.length, 1);
 
   harness.messageListeners[0]({ type: "tabsearch-open" });
+  await settle();
+
+  assert.ok(overlayRoot(harness));
+  assert.deepEqual(rowTitles(harness), ["Docs", "GitHub", "Mozilla"]);
+});
+
+test("extension-hosted tabsearch page opens the overlay on load", async () => {
+  const harness = createHarness({ url: "moz-extension://tab-lens/tabsearch.html?tabsearchOpen=1" });
   await settle();
 
   assert.ok(overlayRoot(harness));

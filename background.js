@@ -2192,12 +2192,22 @@ async function tabsearchAiPreview(windowId, tabIds) {
   };
 }
 
+const TAB_SEARCH_HOST_URL = browser.runtime.getURL("tabsearch.html?tabsearchOpen=1");
+
+function isNewTabPage(tab) {
+  return tab && typeof tab.url === "string" && /^(about:newtab|about:home)(?:[?#]|$)/.test(tab.url);
+}
+
 async function openTabSearchOverlay() {
   const [active] = await browser.tabs.query({ active: true, currentWindow: true });
   if (!active || typeof active.id !== "number") return;
   try {
     await browser.tabs.sendMessage(active.id, { type: "tabsearch-open" });
   } catch (error) {
+    if (isNewTabPage(active)) {
+      await browser.tabs.update(active.id, { url: TAB_SEARCH_HOST_URL });
+      return;
+    }
     // No content script on this page (e.g. about:, addons, PDF viewer).
     await notify({
       type: "basic",
