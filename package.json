@@ -7,7 +7,11 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "lint:web-ext": "web-ext lint --source-dir . --ignore-files node_modules package-lock.json .github web-ext-artifacts build.sh deploy.sh",
+    "audit": "npm audit --audit-level=high",
+    "secrets": "gitleaks detect --no-banner --redact",
+    "verify": "npm run lint:web-ext && npm test && npm run audit"
   },
   "repository": {
     "type": "git",
@@ -18,6 +22,7 @@
   "license": "ISC",
   "type": "commonjs",
   "devDependencies": {
-    "jsdom": "^29.1.1"
+    "jsdom": "^29.1.1",
+    "web-ext": "^10.4.0"
   }
 }
