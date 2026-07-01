@@ -1014,3 +1014,92 @@ test("Enter on the web row activates it", async () => {
     query: "foo",
   });
 });
+
+test("Shift+Enter runs the web search from any selection", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "git");
+  // The top tab (GitHub) is selected; Shift+Enter must still hit the web row.
+  assert.equal(overlayRoot(harness).querySelector(".row[aria-selected='true'] .name").textContent, "GitHub");
+
+  pressKey(harness, "Enter", { shift: true });
+  await settle();
+
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-web-search")), {
+    type: "tabsearch-web-search",
+    query: "git",
+  });
+});
+
+test("a bare domain query becomes a Go to row and opens directly", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "github.com");
+
+  const webRow = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row")).at(-1);
+  assert.equal(webRow.querySelector(".name").textContent, "Go to github.com");
+  assert.equal(webRow.querySelector(".url").textContent, "https://github.com/");
+
+  webRow.click();
+  await settle();
+
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-open-url")), {
+    type: "tabsearch-open-url",
+    url: "https://github.com/",
+  });
+  assert.equal(harness.sent.some((message) => message.type === "tabsearch-web-search"), false);
+});
+
+test("an explicit URL query opens directly, preserving the path", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "https://example.com/docs/page");
+
+  const webRow = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row")).at(-1);
+  assert.equal(webRow.querySelector(".name").textContent, "Go to example.com/docs/page");
+
+  pressKey(harness, "Enter", { shift: true });
+  await settle();
+
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-open-url")), {
+    type: "tabsearch-open-url",
+    url: "https://example.com/docs/page",
+  });
+});
+
+test("a plain word query stays a web search, not a Go to", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "git");
+
+  const webRow = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row")).at(-1);
+  assert.equal(webRow.querySelector(".name").textContent, "Search the web");
+
+  webRow.click();
+  await settle();
+
+  assert.equal(harness.sent.some((message) => message.type === "tabsearch-open-url"), false);
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-web-search")), {
+    type: "tabsearch-web-search",
+    query: "git",
+  });
+});
+
+test("a query with an unknown TLD stays a web search", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "test.foo");
+
+  const webRow = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row")).at(-1);
+  assert.equal(webRow.querySelector(".name").textContent, "Search the web");
+});

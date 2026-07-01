@@ -53,8 +53,11 @@ const ICON_CHEVRON =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"></path></svg>';
 const ICON_UNGROUP =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3" stroke-dasharray="3 3"></rect><path d="M8 12h8"></path></svg>';
-function hintHtml(verb = "switch") {
-  return `<span class="grp"><kbd>\u2191</kbd><kbd>\u2193</kbd> navigate</span><span class="grp"><kbd>\u21b5</kbd> ${verb}</span><span class="grp"><kbd>esc</kbd> close</span>`;
+function hintHtml(verb = "switch", shiftVerb = null) {
+  const shift = shiftVerb
+    ? `<span class="grp"><kbd>\u21e7</kbd><kbd>\u21b5</kbd> ${shiftVerb}</span>`
+    : "";
+  return `<span class="grp"><kbd>\u2191</kbd><kbd>\u2193</kbd> navigate</span><span class="grp"><kbd>\u21b5</kbd> ${verb}</span>${shift}<span class="grp"><kbd>esc</kbd> close</span>`;
 }
 
 function trustedHTMLNodes(markup) {
@@ -467,7 +470,7 @@ function render(query) {
       }
     }
     actionRows.push(...historyRows);
-    actionRows.push({ kind: "web", query: trimmed });
+    actionRows.push({ kind: "web", query: trimmed, url: parseQueryAsUrl(trimmed) });
   }
   listEl.textContent = "";
   listEl.classList.toggle("has-marks", marked.size > 0);
@@ -709,6 +712,47 @@ function readableUrlLabel(rawUrl) {
   }
 }
 
+// Common TLDs a bare "host.tld" query is treated as a URL for. Conservative on
+// purpose: unknown/short suffixes (e.g. "test.foo") stay a web search so normal
+// searches with a dot are never hijacked.
+const KNOWN_TLDS = new Set([
+  "com", "org", "net", "io", "dev", "app", "co", "gov", "edu", "mil", "int",
+  "info", "biz", "me", "tv", "ai", "so", "gg", "xyz", "sh", "ly", "to", "cc",
+  "us", "uk", "ca", "de", "fr", "jp", "cn", "au", "ru", "br", "in", "nl", "eu",
+]);
+
+// If the query is a URL (explicit scheme) or an unambiguous host (localhost,
+// an IP, host:port, or host.<known-tld>[/...]), return the URL to open directly;
+// otherwise null (-> web search). Never treats a query containing whitespace as
+// a URL.
+function parseQueryAsUrl(query) {
+  const q = query.trim();
+  if (!q || /\s/.test(q)) return null;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(q)) {
+    try {
+      return new URL(q).href;
+    } catch (error) {
+      return null;
+    }
+  }
+  // Bare host forms, promoted to https://.
+  const hostPart = q.split(/[/?#]/)[0];
+  const isLocalhost = /^localhost(:\d+)?$/i.test(hostPart);
+  const isIpv4 = /^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(hostPart);
+  const hostNoPort = hostPart.replace(/:\d+$/, "");
+  const labels = hostNoPort.split(".");
+  const tld = labels.length >= 2 ? labels[labels.length - 1].toLowerCase() : "";
+  const looksDomain = labels.length >= 2 && labels.every((l) => /^[a-z0-9-]+$/i.test(l) && l.length > 0) && KNOWN_TLDS.has(tld);
+  if (isLocalhost || isIpv4 || looksDomain) {
+    try {
+      return new URL(`https://${q}`).href;
+    } catch (error) {
+      return null;
+    }
+  }
+  return null;
+}
+
 function makeActionRow(row, index) {
   const item = document.createElement("li");
   item.className = "row action-row";
@@ -729,18 +773,22 @@ function makeActionRow(row, index) {
   const name = document.createElement("span");
   name.className = "name";
   // History with a real title -> title line + url subtitle. Title-less history
-  // -> a single readable label line, never the raw URL printed twice.
+  // -> a single readable label line, never the raw URL printed twice. A web row
+  // whose query is a URL becomes a "Go to <host+path>" direct-open row.
   const hasTitle = row.kind === "history" && row.title && row.title.trim();
+  const isGoTo = row.kind === "web" && row.url;
   name.textContent =
     row.kind === "web"
-      ? "Search the web"
+      ? isGoTo
+        ? `Go to ${readableUrlLabel(row.url)}`
+        : "Search the web"
       : hasTitle
         ? row.title
         : readableUrlLabel(row.url);
   title.appendChild(name);
   text.appendChild(title);
   const subtitleText =
-    row.kind === "web" ? `\u201c${row.query}\u201d` : hasTitle ? row.url : "";
+    row.kind === "web" ? (isGoTo ? row.url : `\u201c${row.query}\u201d`) : hasTitle ? row.url : "";
   if (subtitleText) {
     const subtitle = document.createElement("div");
     subtitle.className = "url";
@@ -991,8 +1039,12 @@ function renderFooter() {
   if (marked.size === 0) {
     footerEl.className = "hint";
     const sel = filtered[selectedIndex];
-    const verb = sel && sel.kind === "web" ? "search" : sel && sel.kind === "history" ? "open" : "switch";
-    replaceChildrenWithTrustedHTML(footerEl, hintHtml(verb));
+    const webRow = filtered.find((row) => row && row.kind === "web");
+    const goVerb = webRow && webRow.url ? "go" : "search";
+    const verb =
+      sel && sel.kind === "web" ? goVerb : sel && sel.kind === "history" ? "open" : "switch";
+    const shiftVerb = webRow && sel && sel.kind !== "web" ? goVerb : null;
+    replaceChildrenWithTrustedHTML(footerEl, hintHtml(verb, shiftVerb));
     return;
   }
 
@@ -1150,6 +1202,13 @@ function onPanelKeydown(event) {
     event.preventDefault();
     event.stopPropagation();
     if (previewState) return;
+    // Shift+Enter runs the search / go-to-URL row from anywhere, so the user
+    // never has to arrow past tabs and history to reach it.
+    if (event.shiftKey) {
+      const webRow = filtered.find((row) => row && row.kind === "web");
+      if (webRow) activate(webRow);
+      return;
+    }
     const sel = filtered[selectedIndex];
     if ((event.metaKey || event.ctrlKey) && sel && !sel.kind) {
       toggleMark(selectedIndex);
@@ -1206,9 +1265,11 @@ function closeOverlay() {
 
 function activate(item) {
   if (item.kind === "web") {
-    browser.runtime
-      .sendMessage({ type: "tabsearch-web-search", query: item.query })
-      .catch(() => {});
+    // A URL-shaped query opens directly; anything else is a web search.
+    const message = item.url
+      ? { type: "tabsearch-open-url", url: item.url }
+      : { type: "tabsearch-web-search", query: item.query };
+    browser.runtime.sendMessage(message).catch(() => {});
     closeOverlay();
     return;
   }
