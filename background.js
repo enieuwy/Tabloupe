@@ -2044,20 +2044,52 @@ async function closeTabFromSearch(tabId) {
   return listTabsForSearch();
 }
 
+// Collapse near-duplicate history URLs (scheme, www., trailing slash, and
+// tracking/session params) so "https://youtube.com/", "http://youtube.com/",
+// and "...?themeRefresh=1" don't each take a row.
+const HISTORY_NOISE_PARAMS = new Set([
+  "sei", "themerefresh", "gs_lcrp", "ved", "ei", "sca_esv", "source", "sourceid",
+  "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid",
+]);
+
+function normalizeHistoryUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.replace(/^www\./, "");
+    for (const key of [...url.searchParams.keys()]) {
+      if (HISTORY_NOISE_PARAMS.has(key.toLowerCase())) url.searchParams.delete(key);
+    }
+    const search = url.searchParams.toString();
+    let path = url.pathname.replace(/\/+$/, "");
+    return `${host}${path}${search ? `?${search}` : ""}`.toLowerCase();
+  } catch (error) {
+    return rawUrl.toLowerCase();
+  }
+}
+
 async function searchHistoryFromSearch(query) {
   if (typeof query !== "string" || query.trim() === "") return { ok: false, results: [] };
   if (!browser.history || typeof browser.history.search !== "function") return { ok: false, results: [] };
   try {
-    const items = await browser.history.search({ text: query, maxResults: 6, startTime: 0 });
-    const seen = new Set();
-    const results = [];
+    const items = await browser.history.search({ text: query, maxResults: 20, startTime: 0 });
+    const byKey = new Map();
     for (const item of Array.isArray(items) ? items : []) {
       const url = item && typeof item.url === "string" ? item.url : "";
-      if (!url || seen.has(url)) continue;
-      seen.add(url);
-      results.push({ title: item.title && item.title.trim() ? item.title : url, url });
+      if (!url) continue;
+      const title = item.title && item.title.trim() ? item.title.trim() : "";
+      const key = normalizeHistoryUrl(url);
+      const existing = byKey.get(key);
+      // Prefer an entry with a real title, then the shorter (canonical) url.
+      if (
+        !existing ||
+        (!existing.title && title) ||
+        (Boolean(existing.title) === Boolean(title) && url.length < existing.url.length)
+      ) {
+        byKey.set(key, { title, url });
+      }
     }
-    return { ok: true, results };
+    // title left empty when history has no real title -> the client renders one line.
+    return { ok: true, results: [...byKey.values()] };
   } catch (error) {
     return { ok: false, results: [] };
   }
