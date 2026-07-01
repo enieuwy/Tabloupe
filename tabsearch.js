@@ -49,6 +49,15 @@ const ICON_UNGROUP =
 const HINT_HTML =
   '<span class="grp"><kbd>\u2191</kbd><kbd>\u2193</kbd> navigate</span><span class="grp"><kbd>\u21b5</kbd> switch</span><span class="grp"><kbd>esc</kbd> close</span>';
 
+function trustedHTMLNodes(markup) {
+  const parsed = new DOMParser().parseFromString(markup, "text/html");
+  return Array.from(parsed.body.childNodes, (node) => document.importNode(node, true));
+}
+
+function replaceChildrenWithTrustedHTML(element, markup) {
+  element.replaceChildren(...trustedHTMLNodes(markup));
+}
+
 // Case-insensitive AND-match: every whitespace token must appear in the
 // precomputed title/url/group haystack.
 function filterTabs(tabs, query, limit = tabs.length) {
@@ -353,7 +362,7 @@ function buildOverlay() {
   searchWrap.className = "search-wrap";
   const searchIcon = document.createElement("span");
   searchIcon.className = "search-icon";
-  searchIcon.innerHTML = ICON_SEARCH;
+  replaceChildrenWithTrustedHTML(searchIcon, ICON_SEARCH);
 
   inputEl = document.createElement("input");
   inputEl.className = "search";
@@ -375,7 +384,7 @@ function buildOverlay() {
 
   footerEl = document.createElement("div");
   footerEl.className = "hint";
-  footerEl.innerHTML = HINT_HTML;
+  replaceChildrenWithTrustedHTML(footerEl, HINT_HTML);
 
   panel.appendChild(searchWrap);
   panel.appendChild(listEl);
@@ -400,7 +409,12 @@ function render(query) {
   if (renderedCount === 0) {
     const empty = document.createElement("li");
     empty.className = "empty";
-    empty.innerHTML = `<span class="empty-icon">${ICON_SEARCH}</span><span>No matching tabs</span>`;
+    const emptyIcon = document.createElement("span");
+    emptyIcon.className = "empty-icon";
+    replaceChildrenWithTrustedHTML(emptyIcon, ICON_SEARCH);
+    const emptyText = document.createElement("span");
+    emptyText.textContent = "No matching tabs";
+    empty.append(emptyIcon, emptyText);
     listEl.appendChild(empty);
     filtered = [];
     selectedIndex = 0;
@@ -568,7 +582,7 @@ function makeTabRow(tab, index, interactive, opts = {}) {
   close.className = "close";
   close.type = "button";
   close.title = "Close tab";
-  close.innerHTML = ICON_CLOSE;
+  replaceChildrenWithTrustedHTML(close, ICON_CLOSE);
   close.addEventListener("click", (event) => {
     event.stopPropagation();
     closeTab(tab);
@@ -672,7 +686,7 @@ function makeGroupHeader(tab, count) {
 
   const chevron = document.createElement("span");
   chevron.className = "chevron";
-  chevron.innerHTML = ICON_CHEVRON;
+  replaceChildrenWithTrustedHTML(chevron, ICON_CHEVRON);
   header.appendChild(chevron);
 
   const badge = document.createElement("span");
@@ -694,7 +708,7 @@ function makeGroupHeader(tab, count) {
   ungroupBtn.type = "button";
   ungroupBtn.className = "ghbtn";
   ungroupBtn.title = "Ungroup";
-  ungroupBtn.innerHTML = ICON_UNGROUP;
+  replaceChildrenWithTrustedHTML(ungroupBtn, ICON_UNGROUP);
   ungroupBtn.addEventListener("click", (event) => {
     event.stopPropagation();
     runBulkListAction("tabsearch-ungroup", { tabIds: groupTabIds(tab.groupId) });
@@ -705,7 +719,7 @@ function makeGroupHeader(tab, count) {
   closeBtn.type = "button";
   closeBtn.className = "ghbtn";
   closeBtn.title = "Close group";
-  closeBtn.innerHTML = ICON_CLOSE;
+  replaceChildrenWithTrustedHTML(closeBtn, ICON_CLOSE);
   closeBtn.addEventListener("click", (event) => {
     event.stopPropagation();
     runBulkListAction("tabsearch-close-many", { tabIds: groupTabIds(tab.groupId) });
@@ -756,7 +770,7 @@ async function groupOntoExisting(tabIds, groupId, windowId) {
 function makeFavFallback() {
   const fallback = document.createElement("span");
   fallback.className = "fav-fallback";
-  fallback.innerHTML = ICON_GLOBE;
+  replaceChildrenWithTrustedHTML(fallback, ICON_GLOBE);
   return fallback;
 }
 
@@ -816,7 +830,7 @@ function renderFooter() {
   if (!footerEl) return;
   if (marked.size === 0) {
     footerEl.className = "hint";
-    footerEl.innerHTML = HINT_HTML;
+    replaceChildrenWithTrustedHTML(footerEl, HINT_HTML);
     return;
   }
 
