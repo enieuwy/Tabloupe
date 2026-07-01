@@ -1632,14 +1632,36 @@ test("tabsearch-web-search returns ok:false on blank query and when api missing/
   assert.equal(failingResult.ok, false);
 });
 
-test("tabsearch-open-url creates a new active tab", async () => {
-  const harness = createHarness();
+test("tabsearch-open-url opens a new tab when the current tab is a real page", async () => {
+  const harness = createHarness({
+    tabs: [{ id: 7, windowId: 1, url: "https://real.test", active: true }],
+  });
 
   const result = await harness.messageListeners[0]({ type: "tabsearch-open-url", url: "https://x.test" });
 
   assert.equal(result.ok, true);
   assert.equal(harness.tabCreations[0].url, "https://x.test");
   assert.equal(harness.tabCreations[0].active, true);
+  // The real current tab is left untouched.
+  assert.equal(harness.tabUpdates.some((u) => u.id === 7), false);
+});
+
+test("tabsearch-open-url reuses a blank current tab instead of stacking a new one", async () => {
+  for (const blankUrl of ["about:blank", "about:newtab", "about:home"]) {
+    const harness = createHarness({
+      tabs: [{ id: 9, windowId: 1, url: blankUrl, active: true }],
+    });
+
+    const result = await harness.messageListeners[0]({ type: "tabsearch-open-url", url: "https://x.test" });
+
+    assert.equal(result.ok, true, `${blankUrl} reuse ok`);
+    assert.equal(harness.tabCreations.length, 0, `${blankUrl} did not create a tab`);
+    assert.deepEqual(
+      harness.tabUpdates.find((u) => u.id === 9),
+      { id: 9, patch: { url: "https://x.test" } },
+      `${blankUrl} navigated the blank tab`,
+    );
+  }
 });
 
 test("tabsearch-open-url returns ok:false for empty url", async () => {
