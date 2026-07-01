@@ -10,8 +10,10 @@
 //     preventDefault stops "Save Page As" on Windows/Linux. On macOS Ctrl+S
 //     isn't bound, so nothing is overridden. Stored in storage.local as
 //     `tabSearchShortcut` ({ctrl,alt,shift,meta,key}); null disables it.
-//   - The "search-tabs" command (remappable in about:addons), relayed by the
-//     background as a {type:"tabsearch-open"} message.
+//   - The "search-tabs" command (Ctrl+S by default, MacCtrl+S on macOS, and
+//     remappable in about:addons), relayed by the background as a
+//     {type:"tabsearch-open"} message on normal pages or routed to this
+//     extension-hosted page from Firefox new-tab/home pages.
 
 const TABSEARCH_HOST_ID = "focus-tab-search-overlay";
 
@@ -1162,6 +1164,18 @@ function onGlobalKeydown(event) {
   }
 }
 
+function shouldAutoOpenFromUrl() {
+  if (!browser.runtime || typeof browser.runtime.getURL !== "function") return false;
+  try {
+    const extensionOrigin = new URL(browser.runtime.getURL("")).origin;
+    const currentUrl = new URL(window.location.href);
+    return currentUrl.origin === extensionOrigin && currentUrl.searchParams.get("tabsearchOpen") === "1";
+  } catch (error) {
+    return false;
+  }
+}
+
+
 if (!window.__focusTabSearchInit) {
   window.__focusTabSearchInit = true;
   document.addEventListener("keydown", onGlobalKeydown, true);
@@ -1188,5 +1202,8 @@ if (!window.__focusTabSearchInit) {
         openOverlay();
       }
     });
+  }
+  if (shouldAutoOpenFromUrl()) {
+    setTimeout(() => openOverlay(), 0);
   }
 }

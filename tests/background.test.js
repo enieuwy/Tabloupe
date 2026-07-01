@@ -198,6 +198,7 @@ function createHarness({
       onInstalled: { addListener: (listener) => installedListeners.push(listener) },
       onStartup: { addListener: (listener) => startupListeners.push(listener) },
       onMessage: { addListener: (listener) => messageListeners.push(listener) },
+      getURL: (path = "") => `moz-extension://tab-lens/${path}`,
       openOptionsPage: () => openedOptions.push(true),
     },
     notifications: {
@@ -1616,6 +1617,23 @@ test("search-tabs command relays open to the active tab", async () => {
   await settle();
 
   assert.deepEqual(harness.tabMessages, [{ tabId: 20, message: { type: "tabsearch-open" } }]);
+  assert.equal(harness.notifications.length, 0);
+});
+
+test("search-tabs command opens extension search page from Firefox new-tab page", async () => {
+  const harness = createHarness({
+    currentWindowId: 1,
+    failTabMessage: true,
+    tabs: [{ id: 20, windowId: 1, title: "New Tab", url: "about:newtab", active: true }],
+  });
+  await settle();
+
+  await harness.runCommand("search-tabs");
+  await settle();
+
+  assert.deepEqual(harness.tabUpdates, [
+    { id: 20, patch: { url: "moz-extension://tab-lens/tabsearch.html?tabsearchOpen=1" } },
+  ]);
   assert.equal(harness.notifications.length, 0);
 });
 
