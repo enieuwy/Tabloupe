@@ -43,6 +43,8 @@ let shortcut = { ...DEFAULT_TAB_SEARCH_SHORTCUT };
 
 const ICON_SEARCH =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>';
+const ICON_CLOCK =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>';
 const ICON_GLOBE =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M3 12h18"></path><path d="M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18"></path></svg>';
 const ICON_CLOSE =
@@ -51,8 +53,9 @@ const ICON_CHEVRON =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"></path></svg>';
 const ICON_UNGROUP =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3" stroke-dasharray="3 3"></rect><path d="M8 12h8"></path></svg>';
-const HINT_HTML =
-  '<span class="grp"><kbd>\u2191</kbd><kbd>\u2193</kbd> navigate</span><span class="grp"><kbd>\u21b5</kbd> switch</span><span class="grp"><kbd>esc</kbd> close</span>';
+function hintHtml(verb = "switch") {
+  return `<span class="grp"><kbd>\u2191</kbd><kbd>\u2193</kbd> navigate</span><span class="grp"><kbd>\u21b5</kbd> ${verb}</span><span class="grp"><kbd>esc</kbd> close</span>`;
+}
 
 function trustedHTMLNodes(markup) {
   const parsed = new DOMParser().parseFromString(markup, "text/html");
@@ -270,6 +273,8 @@ function buildOverlay() {
       letter-spacing: 0.06em; text-transform: uppercase;
       border-top: 1px solid rgba(255, 255, 255, 0.06);
     }
+    .divider.section-header { font-weight: 600; }
+    .list > .divider.section-header:first-child { border-top: none; }
     .preview-topic {
       display: flex; align-items: center; gap: 8px;
       padding: 10px 11px 5px; color: var(--text); font-size: 12px; font-weight: 600;
@@ -427,7 +432,7 @@ function buildOverlay() {
 
   footerEl = document.createElement("div");
   footerEl.className = "hint";
-  replaceChildrenWithTrustedHTML(footerEl, HINT_HTML);
+  replaceChildrenWithTrustedHTML(footerEl, hintHtml());
 
   panel.appendChild(searchWrap);
   panel.appendChild(listEl);
@@ -448,12 +453,20 @@ function render(query) {
   const matches = filterTabs(allTabs, query, MAX_RENDERED_RESULTS);
   const renderedCount = Math.min(matches.length, MAX_RENDERED_RESULTS);
   const actionRows = [];
+  const historyRows = [];
   if (trimmed !== "") {
-    if (historyQuery === trimmed) {
-      for (const item of historyResults.slice(0, 5)) {
-        actionRows.push({ kind: "history", title: item.title, url: item.url });
+    // Drop history entries whose URL is already an open tab (matched or not) so
+    // the same page never shows twice; require >=2 chars so single-letter
+    // queries don't surface noisy history.
+    if (historyQuery === trimmed && trimmed.length >= 2) {
+      const openUrls = new Set(allTabs.map((tab) => tab.url));
+      for (const item of historyResults) {
+        if (openUrls.has(item.url)) continue;
+        historyRows.push({ kind: "history", title: item.title, url: item.url });
+        if (historyRows.length >= 3) break;
       }
     }
+    actionRows.push(...historyRows);
     actionRows.push({ kind: "web", query: trimmed });
   }
   listEl.textContent = "";
@@ -475,7 +488,10 @@ function render(query) {
     return;
   }
 
-  if (renderedCount === 0) {
+  // Section headers clarify the mixed list once fallback rows are present:
+  // "Open tabs" over real tabs, "History" over history rows, "Search" over web.
+  const sectioned = actionRows.length > 0;
+  if (renderedCount === 0 && !sectioned) {
     const empty = document.createElement("li");
     empty.className = "empty-inline";
     empty.textContent = "No matching tabs";
@@ -491,9 +507,12 @@ function render(query) {
   let previousWindowId = null;
   let currentGroupId = null;
 
+  if (sectioned && renderedCount > 0) {
+    listEl.appendChild(makeSectionHeader("Open tabs"));
+  }
   for (let index = 0; index < renderedCount; index += 1) {
     const tab = matches[index];
-    if (spansWindows && tab.windowId !== previousWindowId) {
+    if (!sectioned && spansWindows && tab.windowId !== previousWindowId) {
       const divider = document.createElement("li");
       divider.className = "divider";
       divider.textContent = tab.currentWindow ? "This window" : `Window ${tab.windowId}`;
@@ -518,7 +537,15 @@ function render(query) {
     }
   }
 
+  let sectionShown = false;
   for (const row of actionRows) {
+    if (row.kind === "history" && !sectionShown) {
+      listEl.appendChild(makeSectionHeader("History"));
+      sectionShown = true;
+    }
+    if (row.kind === "web") {
+      listEl.appendChild(makeSectionHeader("Search"));
+    }
     const idx = visible.length;
     visible.push(row);
     listEl.appendChild(makeActionRow(row, idx));
@@ -662,6 +689,26 @@ function makeTabRow(tab, index, interactive, opts = {}) {
   return row;
 }
 
+function makeSectionHeader(label) {
+  const header = document.createElement("li");
+  header.className = "divider section-header";
+  header.textContent = label;
+  return header;
+}
+
+// A readable one-line label for a title-less history entry: host + path, no
+// scheme/query clutter (e.g. "youtube.com" or "github.com/mozilla/foo").
+function readableUrlLabel(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.replace(/^www\./, "");
+    const path = url.pathname.replace(/\/+$/, "");
+    return `${host}${path}`;
+  } catch (error) {
+    return rawUrl;
+  }
+}
+
 function makeActionRow(row, index) {
   const item = document.createElement("li");
   item.className = "row action-row";
@@ -672,7 +719,7 @@ function makeActionRow(row, index) {
 
   const icon = document.createElement("span");
   icon.className = "action-icon";
-  replaceChildrenWithTrustedHTML(icon, row.kind === "history" ? ICON_SEARCH : ICON_GLOBE);
+  replaceChildrenWithTrustedHTML(icon, row.kind === "history" ? ICON_CLOCK : ICON_GLOBE);
   item.appendChild(icon);
 
   const text = document.createElement("div");
@@ -681,13 +728,25 @@ function makeActionRow(row, index) {
   title.className = "title";
   const name = document.createElement("span");
   name.className = "name";
-  name.textContent = row.kind === "history" ? row.title : "Search the web";
+  // History with a real title -> title line + url subtitle. Title-less history
+  // -> a single readable label line, never the raw URL printed twice.
+  const hasTitle = row.kind === "history" && row.title && row.title.trim();
+  name.textContent =
+    row.kind === "web"
+      ? "Search the web"
+      : hasTitle
+        ? row.title
+        : readableUrlLabel(row.url);
   title.appendChild(name);
-  const subtitle = document.createElement("div");
-  subtitle.className = "url";
-  subtitle.textContent = row.kind === "history" ? row.url : `\u201c${row.query}\u201d`;
   text.appendChild(title);
-  text.appendChild(subtitle);
+  const subtitleText =
+    row.kind === "web" ? `\u201c${row.query}\u201d` : hasTitle ? row.url : "";
+  if (subtitleText) {
+    const subtitle = document.createElement("div");
+    subtitle.className = "url";
+    subtitle.textContent = subtitleText;
+    text.appendChild(subtitle);
+  }
   item.appendChild(text);
 
   return item;
@@ -931,7 +990,9 @@ function renderFooter() {
   if (!footerEl) return;
   if (marked.size === 0) {
     footerEl.className = "hint";
-    replaceChildrenWithTrustedHTML(footerEl, HINT_HTML);
+    const sel = filtered[selectedIndex];
+    const verb = sel && sel.kind === "web" ? "search" : sel && sel.kind === "history" ? "open" : "switch";
+    replaceChildrenWithTrustedHTML(footerEl, hintHtml(verb));
     return;
   }
 
@@ -1060,6 +1121,7 @@ function setSelected(index) {
   selectedIndex = index;
   const rows = listEl.querySelectorAll(".row");
   rows.forEach((row, i) => row.setAttribute("aria-selected", String(i === selectedIndex)));
+  renderFooter();
 }
 
 function moveSelection(delta) {

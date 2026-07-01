@@ -424,6 +424,7 @@ function createHarness({
     WebSocket: FakeWebSocket,
     fetch: fakeFetch,
     AbortController,
+    URL,
   };
   vm.createContext(context);
   vm.runInContext(backgroundSource, context, { filename: "background.js" });
@@ -1567,19 +1568,23 @@ test("tabsearch-history returns deduped mapped results", async () => {
       { title: "", url: "https://b.test" },
       { title: "Dup", url: "https://a.test" },
       { title: "NoUrl" },
+      // Near-duplicate of a.test (scheme + www + trailing slash + noise param).
+      { title: "A mirror", url: "http://www.a.test/?sei=xyz" },
     ],
   });
 
   const result = await harness.messageListeners[0]({ type: "tabsearch-history", query: "x" });
 
   assert.equal(result.ok, true);
+  // a.test collapses to one entry (real title wins over the mirror); b.test stays.
   assert.equal(result.results.length, 2);
   assert.equal(result.results[0].title, "A");
   assert.equal(result.results[0].url, "https://a.test");
-  assert.equal(result.results[1].title, "https://b.test");
+  // Title-less history returns an empty title; the client derives a label.
+  assert.equal(result.results[1].title, "");
   assert.equal(result.results[1].url, "https://b.test");
   assert.equal(harness.historySearches[0].text, "x");
-  assert.equal(harness.historySearches[0].maxResults, 6);
+  assert.equal(harness.historySearches[0].maxResults, 20);
   assert.equal(harness.historySearches[0].startTime, 0);
 });
 

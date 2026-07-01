@@ -815,12 +815,102 @@ test("history rows render before the web row", async () => {
 
   const cappedActionRows = Array.from(overlayRoot(cappedHarness).querySelectorAll(".row.action-row"));
   const cappedHistoryRows = cappedActionRows.filter((row) => row.querySelector(".name").textContent !== "Search the web");
-  assert.equal(cappedHistoryRows.length, 5);
+  assert.equal(cappedHistoryRows.length, 3);
   assert.deepEqual(
     cappedHistoryRows.map((row) => row.querySelector(".name").textContent),
-    ["History 1", "History 2", "History 3", "History 4", "History 5"],
+    ["History 1", "History 2", "History 3"],
   );
   assert.equal(cappedActionRows[cappedActionRows.length - 1].querySelector(".name").textContent, "Search the web");
+});
+test("sections label open tabs, history, and search", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-history") {
+      return { ok: true, results: [{ title: "Rust Book", url: "https://doc.rust-lang.org/book/" }] };
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  // "git" matches the GitHub tab, so all three sections are present.
+  await typeTabSearchQuery(harness, "git");
+
+  const headers = Array.from(overlayRoot(harness).querySelectorAll(".divider.section-header")).map(
+    (el) => el.textContent,
+  );
+  assert.deepEqual(headers, ["Open tabs", "History", "Search"]);
+});
+
+test("history entries already open as tabs are dropped", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-history") {
+      // https://github.com is SAMPLE_TABS' GitHub tab -> must be filtered out.
+      return {
+        ok: true,
+        results: [
+          { title: "GitHub", url: "https://github.com" },
+          { title: "Rust Book", url: "https://doc.rust-lang.org/book/" },
+        ],
+      };
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "git");
+
+  const historyRows = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row")).filter(
+    (row) => row.querySelector(".name").textContent !== "Search the web",
+  );
+  assert.deepEqual(
+    historyRows.map((row) => row.querySelector(".name").textContent),
+    ["Rust Book"],
+  );
+});
+
+test("single-char query shows the web row but no history", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-history") {
+      return { ok: true, results: [{ title: "Rust Book", url: "https://doc.rust-lang.org/book/" }] };
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "z");
+
+  const actionRows = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row"));
+  assert.equal(actionRows.length, 1);
+  assert.equal(actionRows[0].querySelector(".name").textContent, "Search the web");
+});
+
+test("title-less history renders a single readable label line", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-history") {
+      return { ok: true, results: [{ title: "", url: "https://youtube.com/" }] };
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "you");
+
+  const historyRow = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row")).find(
+    (row) => row.querySelector(".name").textContent !== "Search the web",
+  );
+  assert.equal(historyRow.querySelector(".name").textContent, "youtube.com");
+  assert.equal(historyRow.querySelector(".url"), null, "no second URL line when the title is derived");
 });
 
 test("empty query shows no action rows", async () => {
