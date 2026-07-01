@@ -191,7 +191,7 @@ test("typing filters the rendered rows", async () => {
   input.value = "git";
   input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
 
-  assert.deepEqual(rowTitles(harness), ["GitHub"]);
+  assert.deepEqual(rowTitles(harness).filter((title) => title !== "Search the web"), ["GitHub"]);
 });
 
 test("group titles are searchable and rendered as badges", async () => {
@@ -219,7 +219,7 @@ test("group titles are searchable and rendered as badges", async () => {
   input.value = "release";
   input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
 
-  assert.deepEqual(rowTitles(harness), ["Issue"]);
+  assert.deepEqual(rowTitles(harness).filter((title) => title !== "Search the web"), ["Issue"]);
   const badge = root.querySelector(".row .group-badge");
   assert.equal(badge.textContent, "Release Train");
   assert.equal(badge.dataset.color, "purple");
@@ -244,12 +244,12 @@ test("rendering is bounded for large tab lists", async () => {
   await settle();
 
   const root = overlayRoot(harness);
-  assert.equal(root.querySelectorAll(".row").length, 50);
+  assert.equal(root.querySelectorAll(".row:not(.action-row)").length, 50);
 
   const input = root.querySelector(".search");
   input.value = "example";
   input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
-  assert.equal(root.querySelectorAll(".row").length, 50);
+  assert.equal(root.querySelectorAll(".row:not(.action-row)").length, 50);
 });
 
 test("Enter activates the selected tab and closes the overlay", async () => {
@@ -329,7 +329,9 @@ test("tabsearch-open message from the command relay opens the overlay", async ()
 
 test("extension-hosted tabsearch page opens the overlay on load", async () => {
   const harness = createHarness({ url: "moz-extension://tab-lens/tabsearch.html?tabsearchOpen=1" });
-  await settle();
+  for (let i = 0; i < 20 && !overlayRoot(harness); i += 1) {
+    await settle();
+  }
 
   assert.ok(overlayRoot(harness));
   assert.deepEqual(rowTitles(harness), ["Docs", "GitHub", "Mozilla"]);
@@ -742,4 +744,183 @@ test("typing in the overlay does not leak key events to the host page (focus-ste
   input.dispatchEvent(event);
 
   assert.equal(pageSawKey, false, "the host page never sees the keystroke while the overlay is open");
+});
+
+async function typeTabSearchQuery(harness, query) {
+  const input = overlayRoot(harness).querySelector(".search");
+  input.value = query;
+  input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  await settle();
+}
+
+test("web fallback row always appears for a non-empty query", async () => {
+  const harness = createHarness();
+  const query = "zzzznotab";
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, query);
+
+  const root = overlayRoot(harness);
+  const renderedRows = Array.from(root.querySelectorAll(".row"));
+  const lastRow = renderedRows[renderedRows.length - 1];
+  assert.equal(root.querySelectorAll(".row:not(.action-row)").length, 0, "no tabs match the query");
+  assert.ok(lastRow.classList.contains("action-row"), "the last rendered row is an action row");
+  assert.equal(lastRow.querySelector(".name").textContent, "Search the web");
+  assert.match(lastRow.querySelector(".url").textContent, new RegExp(query));
+  assert.ok(
+    Array.from(root.querySelectorAll(".row.action-row")).some(
+      (row) => row.querySelector(".name").textContent === "Search the web" && row.querySelector(".url").textContent.includes(query),
+    ),
+    "a web action row is rendered even when no tabs match",
+  );
+});
+
+test("history rows render before the web row", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-history") {
+      return { ok: true, results: [{ title: "Rust Book", url: "https://doc.rust-lang.org/book/" }] };
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "rust");
+
+  const actionRows = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row"));
+  assert.equal(actionRows.length, 2);
+  assert.equal(actionRows[0].querySelector(".name").textContent, "Rust Book");
+  assert.equal(actionRows[0].querySelector(".url").textContent, "https://doc.rust-lang.org/book/");
+  assert.equal(actionRows[1].querySelector(".name").textContent, "Search the web");
+
+  const manyHistoryResults = Array.from({ length: 8 }, (_, index) => ({
+    title: `History ${index + 1}`,
+    url: `https://example.com/history/${index + 1}`,
+  }));
+  const cappedHarness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-history") return { ok: true, results: manyHistoryResults };
+      return undefined;
+    },
+  });
+  pressCtrlS(cappedHarness);
+  await settle();
+
+  await typeTabSearchQuery(cappedHarness, "rust");
+
+  const cappedActionRows = Array.from(overlayRoot(cappedHarness).querySelectorAll(".row.action-row"));
+  const cappedHistoryRows = cappedActionRows.filter((row) => row.querySelector(".name").textContent !== "Search the web");
+  assert.equal(cappedHistoryRows.length, 5);
+  assert.deepEqual(
+    cappedHistoryRows.map((row) => row.querySelector(".name").textContent),
+    ["History 1", "History 2", "History 3", "History 4", "History 5"],
+  );
+  assert.equal(cappedActionRows[cappedActionRows.length - 1].querySelector(".name").textContent, "Search the web");
+});
+
+test("empty query shows no action rows", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  assert.equal(overlayRoot(harness).querySelectorAll(".row.action-row").length, 0);
+});
+
+test("activating the web row sends tabsearch-web-search and closes", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "foo");
+
+  const webRow = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row")).find(
+    (row) => row.querySelector(".name").textContent === "Search the web",
+  );
+  webRow.click();
+  await settle();
+
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-web-search")), {
+    type: "tabsearch-web-search",
+    query: "foo",
+  });
+  assert.equal(overlayRoot(harness), null, "overlay closed after web search activation");
+});
+
+test("activating a history row sends tabsearch-open-url with the url", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-history") {
+      return { ok: true, results: [{ title: "Rust Book", url: "https://doc.rust-lang.org/book/" }] };
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "rust");
+
+  const historyRow = Array.from(overlayRoot(harness).querySelectorAll(".row.action-row")).find(
+    (row) => row.querySelector(".name").textContent === "Rust Book",
+  );
+  historyRow.click();
+  await settle();
+
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-open-url")), {
+    type: "tabsearch-open-url",
+    url: "https://doc.rust-lang.org/book/",
+  });
+});
+
+test("action rows are not markable", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-history") {
+      return { ok: true, results: [{ title: "Rust Book", url: "https://doc.rust-lang.org/book/" }] };
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "rust");
+
+  const root = overlayRoot(harness);
+  const actionRows = Array.from(root.querySelectorAll(".row.action-row"));
+  assert.equal(actionRows.length, 2);
+  assert.equal(root.querySelectorAll(".row.action-row .mark").length, 0, "action rows do not render mark checkboxes");
+  assert.equal(root.querySelectorAll(".row.marked").length, 0);
+
+  const webRow = actionRows.find((row) => row.querySelector(".name").textContent === "Search the web");
+  webRow.dispatchEvent(new harness.window.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+  await settle();
+
+  assert.equal(root.querySelectorAll(".row.marked").length, 0, "Ctrl-click did not mark an action row");
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-web-search")), {
+    type: "tabsearch-web-search",
+    query: "rust",
+  });
+});
+
+test("Enter on the web row activates it", async () => {
+  const harness = createHarness();
+  pressCtrlS(harness);
+  await settle();
+
+  await typeTabSearchQuery(harness, "foo");
+  assert.equal(overlayRoot(harness).querySelectorAll(".row.action-row").length, 1);
+
+  pressKey(harness, "Enter");
+  await settle();
+
+  assert.deepEqual(plain(harness.sent.find((message) => message.type === "tabsearch-web-search")), {
+    type: "tabsearch-web-search",
+    query: "foo",
+  });
 });

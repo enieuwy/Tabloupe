@@ -54,6 +54,10 @@ function createHarness({
   deferFirstGroupUpdate = false,
   failTabMessage = false,
   fetchHandler = null,
+  history = [],
+  failSearch = false,
+  noHistoryApi = false,
+  noSearchApi = false,
 } = {}) {
   const storageData = clone(storage) || {};
   const groupState = clone(groups);
@@ -74,11 +78,15 @@ function createHarness({
   const groupCreations = [];
   const windowUpdates = [];
   const removedTabs = [];
+  const tabCreations = [];
   const tabMessages = [];
   const commandListeners = [];
   const tabCreatedListeners = [];
   const tabUpdatedListeners = [];
   const fetchCalls = [];
+  const historySearches = [];
+  const searchQueries = [];
+  let historyResults = history;
   const timers = new Map();
   const consoleErrors = [];
   const consoleWarnings = [];
@@ -250,6 +258,10 @@ function createHarness({
           return true;
         }));
       },
+      async create(props) {
+        tabCreations.push(clone(props));
+        return { id: 999, ...props };
+      },
       async update(id, patch) {
         const tab = tabState.find((candidate) => candidate.id === id);
         assert.ok(tab, `tab ${id} exists`);
@@ -345,6 +357,24 @@ function createHarness({
     },
   };
 
+  if (!noHistoryApi) {
+    browser.history = {
+      async search(query) {
+        historySearches.push(clone(query));
+        return historyResults;
+      },
+    };
+  }
+
+  if (!noSearchApi) {
+    browser.search = {
+      async query(props) {
+        searchQueries.push(clone(props));
+        if (failSearch) throw new Error("no engine");
+      },
+    };
+  }
+
   class FakeWebSocket {
     static CLOSED = 3;
     static OPEN = 1;
@@ -425,7 +455,10 @@ function createHarness({
     firstGroupUpdate,
     windowUpdates,
     removedTabs,
+    tabCreations,
     tabMessages,
+    historySearches,
+    searchQueries,
     commandListeners,
     tabCreatedListeners,
     tabUpdatedListeners,
@@ -1525,6 +1558,92 @@ test("tabsearch-discard marks selected tabs discarded", async () => {
 
   assert.equal(harness.tabState.find((tab) => tab.id === 20).discarded, true);
   assert.equal(harness.tabState.find((tab) => tab.id === 30).discarded, true);
+});
+
+test("tabsearch-history returns deduped mapped results", async () => {
+  const harness = createHarness({
+    history: [
+      { title: "A", url: "https://a.test" },
+      { title: "", url: "https://b.test" },
+      { title: "Dup", url: "https://a.test" },
+      { title: "NoUrl" },
+    ],
+  });
+
+  const result = await harness.messageListeners[0]({ type: "tabsearch-history", query: "x" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.results.length, 2);
+  assert.equal(result.results[0].title, "A");
+  assert.equal(result.results[0].url, "https://a.test");
+  assert.equal(result.results[1].title, "https://b.test");
+  assert.equal(result.results[1].url, "https://b.test");
+  assert.equal(harness.historySearches[0].text, "x");
+  assert.equal(harness.historySearches[0].maxResults, 6);
+  assert.equal(harness.historySearches[0].startTime, 0);
+});
+
+test("tabsearch-history returns ok:false for blank query without calling history", async () => {
+  const harness = createHarness();
+
+  const result = await harness.messageListeners[0]({ type: "tabsearch-history", query: "  " });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.results.length, 0);
+  assert.equal(harness.historySearches.length, 0);
+});
+
+test("tabsearch-history returns ok:false when history api missing", async () => {
+  const harness = createHarness({ noHistoryApi: true });
+
+  const result = await harness.messageListeners[0]({ type: "tabsearch-history", query: "x" });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.results.length, 0);
+});
+
+test("tabsearch-web-search calls search.query with NEW_TAB disposition", async () => {
+  const harness = createHarness();
+
+  const result = await harness.messageListeners[0]({ type: "tabsearch-web-search", query: "cats" });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.searchQueries[0].query, "cats");
+  assert.equal(harness.searchQueries[0].disposition, "NEW_TAB");
+});
+
+test("tabsearch-web-search returns ok:false on blank query and when api missing/throws", async () => {
+  const blankHarness = createHarness();
+  const blankResult = await blankHarness.messageListeners[0]({ type: "tabsearch-web-search", query: "  " });
+  assert.equal(blankResult.ok, false);
+  assert.equal(blankHarness.searchQueries.length, 0);
+
+  const missingHarness = createHarness({ noSearchApi: true });
+  const missingResult = await missingHarness.messageListeners[0]({ type: "tabsearch-web-search", query: "cats" });
+  assert.equal(missingResult.ok, false);
+
+  const failingHarness = createHarness({ failSearch: true });
+  const failingResult = await failingHarness.messageListeners[0]({ type: "tabsearch-web-search", query: "cats" });
+  assert.equal(failingResult.ok, false);
+});
+
+test("tabsearch-open-url creates a new active tab", async () => {
+  const harness = createHarness();
+
+  const result = await harness.messageListeners[0]({ type: "tabsearch-open-url", url: "https://x.test" });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.tabCreations[0].url, "https://x.test");
+  assert.equal(harness.tabCreations[0].active, true);
+});
+
+test("tabsearch-open-url returns ok:false for empty url", async () => {
+  const harness = createHarness();
+
+  const result = await harness.messageListeners[0]({ type: "tabsearch-open-url", url: "" });
+
+  assert.equal(result.ok, false);
+  assert.equal(harness.tabCreations.length, 0);
 });
 
 test("tabsearch-ai-preview clusters the selected tab subset", async () => {
