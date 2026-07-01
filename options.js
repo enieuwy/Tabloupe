@@ -447,6 +447,15 @@ const CHEVRON_ICON =
   'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<path d="M6 9l6 6 6-6"/></svg>';
 
+function trustedHTMLNodes(markup) {
+  const parsed = new DOMParser().parseFromString(markup, "text/html");
+  return Array.from(parsed.body.childNodes, (node) => document.importNode(node, true));
+}
+
+function replaceChildrenWithTrustedHTML(element, markup) {
+  element.replaceChildren(...trustedHTMLNodes(markup));
+}
+
 // ── Focus catalog fallback (bundled) ──
 // MCC is the source of truth: it broadcasts id -> {name, icon, color}, which we
 // cache in storage (state.focusCatalog) and prefer here. This bundled table is
@@ -488,10 +497,13 @@ function makeFocusIcon(iconName, color) {
   wrap.className = "focus-icon";
   wrap.setAttribute("aria-hidden", "true");
   if (color) wrap.style.color = color;
-  wrap.innerHTML =
+  replaceChildrenWithTrustedHTML(
+    wrap,
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" ' +
-    'stroke-linecap="round" stroke-linejoin="round">' +
-    (FOCUS_ICON_PATHS[iconName] || FOCUS_ICON_PATHS.target) + "</svg>";
+      'stroke-linecap="round" stroke-linejoin="round">' +
+      (FOCUS_ICON_PATHS[iconName] || FOCUS_ICON_PATHS.target) +
+      "</svg>"
+  );
   return wrap;
 }
 
@@ -1295,14 +1307,14 @@ function renderLensCard(lens, index) {
   optionsBtn.setAttribute("aria-expanded", String(optionsOpen));
   optionsBtn.title = "Advanced";
   optionsBtn.setAttribute("aria-label", `Advanced options for ${lens.name}`);
-  optionsBtn.innerHTML = CHEVRON_ICON;
+  replaceChildrenWithTrustedHTML(optionsBtn, CHEVRON_ICON);
 
   const remove = document.createElement("button");
   remove.type = "button";
   remove.className = "icon-btn";
   remove.title = "Delete this lens";
   remove.setAttribute("aria-label", `Delete lens ${lens.name}`);
-  remove.innerHTML = TRASH_ICON;
+  replaceChildrenWithTrustedHTML(remove, TRASH_ICON);
   remove.addEventListener("click", () => deleteLens(lens.id));
   actions.append(showButton, orderActions, optionsBtn, remove);
   header.append(actions);
