@@ -2266,7 +2266,7 @@ test("auto-group: a tab event triggers a silent grouping", async () => {
     },
   });
   await settle();
-  await harness.context.setFocusBadge({ text: "W", color: "#00C853", title: "Tab Lens: Work" });
+  await harness.context.setFocusBadge({ text: "W", color: "#00C853", title: "Tabloupe: Work" });
 
   await harness.fireTabCreated({ windowId: 1 });
   const entry = findDebounceTimer(harness);

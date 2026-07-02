@@ -2324,7 +2324,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   loadAll().catch((error) => {
-    console.error("Tab Lens options load failed:", error);
+    console.error("Tabloupe options load failed:", error);
     setStatus("Load failed. See extension console for details.", "error");
   });
 });

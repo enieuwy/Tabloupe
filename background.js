@@ -39,7 +39,7 @@ const NOTIFICATION_LIST_MAX = 12;
 const LEGACY_MAP_KEY = "focus" + "Mappings";
 
 let lastAppliedAppleFocusId = null;
-let focusBadge = { text: "", color: null, title: "Tab Lens" };
+let focusBadge = { text: "", color: null, title: "Tabloupe" };
 const transientViewsByWindow = new Map();
 let lastError = null;
 let socket = null;
@@ -496,7 +496,7 @@ async function findLensForAppleFocusId(rawId) {
 
 async function notifyUnboundAppleFocus(rawId) {
   const focusName = await focusDisplayName(rawId);
-  await setFocusBadge({ text: "?", color: "#D50000", title: `Tab Lens: ${focusName}` });
+  await setFocusBadge({ text: "?", color: "#D50000", title: `Tabloupe: ${focusName}` });
   await browser.storage.local.set({
     ...CLEAR_ACTION_DIAGNOSTICS,
     lastAction: "unmapped_focus_id",
@@ -504,7 +504,7 @@ async function notifyUnboundAppleFocus(rawId) {
   });
   await notify({
     type: "basic",
-    title: "Tab Lens",
+    title: "Tabloupe",
     message: `Unbound automation mode ${focusName} — open options to bind it to a lens`,
   }, `${OPTIONS_NOTIFICATION_PREFIX}${rawId}`);
 }
@@ -979,7 +979,7 @@ async function refreshBadge() {
     if (lastError) {
       await browser.browserAction.setBadgeText({ text: "!" });
       await browser.browserAction.setBadgeBackgroundColor({ color: "#B71C1C" });
-      await browser.browserAction.setTitle({ title: `Tab Lens — ${lastError.message}` });
+      await browser.browserAction.setTitle({ title: `Tabloupe — ${lastError.message}` });
       return;
     }
     const badge = focusBadge || {};
@@ -988,7 +988,7 @@ async function refreshBadge() {
     if (badge.color) {
       await browser.browserAction.setBadgeBackgroundColor({ color: badge.color });
     }
-    await browser.browserAction.setTitle({ title: badge.title || "Tab Lens" });
+    await browser.browserAction.setTitle({ title: badge.title || "Tabloupe" });
   } catch (error) {
     console.error("Badge error:", error);
   }
@@ -998,7 +998,7 @@ async function setFocusBadge(badge) {
   focusBadge = {
     text: typeof badge.text === "string" ? badge.text : "",
     color: badge.color || null,
-    title: badge.title || "Tab Lens",
+    title: badge.title || "Tabloupe",
   };
   await refreshBadge();
 }
@@ -1196,7 +1196,7 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
       updateFailures,
     });
     if (persist) {
-      await setFocusBadge({ text: "", color: null, title: "Tab Lens" });
+      await setFocusBadge({ text: "", color: null, title: "Tabloupe" });
       await rememberActivatedView(resolved.view, activation);
     }
     return { ok: true, expandedGroups: allGroups.map((group) => group.title), collapsedGroups: [], updateFailures };
@@ -1225,7 +1225,7 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
       updateFailures,
     });
     if (persist) {
-      await setFocusBadge({ text: "!", color: "#FF9800", title: `Tab Lens: ${resolved.name}` });
+      await setFocusBadge({ text: "!", color: "#FF9800", title: `Tabloupe: ${resolved.name}` });
       await rememberActivatedView(resolved.view, activation);
     }
     return { ok: true, expandedGroups: allGroups.map((group) => group.title), collapsedGroups: [], updateFailures };
@@ -1267,7 +1267,7 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
     await setFocusBadge({
       text: updateFailures.length === 0 ? resolved.badgeText : "!",
       color: updateFailures.length === 0 ? resolved.badgeColor : "#FF9800",
-      title: `Tab Lens: ${resolved.name}`,
+      title: `Tabloupe: ${resolved.name}`,
     });
     await rememberActivatedView(resolved.view, activation);
   }
@@ -1310,7 +1310,7 @@ async function activateWithWindowProfiles(resolved, activation) {
   await setFocusBadge({
     text: aggregate.updateFailures.length === 0 ? resolved.badgeText : "!",
     color: aggregate.updateFailures.length === 0 ? resolved.badgeColor : "#FF9800",
-    title: `Tab Lens: ${resolved.name}`,
+    title: `Tabloupe: ${resolved.name}`,
   });
   await rememberActivatedView(resolved.view, activation);
   return true;
