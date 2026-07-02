@@ -125,7 +125,7 @@ test("popup renders the active lens from lens-state", async () => {
   });
   await settle();
 
-  assert.equal(harness.document.querySelector("h1").textContent, "Tab Lens");
+  assert.equal(harness.document.querySelector("h1").textContent, "Tabloupe");
   assert.equal(harness.document.getElementById("lens-showing").textContent, "Showing: Work");
   const stateMsg = harness.sent.find((message) => message.type === "lens-state");
   assert.equal(stateMsg.windowId, 7);
@@ -272,7 +272,7 @@ test("empty state renders when there are no groups and no lenses", async () => {
 
   const empty = harness.document.getElementById("empty-state");
   assert.equal(empty.hidden, false);
-  assert.match(empty.textContent, /Tab Lens works with Firefox tab groups/);
+  assert.match(empty.textContent, /Tabloupe works with Firefox tab groups/);
   assert.match(empty.textContent, /Organize tabs/);
 });
 

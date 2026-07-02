@@ -1,5 +1,5 @@
 {
-  "name": "focus-tab-groups",
+  "name": "tabloupe",
   "version": "1.0.0",
   "description": "",
   "main": "background.js",
@@ -15,7 +15,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://forgejo.nieuwy.com/ellis/focus-tab-groups.git"
+    "url": "https://github.com/enieuwy/Tabloupe.git"
   },
   "keywords": [],
   "author": "",

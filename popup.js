@@ -364,7 +364,7 @@ async function refreshLensState() {
     renderLensState(state || {});
   } catch (error) {
     console.error("Lens state failed:", error);
-    setLensStatus("Could not load Tab Lens state.", "error");
+    setLensStatus("Could not load Tabloupe state.", "error");
   }
 }
 
