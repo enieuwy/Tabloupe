@@ -1783,8 +1783,6 @@ function renderActivity() {
 }
 
 function exportSettings() {
-  const provider = isRecord(state.aiProvider) ? { ...state.aiProvider } : { kind: "foundation" };
-  delete provider.apiKey;
   const payload = {
     schemaVersion: 2,
     exportedAt: new Date().toISOString(),
@@ -1793,7 +1791,6 @@ function exportSettings() {
     automationFallback: state.automationFallback,
     lensSchedules: state.lensSchedules,
     tabSearchShortcut: state.tabSearchShortcut,
-    aiProvider: provider,
     aiGroupingPrompt: state.aiGroupingPrompt,
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -1817,11 +1814,14 @@ async function importSettingsFile(file) {
   if (hasOwn(parsed, "automationFallback") && isRecord(parsed.automationFallback)) values.automationFallback = parsed.automationFallback;
   if (hasOwn(parsed, "lensSchedules")) values.lensSchedules = normalizeLensSchedules(parsed.lensSchedules);
   if (hasOwn(parsed, "tabSearchShortcut")) values.tabSearchShortcut = normalizeShortcut(parsed.tabSearchShortcut);
-  if (hasOwn(parsed, "aiProvider")) values.aiProvider = normalizeProvider(parsed.aiProvider);
   if (hasOwn(parsed, "aiGroupingPrompt")) values.aiGroupingPrompt = normalizeGroupingPrompt(parsed.aiGroupingPrompt);
   await browser.storage.local.set(values);
   await loadAll();
-  showToast("Settings imported.", "success");
+  if (hasOwn(parsed, "aiProvider")) {
+    showToast("Settings imported. AI provider settings are managed in AI tab grouping and are not imported.", "success");
+  } else {
+    showToast("Settings imported.", "success");
+  }
 }
 
 
@@ -2197,13 +2197,19 @@ async function saveProvider() {
     showToast("Enter both an API base URL and a model.", "error");
     return;
   }
-  let origin;
+  let parsed;
   try {
-    origin = new URL(baseURL).origin;
+    parsed = new URL(baseURL);
   } catch (error) {
     showToast("That base URL is not valid.", "error");
     return;
   }
+  const loopbackHosts = ["localhost", "127.0.0.1", "[::1]"];
+  if (parsed.protocol !== "https:" && !loopbackHosts.includes(parsed.hostname)) {
+    showToast("Use an https:// URL. Plain http is only allowed for localhost.", "error");
+    return;
+  }
+  const origin = parsed.origin;
 
 
   let granted;

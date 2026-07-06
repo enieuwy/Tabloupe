@@ -72,6 +72,14 @@ function createHarness({ tabs = SAMPLE_TABS, respond, shortcut, url = "https://h
     runScripts: "dangerously",
     beforeParse(window) {
       window.browser = browser;
+      // The overlay uses a closed shadow root, so host.shadowRoot is null.
+      // Capture the returned root so overlayRoot() can still inspect the UI.
+      const attachShadow = window.Element.prototype.attachShadow;
+      window.Element.prototype.attachShadow = function (init) {
+        const root = attachShadow.call(this, init);
+        Object.defineProperty(this, "__shadowRoot", { value: root, configurable: true });
+        return root;
+      };
     },
   });
   const scriptEl = dom.window.document.createElement("script");
@@ -95,7 +103,7 @@ function createHarness({ tabs = SAMPLE_TABS, respond, shortcut, url = "https://h
 
 function overlayRoot(harness) {
   const hostEl = harness.document.getElementById("focus-tab-search-overlay");
-  return hostEl ? hostEl.shadowRoot : null;
+  return hostEl ? hostEl.shadowRoot || hostEl.__shadowRoot || null : null;
 }
 
 function rowTitles(harness) {
@@ -119,6 +127,17 @@ function plain(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+// jsdom marks scripted events isTrusted:false, but the overlay's onGlobalKeydown
+// gate only opens on trusted events. dispatchEvent() spec-resets isTrusted to
+// false, so override the accessor on jsdom's impl slot to report a trusted event.
+function markTrusted(event) {
+  const implSym = Object.getOwnPropertySymbols(event).find((s) => s.toString() === "Symbol(impl)");
+  if (implSym) {
+    Object.defineProperty(event[implSym], "isTrusted", { get: () => true, set: () => {}, configurable: true });
+  }
+  return event;
+}
+
 function pressCtrlS(harness) {
   const event = new harness.window.KeyboardEvent("keydown", {
     key: "s",
@@ -126,7 +145,7 @@ function pressCtrlS(harness) {
     bubbles: true,
     cancelable: true,
   });
-  harness.document.body.dispatchEvent(event);
+  harness.document.body.dispatchEvent(markTrusted(event));
 }
 
 function pressKey(harness, key, init = {}) {
@@ -155,7 +174,7 @@ function pressCombo(harness, combo) {
     bubbles: true,
     cancelable: true,
   });
-  harness.document.body.dispatchEvent(event);
+  harness.document.body.dispatchEvent(markTrusted(event));
 }
 
 test("filterTabs AND-matches tokens across the precomputed title/url/group haystack", () => {
@@ -1112,4 +1131,80 @@ test("opening the overlay focuses the search input", async () => {
   const root = overlayRoot(harness);
   assert.ok(root, "overlay is open");
   assert.equal(root.activeElement, root.querySelector(".search"), "the search input holds focus");
+});
+
+// ── Regression: URL scheme allowlist, trusted-keydown gate, standalone close ──
+
+test("parseQueryAsUrl allows only http(s), rejecting dangerous schemes", () => {
+  const { window } = createHarness();
+
+  assert.equal(window.parseQueryAsUrl("javascript://x"), null);
+  assert.equal(window.parseQueryAsUrl("file:///etc/passwd"), null);
+  assert.equal(window.parseQueryAsUrl("data:text/html,x"), null);
+  assert.equal(window.parseQueryAsUrl("moz-extension://abc/"), null);
+  assert.equal(window.parseQueryAsUrl("HTTPS://A.COM"), "https://a.com/");
+});
+
+test("an untrusted shortcut keydown does not open the overlay", async () => {
+  const harness = createHarness();
+
+  // A page-dispatched (untrusted) synthetic event must be ignored by the gate.
+  const untrusted = new harness.window.KeyboardEvent("keydown", {
+    key: "s",
+    ctrlKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  harness.document.body.dispatchEvent(untrusted);
+  await settle();
+  assert.equal(overlayRoot(harness), null, "untrusted keydown must not open the overlay");
+
+  // The same shortcut from a trusted keystroke opens it.
+  pressCtrlS(harness);
+  await settle();
+  assert.ok(overlayRoot(harness), "trusted keydown opens the overlay");
+});
+
+test("closing the overlay on the standalone page closes its tab", async () => {
+  const harness = createHarness({ url: "moz-extension://tab-lens/tabsearch.html" });
+  pressCtrlS(harness);
+  await settle();
+  assert.ok(overlayRoot(harness), "overlay open on the standalone page");
+
+  let closeCalls = 0;
+  harness.window.close = () => { closeCalls += 1; };
+  const removed = [];
+  harness.browser.tabs = {
+    async getCurrent() { return { id: 77 }; },
+    async remove(id) { removed.push(id); },
+  };
+
+  pressKey(harness, "Escape");
+  await settle();
+
+  assert.equal(overlayRoot(harness), null);
+  assert.equal(closeCalls, 1);
+  assert.deepEqual(removed, [77]);
+});
+
+test("closing the overlay on a normal page never closes the tab", async () => {
+  const harness = createHarness({ url: "https://host.example/" });
+  pressCtrlS(harness);
+  await settle();
+  assert.ok(overlayRoot(harness));
+
+  let closeCalls = 0;
+  harness.window.close = () => { closeCalls += 1; };
+  const removed = [];
+  harness.browser.tabs = {
+    async getCurrent() { return { id: 77 }; },
+    async remove(id) { removed.push(id); },
+  };
+
+  pressKey(harness, "Escape");
+  await settle();
+
+  assert.equal(overlayRoot(harness), null);
+  assert.equal(closeCalls, 0);
+  assert.deepEqual(removed, []);
 });

@@ -1,6 +1,10 @@
 const WS_URL = "ws://127.0.0.1:8767";
 const MIN_RECONNECT_MS = 1000;
-const MAX_RECONNECT_MS = 30000;
+// Cap the alarm-backed retry at 10 minutes: while the optional daemon is
+// offline, a 1-minute alarm would wake the suspended event page forever
+// (battery drain). Every wake also calls connect() from start(), and any
+// popup/options interaction wakes the page, so recovery stays prompt.
+const MAX_RECONNECT_MS = 600000;
 const MIN_RECONNECT_ALARM_MINUTES = 1;
 const OPTIONS_NOTIFICATION_PREFIX = "focus-unmapped-";
 // On-device FoundationModels can take ~1s/tab; a busy window easily exceeds 60s.
@@ -38,7 +42,10 @@ const NOTIFICATION_LIST_MAX = 12;
 
 const LEGACY_MAP_KEY = "focus" + "Mappings";
 
-let lastAppliedAppleFocusId = null;
+// Which Apple Focus id automation last applied. Persisted in storage.local
+// (not memory) so a focus-off arriving after the event page suspended, or a
+// stale same-id replay on reconnect, is still handled correctly.
+const LAST_APPLIED_APPLE_FOCUS_KEY = "lastAppliedAppleFocusId";
 let focusBadge = { text: "", color: null, title: "Tabloupe" };
 const transientViewsByWindow = new Map();
 let lastError = null;
@@ -67,12 +74,72 @@ const autoGroupCooldown = new Set();
 const autoGroupInflight = new Set();
 const windowProfileOverrides = new Map();
 
+// Per-window ephemeral view state (transient views, automation overrides).
+// windowIds are only stable within one browser session, so this is mirrored
+// to storage.session: it survives event-page suspension but is cleared on
+// browser exit. Falls back to memory-only where storage.session is missing.
+const sessionStore = typeof browser !== "undefined" && browser.storage && browser.storage.session
+  ? browser.storage.session
+  : null;
+const SESSION_WINDOW_STATE_KEY = "windowViewState";
+
+async function loadSessionWindowState() {
+  if (!sessionStore) {
+    return;
+  }
+  try {
+    const stored = await sessionStore.get(SESSION_WINDOW_STATE_KEY);
+    const state = isRecord(stored[SESSION_WINDOW_STATE_KEY]) ? stored[SESSION_WINDOW_STATE_KEY] : {};
+    const transientViews = isRecord(state.transientViews) ? state.transientViews : {};
+    for (const [key, view] of Object.entries(transientViews)) {
+      const windowId = Number(key);
+      if (Number.isInteger(windowId) && isRecord(view) && view.kind === "transient") {
+        transientViewsByWindow.set(windowId, view);
+      }
+    }
+    const windowProfiles = isRecord(state.windowProfiles) ? state.windowProfiles : {};
+    for (const [key, profile] of Object.entries(windowProfiles)) {
+      const windowId = Number(key);
+      const normalized = normalizeWindowProfile(profile);
+      if (Number.isInteger(windowId) && normalized.kind !== "default") {
+        windowProfileOverrides.set(windowId, normalized);
+      }
+    }
+  } catch (error) {
+    console.error("Session window state load error:", error);
+  }
+}
+
+function persistSessionWindowState() {
+  if (!sessionStore) {
+    return;
+  }
+  const state = { transientViews: {}, windowProfiles: {} };
+  for (const [windowId, view] of transientViewsByWindow) {
+    state.transientViews[windowId] = view;
+  }
+  for (const [windowId, profile] of windowProfileOverrides) {
+    state.windowProfiles[windowId] = profile;
+  }
+  sessionStore.set({ [SESSION_WINDOW_STATE_KEY]: state }).catch((error) => {
+    console.error("Session window state save error:", error);
+  });
+}
+
+const sessionStateReady = loadSessionWindowState();
+
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function hasOwn(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+// Externally-supplied ids (Apple Focus ids from the daemon) are used as plain
+// object keys in storage; never let them name prototype machinery.
+function isUnsafeKey(key) {
+  return key === "__proto__" || key === "constructor" || key === "prototype";
 }
 
 // A focus maps to a list of tab-group titles. An empty list means "seen but
@@ -125,6 +192,10 @@ function scheduleReconnect() {
 async function recordSeen(rawId) {
   if (rawId === null) {
     await browser.storage.local.set({ lastFocusSeen: null });
+    return;
+  }
+
+  if (isUnsafeKey(rawId)) {
     return;
   }
 
@@ -278,12 +349,14 @@ async function handleWindowProfileSet(message) {
   if (!message || typeof message.windowId !== "number") {
     return { ok: false, error: "missing_window" };
   }
+  await sessionStateReady;
   const profile = normalizeWindowProfile(message.profile);
   if (profile.kind === "default") {
     windowProfileOverrides.delete(message.windowId);
   } else {
     windowProfileOverrides.set(message.windowId, profile);
   }
+  persistSessionWindowState();
   return { ok: true, profile: getWindowProfile(message.windowId) };
 }
 
@@ -324,11 +397,46 @@ function scheduleMatchesNow(schedule, now = new Date()) {
   return start <= end ? current >= start && current < end : current >= start || current < end;
 }
 
+// A matching schedule fires only when nothing has activated a view since the
+// schedule window opened: the first tick inside the window applies the lens
+// once, and any later manual/automation switch wins for the rest of the
+// window. Without this edge-trigger the minute tick would yank the user back
+// and overwrite lastActivation.at, destroying session history durations.
+function scheduleWindowStartMs(schedule, now) {
+  const start = minutesForTime(schedule.start);
+  const end = minutesForTime(schedule.end);
+  const current = now.getHours() * 60 + now.getMinutes();
+  const startDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (start > end && current < end) {
+    // Overnight window entered yesterday.
+    startDay.setDate(startDay.getDate() - 1);
+  }
+  return startDay.getTime() + start * 60000;
+}
+
 async function handleScheduleTick(now = new Date()) {
   const schedules = await getLensSchedules();
   const match = schedules.find((schedule) => scheduleMatchesNow(schedule, now));
-  if (match) {
-    await activateView({ kind: "lens", lensId: match.lensId }, { trigger: "schedule", triggerId: match.lensId });
+  if (!match) {
+    return;
+  }
+  const stored = await browser.storage.local.get("lastActivation");
+  const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
+  if (typeof lastActivation.at === "number" && lastActivation.at >= scheduleWindowStartMs(match, now)) {
+    return;
+  }
+  await activateView({ kind: "lens", lensId: match.lensId }, { trigger: "schedule", triggerId: match.lensId });
+}
+
+// The minute tick only exists while at least one schedule is enabled; an
+// unconditional periodic alarm would wake the event page forever for a
+// feature most installs never opt into.
+async function syncScheduleAlarm() {
+  const schedules = await getLensSchedules();
+  if (schedules.some((schedule) => schedule.enabled)) {
+    browser.alarms.create(SCHEDULE_ALARM_NAME, { periodInMinutes: 1 });
+  } else {
+    browser.alarms.clear(SCHEDULE_ALARM_NAME);
   }
 }
 
@@ -465,7 +573,7 @@ async function mergeFocusCatalog(entries) {
   const catalog = isRecord(stored.focusCatalog) ? { ...stored.focusCatalog } : {};
   let changed = false;
   for (const [id, entry] of Object.entries(entries)) {
-    if (typeof id === "string" && isRecord(entry) && typeof entry.name === "string") {
+    if (typeof id === "string" && !isUnsafeKey(id) && isRecord(entry) && typeof entry.name === "string") {
       catalog[id] = {
         name: entry.name,
         icon: typeof entry.icon === "string" ? entry.icon : "target",
@@ -485,7 +593,7 @@ async function focusDisplayName(rawId) {
   }
   const stored = await browser.storage.local.get("focusCatalog");
   const catalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
-  const entry = catalog[rawId];
+  const entry = hasOwn(catalog, rawId) ? catalog[rawId] : undefined;
   return entry && typeof entry.name === "string" && entry.name ? entry.name : rawId;
 }
 
@@ -509,9 +617,15 @@ async function notifyUnboundAppleFocus(rawId) {
   }, `${OPTIONS_NOTIFICATION_PREFIX}${rawId}`);
 }
 
+async function getLastAppliedAppleFocusId() {
+  const stored = await browser.storage.local.get(LAST_APPLIED_APPLE_FOCUS_KEY);
+  const value = stored[LAST_APPLIED_APPLE_FOCUS_KEY];
+  return typeof value === "string" ? value : null;
+}
+
 async function handleAppleFocusOff() {
-  const triggerId = lastAppliedAppleFocusId;
-  lastAppliedAppleFocusId = null;
+  const triggerId = await getLastAppliedAppleFocusId();
+  await browser.storage.local.set({ [LAST_APPLIED_APPLE_FOCUS_KEY]: null });
   if (typeof triggerId !== "string") {
     return;
   }
@@ -528,9 +642,9 @@ async function handleAppleFocus(rawId) {
     await handleAppleFocusOff();
     return;
   }
-  const stored = await browser.storage.local.get("lastActivation");
+  const stored = await browser.storage.local.get(["lastActivation", LAST_APPLIED_APPLE_FOCUS_KEY]);
   const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
-  if (rawId === lastAppliedAppleFocusId && lastActivation.trigger === "manual") {
+  if (rawId === stored[LAST_APPLIED_APPLE_FOCUS_KEY] && lastActivation.trigger === "manual") {
     return;
   }
   const lens = await findLensForAppleFocusId(rawId);
@@ -540,7 +654,7 @@ async function handleAppleFocus(rawId) {
   }
   const applied = await activateView({ kind: "lens", lensId: lens.id }, { trigger: "appleFocus", triggerId: rawId });
   if (applied !== false) {
-    lastAppliedAppleFocusId = rawId;
+    await browser.storage.local.set({ [LAST_APPLIED_APPLE_FOCUS_KEY]: rawId });
   }
 }
 
@@ -615,6 +729,7 @@ async function connect() {
 }
 
 async function handleLensState(windowId) {
+  await sessionStateReady;
   const [lenses, persistedActiveView, stored, aiEnabled] = await Promise.all([
     getLenses(),
     getActiveView(),
@@ -801,7 +916,7 @@ function start() {
   browser.storage.local.get(AI_AUTO_GROUP_KEY)
     .then((stored) => { autoGroupEnabled = stored[AI_AUTO_GROUP_KEY] === true; })
     .catch((error) => console.error("Auto-group init error:", error));
-  browser.alarms.create(SCHEDULE_ALARM_NAME, { periodInMinutes: 1 });
+  syncScheduleAlarm().catch((error) => console.error("Schedule alarm init error:", error));
   migrateToLensesV2()
     .catch((error) => {
       console.error("Lens migration error:", error);
@@ -900,8 +1015,11 @@ browser.runtime.onMessage.addListener((message) => {
 if (browser.windows && browser.windows.onRemoved) {
   browser.windows.onRemoved.addListener((windowId) => {
     lastProposalByWindow.delete(windowId);
-    transientViewsByWindow.delete(windowId);
-    windowProfileOverrides.delete(windowId);
+    const removedTransient = transientViewsByWindow.delete(windowId);
+    const removedProfile = windowProfileOverrides.delete(windowId);
+    if (removedTransient || removedProfile) {
+      persistSessionWindowState();
+    }
     const timer = autoGroupDebounceTimers.get(windowId);
     if (timer) { clearTimeout(timer); autoGroupDebounceTimers.delete(windowId); }
     autoGroupCooldown.delete(windowId);
@@ -962,6 +1080,10 @@ browser.storage.onChanged.addListener((changes, areaName) => {
         })
         .catch((error) => console.error("Auto-group enable error:", error));
     }
+  }
+
+  if (changes.lensSchedules) {
+    syncScheduleAlarm().catch((error) => console.error("Schedule alarm sync error:", error));
   }
 });
 
@@ -1180,10 +1302,16 @@ async function rememberActivatedView(resolvedView, activation) {
   if (resolvedView.kind === "transient") {
     if (typeof resolvedView.windowId === "number") {
       transientViewsByWindow.set(resolvedView.windowId, resolvedView);
+      persistSessionWindowState();
     }
     return;
   }
-  transientViewsByWindow.clear();
+  // A persisted view is applied across every window, so transient views are
+  // genuinely overridden everywhere — drop them all.
+  if (transientViewsByWindow.size > 0) {
+    transientViewsByWindow.clear();
+    persistSessionWindowState();
+  }
   await setActiveView(resolvedView, activation);
 }
 
@@ -1317,6 +1445,7 @@ async function activateWithWindowProfiles(resolved, activation) {
 }
 
 async function activateView(view, activation = {}) {
+  await sessionStateReady;
   const resolved = await resolveActivation(view, activation.windowId);
   if (!resolved.ok) {
     return false;
@@ -1503,6 +1632,15 @@ async function getProvider() {
   return { kind: "foundation" };
 }
 
+// Tab titles are attacker-influenced (any page controls its own <title>):
+// collapse whitespace so a title can't fake extra prompt lines and cap the
+// length. Titleless tabs fall back to the host only — a raw URL can embed
+// query-string secrets (sign-in links, OAuth callbacks) that must not reach
+// a cloud provider's request logs.
+function sanitizeTabTitle(title) {
+  return title.replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
 function buildGroupingPrompt(payload) {
   const lines = ["Tabs to organize (index: title [host]):"];
   for (const tab of payload) {
@@ -1512,7 +1650,8 @@ function buildGroupingPrompt(payload) {
     } catch (error) {
       host = "";
     }
-    const title = typeof tab.title === "string" && tab.title !== "" ? tab.title : tab.url;
+    const cleaned = typeof tab.title === "string" ? sanitizeTabTitle(tab.title) : "";
+    const title = cleaned !== "" ? cleaned : host || "(untitled)";
     lines.push(`${tab.index}: ${title}${host ? ` [${host}]` : ""}`);
   }
   return lines.join("\n");
@@ -1899,7 +2038,10 @@ async function commitTabGroups(windowId, groups, { notify: doNotify = true, surf
 
   const outcome = await applyTabGrouping(normalized, windowId);
   const ok = outcome.failures.length === 0;
-  if (ok) {
+  if (outcome.applied.length > 0) {
+    // Even on a partial failure the applied groups exist: pin them to the
+    // active lens and drop the cached proposal, which no longer matches the
+    // window's live tabs.
     if (pinToActiveLens) await pinTopicsToActiveFocus(outcome.applied);
     if (typeof windowId === "number") {
       lastProposalByWindow.delete(windowId);

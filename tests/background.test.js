@@ -58,8 +58,11 @@ function createHarness({
   failSearch = false,
   noHistoryApi = false,
   noSearchApi = false,
+  groupFailTabIds = [],
+  sessionData: sessionDataInput = null,
 } = {}) {
   const storageData = clone(storage) || {};
+  const sessionData = sessionDataInput || {};
   const groupState = clone(groups);
   const tabState = clone(tabs);
   const notifications = [];
@@ -196,6 +199,35 @@ function createHarness({
           }
         },
       },
+      session: {
+        async get(keys) {
+          if (keys === null || keys === undefined) {
+            return clone(sessionData) || {};
+          }
+          if (typeof keys === "string") {
+            return { [keys]: clone(sessionData[keys]) };
+          }
+          if (Array.isArray(keys)) {
+            const output = {};
+            for (const key of keys) {
+              output[key] = clone(sessionData[key]);
+            }
+            return output;
+          }
+          const output = { ...keys };
+          for (const key of Object.keys(keys)) {
+            if (Object.prototype.hasOwnProperty.call(sessionData, key)) {
+              output[key] = clone(sessionData[key]);
+            }
+          }
+          return output;
+        },
+        async set(values) {
+          for (const [key, value] of Object.entries(values)) {
+            sessionData[key] = clone(value);
+          }
+        },
+      },
       onChanged: {
         addListener(listener) {
           storageListeners.push(listener);
@@ -282,6 +314,9 @@ function createHarness({
         return clone(tab);
       },
       async group({ tabIds, groupId }) {
+        if (groupFailTabIds.length > 0 && tabIds.some((id) => groupFailTabIds.includes(id))) {
+          throw new Error("tab group failed");
+        }
         if (typeof groupId === "number") {
           const existing = groupState.find((group) => group.id === groupId);
           assert.ok(existing, `group ${groupId} exists`);
@@ -438,6 +473,7 @@ function createHarness({
     context,
     browser,
     storageData,
+    sessionData,
     groupState,
     tabState,
     notifications,
@@ -2573,4 +2609,275 @@ test("switching persisted views records a session history entry", async () => {
   assert.deepEqual(harness.storageData.focusSessionHistory[0].view, { kind: "lens", lensId: "lens_work" });
   assert.deepEqual(harness.storageData.focusSessionHistory[0].expandedGroups, ["Work"]);
   assert.deepEqual(harness.storageData.focusSessionHistory[0].collapsedGroups, ["Other"]);
+});
+
+// ── Regression: security/robustness fixes ─────────────────────────────
+
+function scheduledHarness(storageOverrides = {}) {
+  return createHarness({
+    storage: {
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])],
+      lensSchedules: [{ lensId: "lens_work", enabled: true, days: [1], start: "09:00", end: "17:00" }],
+      ...storageOverrides,
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: true },
+    ],
+  });
+}
+
+test("schedule tick is edge-triggered: no-op when a view was activated inside the current window", async () => {
+  const harness = scheduledHarness({
+    lastActivation: { trigger: "manual", at: new Date("2026-06-29T09:30:00").getTime() },
+  });
+  await settle();
+
+  await harness.context.handleScheduleTick(new Date("2026-06-29T10:00:00"));
+
+  // lastActivation.at is after the 09:00 window start, so the tick must not re-activate.
+  assert.equal(harness.storageData.lastActivation.trigger, "manual");
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, true);
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, false);
+});
+
+test("schedule tick activates when the last activation predates the window start", async () => {
+  const harness = scheduledHarness({
+    lastActivation: { trigger: "manual", at: new Date("2026-06-28T10:00:00").getTime() },
+  });
+  await settle();
+
+  await harness.context.handleScheduleTick(new Date("2026-06-29T10:00:00"));
+
+  assert.equal(harness.storageData.lastActivation.trigger, "schedule");
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
+});
+
+test("overnight schedule tick is a no-op when the window opened before the last activation", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])],
+      lensSchedules: [{ lensId: "lens_work", enabled: true, days: [], start: "22:00", end: "06:00" }],
+      lastActivation: { trigger: "manual", at: new Date("2026-06-29T23:00:00").getTime() },
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: true },
+    ],
+  });
+  await settle();
+
+  // Window opened at 22:00 yesterday; the 23:00 manual activation is inside it.
+  await harness.context.handleScheduleTick(new Date("2026-06-30T01:00:00"));
+
+  assert.equal(harness.storageData.lastActivation.trigger, "manual");
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, true);
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, false);
+});
+
+test("no schedule alarm is created when there are no schedules", async () => {
+  const harness = createHarness();
+  await settle();
+
+  assert.ok(!harness.alarms.some((alarm) => alarm.name === "lens-schedule-tick"));
+  assert.ok(harness.clearedAlarms.includes("lens-schedule-tick"));
+});
+
+test("an enabled schedule creates the minute-tick alarm at startup", async () => {
+  const harness = createHarness({
+    storage: { lensSchedules: [{ lensId: "lens_work", enabled: true, days: [1], start: "09:00", end: "17:00" }] },
+  });
+  await settle();
+
+  const created = harness.alarms.find((alarm) => alarm.name === "lens-schedule-tick");
+  assert.ok(created, "schedule alarm created");
+  assert.equal(created.config.periodInMinutes, 1);
+});
+
+test("writing an enabled schedule after startup creates the alarm via onChanged", async () => {
+  const harness = createHarness();
+  await settle();
+  assert.ok(!harness.alarms.some((alarm) => alarm.name === "lens-schedule-tick"));
+
+  await harness.browser.storage.local.set({
+    lensSchedules: [{ lensId: "lens_work", enabled: true, days: [1], start: "09:00", end: "17:00" }],
+  });
+  await settle();
+
+  assert.ok(harness.alarms.some((alarm) => alarm.name === "lens-schedule-tick"));
+});
+
+test("focus-off fallback fires after event-page restart using the persisted apple focus id", async () => {
+  const harness = createHarness({
+    storage: {
+      lastAppliedAppleFocusId: "com.apple.focus.work",
+      activeView: { kind: "lens", lensId: "lens_work" },
+      lastActivation: { trigger: "appleFocus", triggerId: "com.apple.focus.work", at: 1000 },
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["com.apple.focus.work"])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: false },
+      { id: 2, windowId: 1, title: "Other", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: true },
+      { id: 20, windowId: 1, groupId: 2, active: false },
+    ],
+  });
+  await settle();
+
+  // Fresh page after suspension: only storage survives. A focus-off frame must
+  // still apply the automation fallback and clear the persisted key.
+  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", payload: { focus: null } }) });
+
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+  assert.equal(harness.storageData.lastAppliedAppleFocusId, null);
+  assert.ok(harness.groupState.every((group) => group.collapsed === false));
+});
+
+test("same-id focus replay after restart is ignored when the last activation was manual", async () => {
+  const harness = createHarness({
+    storage: {
+      lastAppliedAppleFocusId: "com.apple.focus.work",
+      activeView: { kind: "lens", lensId: "lens_other" },
+      lastActivation: { trigger: "manual", at: 2000 },
+      lenses: [
+        lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["com.apple.focus.work"]),
+        lens("lens_other", "Other", [{ type: "title", value: "Other" }]),
+      ],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: true },
+    ],
+  });
+  await settle();
+
+  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", payload: { focus: { id: "com.apple.focus.work" } } }) });
+
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_other" });
+});
+
+test("grouping prompt uses host only for titleless tabs and never leaks URL secrets", () => {
+  const harness = createHarness();
+  const prompt = harness.context.buildGroupingPrompt([
+    { index: 0, url: "https://app.example.com/reset?token=SECRET123", title: "" },
+  ]);
+
+  assert.match(prompt, /app\.example\.com/);
+  assert.ok(!prompt.includes("SECRET123"), "the query-string token must not reach the prompt");
+});
+
+test("grouping prompt collapses whitespace and truncates long titles", () => {
+  const harness = createHarness();
+  const prompt = harness.context.buildGroupingPrompt([
+    { index: 0, url: "https://x.example/", title: "Hello\n\tWorld\t Foo" },
+    { index: 1, url: "https://y.example/", title: "A".repeat(250) },
+  ]);
+
+  assert.ok(prompt.includes("Hello World Foo"));
+  assert.ok(!prompt.includes("Hello\n"));
+  assert.ok(prompt.includes("A".repeat(200)));
+  assert.ok(!prompt.includes("A".repeat(201)), "titles are capped at 200 chars");
+});
+
+test("partial AI apply still pins the successful topic and clears the cached proposal", async () => {
+  const harness = createHarness({
+    storage: {
+      aiGroupingEnabled: true,
+      aiPinToFocus: true,
+      activeView: { kind: "lens", lensId: "lens_work" },
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Existing" }])],
+    },
+    tabs: [
+      { id: 10, windowId: 1, url: "https://a.com", title: "A", groupId: -1 },
+      { id: 20, windowId: 1, url: "https://b.com", title: "B", groupId: -1 },
+    ],
+    groupFailTabIds: [20],
+  });
+  await settle();
+
+  // Seed a cached proposal for window 1 via a preview.
+  const preview = await driveGrouping(harness, { type: "ai-group-preview", windowId: 1 }, {
+    ok: true,
+    groups: [
+      { topic: "Work Docs", tabIndices: [0] },
+      { topic: "Play", tabIndices: [1] },
+    ],
+  });
+  assert.equal(preview.ok, true);
+  const cached = await harness.messageListeners[0]({ type: "ai-group-state", windowId: 1 });
+  assert.ok(cached.proposal, "proposal cached before apply");
+
+  // The second group's tab fails to group, so the overall apply fails.
+  const result = await harness.messageListeners[0]({ type: "ai-group-apply", windowId: 1, groups: preview.groups });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.applied.join(","), "Work Docs");
+  assert.equal(result.failures.join(","), "Play");
+  // The successful topic is still pinned to the active lens...
+  assert.deepEqual(harness.storageData.lenses[0].groupSelectors, [
+    { type: "title", value: "Existing" },
+    { type: "title", value: "Work Docs" },
+  ]);
+  // ...and the now-stale cached proposal is cleared despite ok:false.
+  const afterApply = await harness.messageListeners[0]({ type: "ai-group-state", windowId: 1 });
+  assert.equal(afterApply.proposal, null);
+});
+
+test("a focus frame with a __proto__ id pollutes neither seen ids nor Object.prototype", async () => {
+  const harness = createHarness();
+  await settle();
+
+  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", payload: { focus: { id: "__proto__", name: "Evil" } } }) });
+
+  assert.equal(harness.storageData.seenFocusIds, undefined);
+  assert.equal(harness.storageData.focusCatalog, undefined);
+  assert.equal(({}).name, undefined);
+});
+
+test("a focusCatalog frame with a __proto__ entry id is skipped", async () => {
+  const harness = createHarness();
+  await settle();
+
+  await harness.context.handleMessage({ data: JSON.stringify({
+    type: "focusCatalog",
+    payload: { entries: { "__proto__": { name: "Evil", icon: "x", color: "#ffffff" } } },
+  }) });
+
+  assert.equal(harness.storageData.focusCatalog, undefined);
+  assert.equal(({}).name, undefined);
+});
+
+test("window profile overrides survive suspension via storage.session", async () => {
+  const shared = {};
+  const harness1 = createHarness({ sessionData: shared });
+  await settle();
+
+  const set = await harness1.request({ type: "window-profile-set", windowId: 1, profile: { kind: "none" } });
+  assert.equal(set.ok, true);
+  await settle();
+
+  // The override is mirrored into storage.session, not just memory.
+  assert.deepEqual(shared.windowViewState.windowProfiles, { 1: { kind: "none" } });
+
+  // A fresh harness sharing the same session store simulates an event-page restart.
+  const harness2 = createHarness({ sessionData: shared });
+  await settle();
+
+  const state = await harness2.request({ type: "lens-state", windowId: 1 });
+  assert.equal(state.windowProfile.kind, "none");
 });

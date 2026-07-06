@@ -1005,3 +1005,96 @@ test("an over-long prompt is truncated to 4000 chars on save", async () => {
   assert.equal(harness.storageData.aiGroupingPrompt.length, 4000);
 });
 
+
+// ── Regression: settings import/export + provider URL hardening ────────
+
+test("import never overwrites the stored AI provider and shows the extended toast", async () => {
+  const harness = createHarness({
+    storage: { aiProvider: { kind: "custom", baseURL: "https://good.example/v1", model: "m", apiKey: "k" } },
+  });
+  await settle();
+
+  const incoming = JSON.stringify({
+    lenses: [],
+    aiProvider: { kind: "custom", baseURL: "https://evil.example/v1", model: "x", apiKey: "leak" },
+  });
+  await harness.window.importSettingsFile({ text: async () => incoming });
+  await settle();
+
+  assert.deepEqual(harness.storageData.aiProvider, {
+    kind: "custom",
+    baseURL: "https://good.example/v1",
+    model: "m",
+    apiKey: "k",
+  });
+  assert.match(harness.document.querySelector("#toast-host .toast").textContent, /are not imported\./);
+});
+
+test("import without an aiProvider key shows the plain imported toast", async () => {
+  const harness = createHarness();
+  await settle();
+
+  await harness.window.importSettingsFile({ text: async () => JSON.stringify({ lenses: [] }) });
+  await settle();
+
+  assert.equal(harness.document.querySelector("#toast-host .toast").textContent, "Settings imported.");
+});
+
+test("export payload omits the AI provider key", async () => {
+  const harness = createHarness({
+    storage: {
+      aiProvider: { kind: "custom", baseURL: "https://good.example/v1", model: "m", apiKey: "k" },
+      aiGroupingPrompt: "Group by domain.",
+    },
+  });
+  await settle();
+
+  let captured = null;
+  harness.window.URL.createObjectURL = (blob) => { captured = blob; return "blob:mock"; };
+  harness.window.URL.revokeObjectURL = () => {};
+
+  harness.window.exportSettings();
+  await settle();
+
+  assert.ok(captured, "export created a blob");
+  const payload = JSON.parse(await captured.text());
+  assert.ok(!("aiProvider" in payload), "export must not include aiProvider");
+});
+
+test("saveProvider rejects a non-loopback http:// URL and stores nothing", async () => {
+  const harness = createHarness();
+  await settle();
+
+  const custom = harness.document.querySelector('input[name="provider-kind"][value="custom"]');
+  custom.checked = true;
+  custom.dispatchEvent(new harness.window.Event("change"));
+  harness.document.getElementById("provider-url").value = "http://api.example.com/v1";
+  harness.document.getElementById("provider-model").value = "m";
+  harness.document.getElementById("provider-save").click();
+  await settle();
+
+  assert.equal(harness.storageData.aiProvider, undefined);
+  assert.equal(harness.permissionRequests.length, 0);
+  assert.equal(
+    harness.document.querySelector("#toast-host .toast").textContent,
+    "Use an https:// URL. Plain http is only allowed for localhost.",
+  );
+});
+
+test("saveProvider accepts loopback http:// URLs", async () => {
+  for (const baseURL of ["http://localhost:11434/v1", "http://127.0.0.1:8080/v1"]) {
+    const harness = createHarness();
+    await settle();
+
+    const custom = harness.document.querySelector('input[name="provider-kind"][value="custom"]');
+    custom.checked = true;
+    custom.dispatchEvent(new harness.window.Event("change"));
+    harness.document.getElementById("provider-url").value = baseURL;
+    harness.document.getElementById("provider-model").value = "m";
+    harness.document.getElementById("provider-key").value = "k";
+    harness.document.getElementById("provider-save").click();
+    await settle();
+
+    assert.deepEqual(harness.storageData.aiProvider, { kind: "custom", baseURL, model: "m", apiKey: "k" });
+  }
+});

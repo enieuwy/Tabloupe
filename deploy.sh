@@ -5,8 +5,10 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROFILES_INI="$HOME/Library/Application Support/Firefox/profiles.ini"
-BACKUP_ROOT="/tmp/focus_tab_groups_firefox_session_backup"
-VENV_DIR="/tmp/focus_restore_lz4"
+STATE_ROOT="$HOME/.local/state/tabloupe"
+BACKUP_ROOT="$STATE_ROOT/session-backups"
+VENV_DIR="$STATE_ROOT/lz4-venv"
+LZ4_VERSION="4.4.5"
 XPI_DIR="$REPO_DIR/web-ext-artifacts"
 
 PROFILE_DIR=""
@@ -136,8 +138,8 @@ preflight_checks() {
   success "  ✓ node, python3 found"
 
   # web-ext available via npx
-  if ! npx -y web-ext --version &>/dev/null; then
-    die "web-ext is not available via npx"
+  if ! npx --no-install web-ext --version &>/dev/null; then
+    die "web-ext is not available — run 'npm ci' first to install pinned devDependencies"
   fi
   success "  ✓ web-ext available"
 
@@ -151,11 +153,13 @@ preflight_checks() {
   # Python venv with lz4
   if [[ ! -x "$VENV_DIR/bin/python3" ]]; then
     info "  Creating Python venv for lz4 at $VENV_DIR..."
+    mkdir -p "$STATE_ROOT"
+    chmod 700 "$STATE_ROOT"
     python3 -m venv "$VENV_DIR"
   fi
   if ! "$VENV_DIR/bin/python3" -c "import lz4.block" 2>/dev/null; then
     info "  Installing lz4 in venv..."
-    "$VENV_DIR/bin/python3" -m pip install lz4 --quiet
+    "$VENV_DIR/bin/python3" -m pip install "lz4==$LZ4_VERSION" --quiet
   fi
   success "  ✓ lz4 venv ready"
 
@@ -177,7 +181,7 @@ preflight_checks() {
 
   # Lint
   info "  Running web-ext lint…"
-  (cd "$REPO_DIR" && npx -y web-ext lint)
+  (cd "$REPO_DIR" && npx --no-install web-ext lint)
   success "  ✓ Lint passed"
 }
 
@@ -193,6 +197,8 @@ snapshot_session() {
   local timestamp
   timestamp="$(date +%Y%m%d_%H%M%S)"
   SNAPSHOT_DIR="$BACKUP_ROOT/$timestamp"
+  mkdir -p "$STATE_ROOT"
+  chmod 700 "$STATE_ROOT"
   mkdir -p "$SNAPSHOT_DIR"
 
   if [[ ! -d "$SESSION_DIR" ]]; then

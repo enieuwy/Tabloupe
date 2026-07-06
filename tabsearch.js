@@ -141,7 +141,7 @@ function buildOverlay() {
   host.id = TABSEARCH_HOST_ID;
   // Keep the host itself inert to page styles; the real UI lives in the shadow.
   host.style.cssText = "all: initial;";
-  shadow = host.attachShadow({ mode: "open" });
+  shadow = host.attachShadow({ mode: "closed" });
 
   // Keep keystrokes inside the overlay. The input lives in this shadow root, so
   // when key events bubble out to the host page's document they are retargeted to
@@ -729,6 +729,9 @@ function parseQueryAsUrl(query) {
   const q = query.trim();
   if (!q || /\s/.test(q)) return null;
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(q)) {
+    // Only navigate for http(s); any other explicit scheme (javascript:, file:,
+    // data:, etc.) falls through to a web search instead of opening directly.
+    if (!/^https?:\/\//i.test(q)) return null;
     try {
       return new URL(q).href;
     } catch (error) {
@@ -1282,6 +1285,17 @@ function closeOverlay() {
   clearMarks();
   previewState = null;
   dropIndicator = null;
+  // When we are the extension-hosted new-tab page (not an in-page overlay),
+  // removing the host leaves a blank extension tab behind. Close the tab instead.
+  if (isStandalonePage()) {
+    window.close();
+    // Firefox often refuses window.close() for tabs it did not script-open, so
+    // fall back to the tabs API (available on extension pages, absent in content
+    // scripts) to remove our own tab.
+    if (browser.tabs && typeof browser.tabs.getCurrent === "function") {
+      browser.tabs.getCurrent().then((tab) => tab && browser.tabs.remove(tab.id)).catch(() => {});
+    }
+  }
 }
 
 function activate(item) {
@@ -1415,6 +1429,9 @@ function matchesShortcut(event, sc) {
 
 function onGlobalKeydown(event) {
   if (event.repeat) return;
+  // A page can dispatch a synthetic KeyboardEvent; refuse to open on it. Real
+  // user keystrokes are isTrusted. Runtime-message and auto-open paths bypass this.
+  if (!event.isTrusted) return;
   if (matchesShortcut(event, shortcut)) {
     event.preventDefault();
     event.stopPropagation();
@@ -1428,6 +1445,21 @@ function shouldAutoOpenFromUrl() {
     const extensionOrigin = new URL(browser.runtime.getURL("")).origin;
     const currentUrl = new URL(window.location.href);
     return currentUrl.origin === extensionOrigin && currentUrl.searchParams.get("tabsearchOpen") === "1";
+  } catch (error) {
+    return false;
+  }
+}
+
+// True when this is the extension-hosted tabsearch page (opened by the background
+// for new-tab pages) rather than an overlay injected into an arbitrary page. Same
+// origin check as shouldAutoOpenFromUrl, but keyed on the pathname, not the query
+// param (the param is gone once the overlay has opened).
+function isStandalonePage() {
+  if (!browser.runtime || typeof browser.runtime.getURL !== "function") return false;
+  try {
+    const extensionOrigin = new URL(browser.runtime.getURL("")).origin;
+    const currentUrl = new URL(window.location.href);
+    return currentUrl.origin === extensionOrigin && currentUrl.pathname.endsWith("/tabsearch.html");
   } catch (error) {
     return false;
   }

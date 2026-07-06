@@ -44,7 +44,7 @@ print("Bumped version to:", data["version"])
 PY
 
 echo "Packaging and submitting to Mozilla..."
-npx -y web-ext sign --channel="unlisted"
+npx --no-install web-ext sign --channel="unlisted"
 SIGN_SUCCEEDED=true
 
 echo "Done! You can install the new .xpi from ./web-ext-artifacts/ via about:addons"
