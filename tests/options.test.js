@@ -838,25 +838,6 @@ test("disable button stores null and shows Disabled", async () => {
   assert.equal(harness.document.getElementById("shortcut-record").textContent, "Disabled");
 });
 
-test("reset button restores the default shortcut", async () => {
-  const harness = createHarness({
-    storage: { tabSearchShortcut: { ctrl: true, alt: false, shift: true, meta: false, key: "j" } },
-  });
-  await settle();
-
-  harness.document.getElementById("shortcut-reset").click();
-  await settle();
-
-  assert.deepEqual({ ...harness.storageData.tabSearchShortcut }, {
-    ctrl: true,
-    alt: false,
-    shift: false,
-    meta: false,
-    key: "s",
-  });
-  assert.equal(harness.document.getElementById("shortcut-record").textContent, "Ctrl + S");
-});
-
 test("selecting Custom reveals the provider fields", async () => {
   const harness = createHarness();
   await settle();

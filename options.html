@@ -16,6 +16,14 @@
       </div>
     </header>
 
+    <nav class="anchor-nav" aria-label="Settings sections">
+      <a href="#lenses-card">Lenses</a>
+      <a href="#shortcuts-card">Shortcuts</a>
+      <a href="#ai-card">AI</a>
+      <a href="#automation-card">Automation</a>
+      <a href="#general-card">General</a>
+      <a href="#activity-card">Activity</a>
+    </nav>
 
     <section class="card" id="lenses-card">
       <div class="section-heading section-heading-row">
@@ -25,13 +33,15 @@
         <div class="lens-create-actions">
           <button id="new-empty-lens" type="button">+ New lens</button>
           <button id="save-window-lens" type="button" class="secondary">Save current window's groups as a lens</button>
+          <button id="import-lens-toggle" type="button" class="ghost" aria-expanded="false" aria-controls="lens-import-row">Import</button>
         </div>
       </div>
-      <div class="field lens-code-import">
+      <div id="lens-import-row" class="field lens-code-import" hidden>
         <label for="lens-import-code">Add lens from code</label>
         <textarea id="lens-import-code" rows="3" spellcheck="false" placeholder="Paste a shared lens JSON code"></textarea>
         <div class="actions">
           <button id="lens-import-add" type="button" class="secondary">Add lens</button>
+          <button id="lens-import-cancel" type="button" class="ghost">Cancel</button>
         </div>
       </div>
       <div id="migration-summary" class="callout migration-summary" hidden></div>
@@ -41,7 +51,74 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card" id="shortcuts-card">
+      <div class="section-heading">
+        <h2>Shortcuts</h2>
+        <p>Click a box and press the keys you want. Include at least one of Ctrl, Alt, or Cmd (function keys work on their own).</p>
+      </div>
+
+      <div class="shortcut-list">
+        <div class="shortcut-binding" data-command="search-tabs">
+          <div class="shortcut-binding-row">
+            <div class="shortcut-binding-label">
+              <span class="shortcut-binding-title">Search tabs</span>
+              <span class="shortcut-binding-desc">Opens the tab search overlay on web pages.</span>
+            </div>
+            <div class="shortcut-row">
+              <button id="shortcut-record" type="button" class="shortcut-input">Ctrl + S</button>
+              <button id="shortcut-clear" type="button" class="secondary shortcut-clear-btn">Clear</button>
+            </div>
+          </div>
+          <span id="shortcut-status" role="status" aria-live="polite"></span>
+          <p class="shortcut-binding-hint">Clear turns the in-page shortcut off and restores Ctrl+S for new-tab and privileged pages.</p>
+        </div>
+
+        <div class="shortcut-binding" data-command="show-all-groups">
+          <div class="shortcut-binding-row">
+            <div class="shortcut-binding-label">
+              <span class="shortcut-binding-title">Show all groups</span>
+            </div>
+            <div class="shortcut-row">
+              <button type="button" class="shortcut-input">Not set</button>
+              <button type="button" class="secondary shortcut-clear-btn">Clear</button>
+            </div>
+          </div>
+          <p class="shortcut-error" role="status" aria-live="polite"></p>
+        </div>
+
+        <div class="shortcut-binding" data-command="cycle-lens-next">
+          <div class="shortcut-binding-row">
+            <div class="shortcut-binding-label">
+              <span class="shortcut-binding-title">Cycle to next lens</span>
+            </div>
+            <div class="shortcut-row">
+              <button type="button" class="shortcut-input">Not set</button>
+              <button type="button" class="secondary shortcut-clear-btn">Clear</button>
+            </div>
+          </div>
+          <p class="shortcut-error" role="status" aria-live="polite"></p>
+        </div>
+
+        <div class="shortcut-binding" data-command="cycle-lens-prev">
+          <div class="shortcut-binding-row">
+            <div class="shortcut-binding-label">
+              <span class="shortcut-binding-title">Cycle to previous lens</span>
+            </div>
+            <div class="shortcut-row">
+              <button type="button" class="shortcut-input">Not set</button>
+              <button type="button" class="secondary shortcut-clear-btn">Clear</button>
+            </div>
+          </div>
+          <p class="shortcut-error" role="status" aria-live="polite"></p>
+        </div>
+
+        <div id="lens-shortcut-list" class="lens-shortcut-list"></div>
+      </div>
+
+      <p class="shortcut-hint shortcut-footnote">Shortcuts can also be managed in <a href="about:addons">about:addons</a>.</p>
+    </section>
+
+    <section class="card" id="ai-card">
       <div class="section-heading">
         <h2>AI tab grouping</h2>
         <p>Cluster a window's ungrouped tabs into named topic groups. Run it from the <strong>toolbar button</strong>; pick the model that does the grouping here.</p>
@@ -135,62 +212,42 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card" id="general-card">
       <div class="section-heading">
-        <h2>Sync</h2>
+        <h2>General</h2>
       </div>
-      <label class="toggle inline-toggle" for="sync-lenses">
-        <input id="sync-lenses" type="checkbox">
-        <span>Sync lenses across devices (Firefox Sync)</span>
-      </label>
-      <p class="field-hint">Syncs lenses (including calendar patterns), schedules, the AI grouping prompt, and the Tab Search shortcut. Never syncs API keys or the AI provider.</p>
-      <p id="sync-last-error" class="field-hint" role="status" aria-live="polite" hidden></p>
-    </section>
-    <section class="card">
-      <div class="section-heading">
-        <h2>Performance</h2>
-      </div>
-      <label class="toggle inline-toggle" for="discard-collapsed-tabs">
-        <input id="discard-collapsed-tabs" type="checkbox">
-        <span>Discard tabs in collapsed groups when switching lenses</span>
-      </label>
-      <p class="field-hint">Frees memory. Tabs reload when you return to them. Pinned, active, and audio-playing tabs are never discarded.</p>
-    </section>
 
-    <section class="card">
-      <div class="section-heading">
-        <h2>Tab search shortcut</h2>
-        <p>Opens the tab search overlay on web pages. Click the box and press the keys you want (include at least one of Ctrl, Alt, or Cmd).</p>
+      <div class="setting-group">
+        <h3 class="setting-group-title">Sync</h3>
+        <label class="toggle inline-toggle" for="sync-lenses">
+          <input id="sync-lenses" type="checkbox">
+          <span>Sync lenses across devices (Firefox Sync)</span>
+        </label>
+        <p class="field-hint">Syncs lenses (including calendar patterns), schedules, the AI grouping prompt, and the Tab Search shortcut. Never syncs API keys or the AI provider.</p>
+        <p id="sync-last-error" class="field-hint" role="status" aria-live="polite" hidden></p>
       </div>
-      <div class="shortcut-row">
-        <button id="shortcut-record" type="button" class="shortcut-input">Ctrl + S</button>
-        <button id="shortcut-reset" type="button" class="secondary">Reset to Ctrl+S</button>
-        <button id="shortcut-clear" type="button" class="secondary">Disable</button>
-        <span id="shortcut-status" role="status" aria-live="polite"></span>
-      </div>
-      <p class="shortcut-hint">The overlay can't run on privileged pages (<code>about:</code>, add-ons, PDF viewer). For a shortcut that works there too, assign one under <a href="about:addons">about:addons &rarr; Manage Extension Shortcuts</a>.</p>
-    </section>
 
-    <section class="card">
-      <div class="section-heading">
-        <h2>Keyboard shortcuts</h2>
-        <p>Lens slots 1–9, cycle next/previous, and show-all commands can be bound in <a href="about:addons">about:addons</a> → ⚙️ → Manage Extension Shortcuts. They ship unbound to avoid conflicts.</p>
+      <div class="setting-group">
+        <h3 class="setting-group-title">Performance</h3>
+        <label class="toggle inline-toggle" for="discard-collapsed-tabs">
+          <input id="discard-collapsed-tabs" type="checkbox">
+          <span>Discard tabs in collapsed groups when switching lenses</span>
+        </label>
+        <p class="field-hint">Frees memory. Tabs reload when you return to them. Pinned, active, and audio-playing tabs are never discarded.</p>
+      </div>
+
+      <div class="setting-group">
+        <h3 class="setting-group-title">Backup and transfer</h3>
+        <p class="field-hint">Export lenses, schedules, shortcuts, and AI settings as JSON. API keys are excluded.</p>
+        <div class="provider-actions">
+          <button id="settings-export" type="button" class="secondary">Export settings</button>
+          <label class="secondary import-label" for="settings-import">Import settings</label>
+          <input id="settings-import" type="file" accept="application/json,.json" hidden>
+        </div>
       </div>
     </section>
 
-    <section class="card">
-      <div class="section-heading">
-        <h2>Backup and transfer</h2>
-        <p>Export lenses, schedules, shortcuts, and AI settings as JSON. API keys are excluded.</p>
-      </div>
-      <div class="provider-actions">
-        <button id="settings-export" type="button" class="secondary">Export settings</button>
-        <label class="secondary import-label" for="settings-import">Import settings</label>
-        <input id="settings-import" type="file" accept="application/json,.json" hidden>
-      </div>
-    </section>
-
-    <section class="card">
+    <section class="card" id="activity-card">
       <div class="section-heading">
         <h2>Activity</h2>
         <p>Recent lens sessions recorded when Tabloupe switches views.</p>

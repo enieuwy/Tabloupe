@@ -98,9 +98,11 @@ const state = {
   syncLastError: "",
   busToken: "",
   busPairingStatus: "",
+  commandShortcuts: {},
 };
 
-let recordingShortcut = false;
+let recordingCommand = null;
+let recordingButton = null;
 let activeAdderId = null;
 let activeFocusPickerId = null;
 let pendingNameEditId = null;
@@ -306,6 +308,80 @@ function formatShortcut(shortcut) {
   return parts.join(" + ");
 }
 
+// Named non-character keys the WebExtensions commands API accepts as the final
+// key of a shortcut. event.key -> commands token.
+const COMMAND_KEY_MAP = Object.freeze({
+  " ": "Space",
+  ",": "Comma",
+  ".": "Period",
+  ArrowUp: "Up",
+  ArrowDown: "Down",
+  ArrowLeft: "Left",
+  ArrowRight: "Right",
+  Home: "Home",
+  End: "End",
+  PageUp: "PageUp",
+  PageDown: "PageDown",
+  Insert: "Insert",
+  Delete: "Delete",
+});
+
+// Pure map from a recorded combo ({ctrl,alt,shift,meta,key}) to the string the
+// WebExtensions commands API expects (e.g. "Ctrl+Shift+K"). Returns null when
+// the combo is not a valid command shortcut (Shift-only, unmapped key, etc.).
+// Modifier mapping: macOS meta(Command)->"Ctrl", ctrl->"MacCtrl"; elsewhere
+// ctrl->"Ctrl". alt->"Alt", shift->"Shift" on both. F-keys need no modifier.
+function shortcutToCommandFormat(combo, isMac) {
+  if (!combo || typeof combo.key !== "string" || combo.key.length === 0) return null;
+  const rawKey = combo.key;
+  const isFunctionKey = /^F([1-9]|1[0-2])$/.test(rawKey);
+  let mappedKey = null;
+  if (isFunctionKey) {
+    mappedKey = rawKey;
+  } else if (rawKey.length === 1 && /[a-z0-9]/i.test(rawKey)) {
+    mappedKey = rawKey.toUpperCase();
+  } else if (hasOwn(COMMAND_KEY_MAP, rawKey)) {
+    mappedKey = COMMAND_KEY_MAP[rawKey];
+  }
+  if (mappedKey === null) return null;
+
+  const modifiers = [];
+  if (isMac) {
+    if (combo.meta) modifiers.push("Ctrl");
+    if (combo.ctrl) modifiers.push("MacCtrl");
+  } else if (combo.ctrl) {
+    modifiers.push("Ctrl");
+  }
+  if (combo.alt) modifiers.push("Alt");
+  const primaryCount = modifiers.length;
+  if (combo.shift) modifiers.push("Shift");
+  if (!isFunctionKey && primaryCount === 0) return null;
+  return [...modifiers, mappedKey].join("+");
+}
+
+// Present a stored commands-format string ("MacCtrl+Shift+K") for display,
+// mirroring formatShortcut's plain-text style. Empty string -> "Not set".
+function formatCommandShortcut(shortcut, isMac) {
+  if (typeof shortcut !== "string" || shortcut.length === 0) return "Not set";
+  const tokens = shortcut.split("+");
+  const parts = tokens.map((token) => {
+    switch (token) {
+      case "Ctrl":
+      case "Command":
+        return isMac ? "Cmd" : "Ctrl";
+      case "MacCtrl":
+        return "Ctrl";
+      case "Alt":
+        return isMac ? "Option" : "Alt";
+      case "Shift":
+        return "Shift";
+      default:
+        return token.length === 1 ? token.toUpperCase() : token;
+    }
+  });
+  return parts.join(" + ");
+}
+
 function uniqueSortedTitlesFromValues(titles) {
   return [...new Set(titles.filter((title) => typeof title === "string" && title.length > 0))]
     .sort((a, b) => a.localeCompare(b));
@@ -507,6 +583,7 @@ async function loadAll() {
   render();
   renderProvider();
   renderGroupingPrompt();
+  refreshCommandShortcuts();
 }
 
 function clearStatusUndoTimer() {
@@ -746,6 +823,28 @@ function importedLensFromCode(code, existingLenses) {
   });
 }
 
+function setLensImportVisible(visible) {
+  const row = document.getElementById("lens-import-row");
+  const toggle = document.getElementById("import-lens-toggle");
+  if (row) row.hidden = !visible;
+  if (toggle) toggle.setAttribute("aria-expanded", visible ? "true" : "false");
+  if (visible) {
+    const input = document.getElementById("lens-import-code");
+    if (input) input.focus();
+  }
+}
+
+function toggleLensImport() {
+  const row = document.getElementById("lens-import-row");
+  setLensImportVisible(row ? row.hidden : true);
+}
+
+function closeLensImport() {
+  const input = document.getElementById("lens-import-code");
+  if (input) input.value = "";
+  setLensImportVisible(false);
+}
+
 async function addLensFromCode() {
   const input = document.getElementById("lens-import-code");
   const code = input ? input.value : "";
@@ -762,6 +861,7 @@ async function addLensFromCode() {
   if (input) {
     input.value = "";
   }
+  setLensImportVisible(false);
   render();
   showToast("Lens added.", "ok");
 }
@@ -2312,7 +2412,7 @@ function render() {
   renderSyncSettings();
   renderDiagnostics();
   renderActivity();
-  renderShortcut();
+  renderShortcuts();
   renderPerformanceSettings();
   renderAutomationSettings();
   applyPendingFocus();
@@ -2321,13 +2421,95 @@ function render() {
 function renderShortcut() {
   const button = document.getElementById("shortcut-record");
   if (!button) return;
-  if (recordingShortcut) {
+  if (recordingCommand === "search-tabs") {
     button.textContent = "Press a shortcut\u2026";
     button.classList.add("recording");
     return;
   }
   button.classList.remove("recording");
   button.textContent = formatShortcut(state.tabSearchShortcut);
+}
+
+function recorderButtonFor(commandName) {
+  return document.querySelector(`.shortcut-binding[data-command="${commandName}"] .shortcut-input`);
+}
+
+function renderCommandRow(commandName) {
+  const button = recorderButtonFor(commandName);
+  if (!button) return;
+  if (recordingCommand === commandName) {
+    button.textContent = "Press a shortcut\u2026";
+    button.classList.add("recording");
+    return;
+  }
+  button.classList.remove("recording");
+  button.textContent = formatCommandShortcut(state.commandShortcuts[commandName] || "", IS_MAC);
+}
+
+function buildLensShortcutRow(lens, index) {
+  const commandName = `activate-lens-${index + 1}`;
+  const binding = document.createElement("div");
+  binding.className = "shortcut-binding";
+  binding.dataset.command = commandName;
+
+  const row = document.createElement("div");
+  row.className = "shortcut-binding-row";
+
+  const labelWrap = document.createElement("div");
+  labelWrap.className = "shortcut-binding-label";
+  const title = document.createElement("span");
+  title.className = "shortcut-binding-title";
+  title.textContent = `Activate \u201c${lens.name}\u201d`;
+  labelWrap.append(title);
+
+  const controls = document.createElement("div");
+  controls.className = "shortcut-row";
+  const record = document.createElement("button");
+  record.type = "button";
+  record.className = "shortcut-input";
+  if (recordingCommand === commandName) {
+    record.textContent = "Press a shortcut\u2026";
+    record.classList.add("recording");
+  } else {
+    record.textContent = formatCommandShortcut(state.commandShortcuts[commandName] || "", IS_MAC);
+  }
+  const clear = document.createElement("button");
+  clear.type = "button";
+  clear.className = "secondary shortcut-clear-btn";
+  clear.textContent = "Clear";
+  controls.append(record, clear);
+
+  row.append(labelWrap, controls);
+
+  const error = document.createElement("p");
+  error.className = "shortcut-error";
+  error.setAttribute("role", "status");
+  error.setAttribute("aria-live", "polite");
+
+  binding.append(row, error);
+  return binding;
+}
+
+function renderLensShortcuts() {
+  const list = document.getElementById("lens-shortcut-list");
+  if (!list) return;
+  const lenses = state.lenses.slice(0, 9);
+  if (lenses.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "shortcut-empty";
+    empty.textContent = "Save a lens to bind activation shortcuts.";
+    list.replaceChildren(empty);
+    return;
+  }
+  list.replaceChildren(...lenses.map((lens, index) => buildLensShortcutRow(lens, index)));
+}
+
+function renderShortcuts() {
+  renderShortcut();
+  renderCommandRow("show-all-groups");
+  renderCommandRow("cycle-lens-next");
+  renderCommandRow("cycle-lens-prev");
+  renderLensShortcuts();
 }
 
 function renderPerformanceSettings() {
@@ -2379,45 +2561,221 @@ async function persistShortcut(shortcut) {
   setShortcutStatus(shortcut ? "Saved" : "Tab search shortcut disabled", "ok");
 }
 
-function startRecordingShortcut() {
-  recordingShortcut = true;
-  setShortcutStatus("Recording\u2026 press your keys, or Esc to cancel.");
-  renderShortcut();
-  const button = document.getElementById("shortcut-record");
-  if (button) button.focus();
+function hasCommandsApi() {
+  return typeof browser !== "undefined" && !!browser.commands && typeof browser.commands.update === "function";
 }
 
-function onShortcutKeydown(event) {
-  if (!recordingShortcut) return;
+function commandUpdateErrorText(error) {
+  const message = error && error.message ? error.message : "";
+  return message ? `Couldn't set that shortcut: ${message}` : "Couldn't set that shortcut. Try another combination.";
+}
+
+function shortcutErrorEl(commandName) {
+  return document.querySelector(`.shortcut-binding[data-command="${commandName}"] .shortcut-error`);
+}
+
+function showRowError(commandName, message) {
+  if (commandName === "search-tabs") {
+    setShortcutStatus(message, "error");
+    return;
+  }
+  const el = shortcutErrorEl(commandName);
+  if (el) {
+    el.textContent = message;
+    el.classList.add("is-error");
+  }
+}
+
+function clearRowError(commandName) {
+  if (commandName === "search-tabs") {
+    setShortcutStatus("", "");
+    return;
+  }
+  const el = shortcutErrorEl(commandName);
+  if (el) {
+    el.textContent = "";
+    el.classList.remove("is-error");
+  }
+}
+
+function renderRecorderButton(commandName) {
+  if (commandName === "search-tabs") {
+    renderShortcut();
+  } else {
+    renderCommandRow(commandName);
+  }
+}
+
+function startRecordingRow(commandName, button) {
+  recordingCommand = commandName;
+  recordingButton = button;
+  clearRowError(commandName);
+  button.textContent = "Press a shortcut\u2026";
+  button.classList.add("recording");
+  button.focus();
+  if (commandName === "search-tabs") {
+    setShortcutStatus("Recording\u2026 press your keys, or Esc to cancel.");
+  }
+}
+
+function stopRecording() {
+  const commandName = recordingCommand;
+  recordingCommand = null;
+  recordingButton = null;
+  if (commandName) renderRecorderButton(commandName);
+}
+
+function onShortcutListClick(event) {
+  const recordBtn = event.target.closest(".shortcut-input");
+  if (recordBtn) {
+    const row = recordBtn.closest(".shortcut-binding");
+    if (row && row.dataset.command) startRecordingRow(row.dataset.command, recordBtn);
+    return;
+  }
+  const clearBtn = event.target.closest(".shortcut-clear-btn");
+  if (clearBtn) {
+    const row = clearBtn.closest(".shortcut-binding");
+    if (row && row.dataset.command) clearShortcutRow(row.dataset.command);
+  }
+}
+
+function onShortcutListKeydown(event) {
+  if (!recordingCommand || !recordingButton) return;
+  if (event.target.closest(".shortcut-input") !== recordingButton) return;
+  handleRecorderKeydown(event, recordingCommand);
+}
+
+function handleRecorderKeydown(event, commandName) {
   event.preventDefault();
   event.stopPropagation();
   const key = event.key;
   if (key === "Escape") {
-    recordingShortcut = false;
-    renderShortcut();
-    setShortcutStatus("Cancelled", "");
+    stopRecording();
+    if (commandName === "search-tabs") setShortcutStatus("Cancelled", "");
     return;
   }
   if (key === "Control" || key === "Alt" || key === "Shift" || key === "Meta" || key === "OS") {
     return; // wait for the non-modifier key
   }
-  const isFunctionKey = /^F\d{1,2}$/.test(key);
-  if (!event.ctrlKey && !event.altKey && !event.metaKey && !isFunctionKey) {
-    setShortcutStatus("Add at least one modifier (Ctrl, Alt, or Cmd).", "error");
-    return;
-  }
-  recordingShortcut = false;
-  const shortcut = {
+  const combo = {
     ctrl: event.ctrlKey,
     alt: event.altKey,
     shift: event.shiftKey,
     meta: event.metaKey,
     key: key.length === 1 ? key.toLowerCase() : key,
   };
-  persistShortcut(shortcut).catch((error) => {
+  const commandShortcut = shortcutToCommandFormat(combo, IS_MAC);
+  if (commandShortcut === null) {
+    showRowError(commandName, "Add at least one modifier (Ctrl, Alt, or Cmd).");
+    return; // stay recording so the user can try again
+  }
+  stopRecording();
+  clearRowError(commandName);
+  if (commandName === "search-tabs") {
+    applySearchTabsShortcut(combo, commandShortcut);
+  } else {
+    applyCommandShortcut(commandName, commandShortcut);
+  }
+}
+
+function applySearchTabsShortcut(combo, commandShortcut) {
+  persistShortcut(combo).catch((error) => {
     console.error("Tab search shortcut save failed:", error);
     setShortcutStatus("Save failed. See extension console.", "error");
   });
+  if (hasCommandsApi()) {
+    updateCommandShortcut("search-tabs", commandShortcut).catch((error) => {
+      console.error("search-tabs command update failed:", error);
+      showRowError("search-tabs", commandUpdateErrorText(error));
+    });
+  }
+}
+
+function applyCommandShortcut(commandName, commandShortcut) {
+  if (!hasCommandsApi()) {
+    state.commandShortcuts[commandName] = commandShortcut;
+    renderCommandRow(commandName);
+    return;
+  }
+  updateCommandShortcut(commandName, commandShortcut).catch((error) => {
+    console.error(`${commandName} command update failed:`, error);
+    showRowError(commandName, commandUpdateErrorText(error));
+  });
+}
+
+async function updateCommandShortcut(commandName, commandShortcut) {
+  await browser.commands.update({ name: commandName, shortcut: commandShortcut });
+  state.commandShortcuts[commandName] = commandShortcut;
+  renderRecorderButton(commandName);
+}
+
+function clearShortcutRow(commandName) {
+  if (recordingCommand === commandName) stopRecording();
+  clearRowError(commandName);
+  if (commandName === "search-tabs") {
+    persistShortcut(null).catch((error) => {
+      console.error("Tab search shortcut disable failed:", error);
+      setShortcutStatus("Save failed. See extension console.", "error");
+    });
+    if (hasCommandsApi()) {
+      browser.commands.reset("search-tabs")
+        .then(() => refreshCommandShortcuts())
+        .catch((error) => console.error("search-tabs command reset failed:", error));
+    }
+    return;
+  }
+  if (hasCommandsApi()) {
+    browser.commands.reset(commandName)
+      .then(() => {
+        state.commandShortcuts[commandName] = "";
+        renderRecorderButton(commandName);
+      })
+      .catch((error) => {
+        console.error(`${commandName} command reset failed:`, error);
+        showRowError(commandName, commandUpdateErrorText(error));
+      });
+    return;
+  }
+  state.commandShortcuts[commandName] = "";
+  renderCommandRow(commandName);
+}
+
+async function refreshCommandShortcuts() {
+  if (typeof browser === "undefined" || !browser.commands || typeof browser.commands.getAll !== "function") return;
+  try {
+    const all = await browser.commands.getAll();
+    const map = {};
+    for (const command of Array.isArray(all) ? all : []) {
+      if (command && typeof command.name === "string") {
+        map[command.name] = typeof command.shortcut === "string" ? command.shortcut : "";
+      }
+    }
+    state.commandShortcuts = map;
+    renderShortcuts();
+  } catch (error) {
+    console.error("commands.getAll failed:", error);
+  }
+}
+
+function setupAnchorNav() {
+  const nav = document.querySelector(".anchor-nav");
+  if (!nav || typeof IntersectionObserver !== "function") return;
+  const links = new Map();
+  for (const link of nav.querySelectorAll("a[href^='#']")) {
+    links.set(link.getAttribute("href").slice(1), link);
+  }
+  const sections = [...links.keys()].map((id) => document.getElementById(id)).filter(Boolean);
+  if (sections.length === 0) return;
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const link = links.get(entry.target.id);
+      if (!link) continue;
+      for (const other of links.values()) other.classList.remove("active");
+      link.classList.add("active");
+    }
+  }, { rootMargin: "-72px 0px -55% 0px", threshold: 0 });
+  for (const section of sections) observer.observe(section);
 }
 
 
@@ -2963,6 +3321,14 @@ document.addEventListener("DOMContentLoaded", () => {
       showToast("Not a valid lens code.", "error");
     });
   });
+  const importToggle = document.getElementById("import-lens-toggle");
+  if (importToggle) {
+    importToggle.addEventListener("click", toggleLensImport);
+  }
+  const importCancel = document.getElementById("lens-import-cancel");
+  if (importCancel) {
+    importCancel.addEventListener("click", closeLensImport);
+  }
 
 
   const syncLenses = document.getElementById("sync-lenses");
@@ -2975,23 +3341,26 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  const shortcutRecord = document.getElementById("shortcut-record");
-  if (shortcutRecord) {
-    shortcutRecord.addEventListener("click", startRecordingShortcut);
-    shortcutRecord.addEventListener("keydown", onShortcutKeydown);
+  const shortcutList = document.querySelector(".shortcut-list");
+  if (shortcutList) {
+    shortcutList.addEventListener("click", onShortcutListClick);
+    shortcutList.addEventListener("keydown", onShortcutListKeydown);
   }
-  document.getElementById("shortcut-reset").addEventListener("click", () => {
-    recordingShortcut = false;
-    persistShortcut({ ...DEFAULT_TAB_SEARCH_SHORTCUT }).catch((error) => {
-      console.error("Tab search shortcut reset failed:", error);
+
+  if (
+    typeof browser !== "undefined" &&
+    browser.commands &&
+    browser.commands.onChanged &&
+    typeof browser.commands.onChanged.addListener === "function"
+  ) {
+    browser.commands.onChanged.addListener((changeInfo) => {
+      if (changeInfo && typeof changeInfo.name === "string") {
+        state.commandShortcuts[changeInfo.name] =
+          typeof changeInfo.newShortcut === "string" ? changeInfo.newShortcut : "";
+        renderShortcuts();
+      }
     });
-  });
-  document.getElementById("shortcut-clear").addEventListener("click", () => {
-    recordingShortcut = false;
-    persistShortcut(null).catch((error) => {
-      console.error("Tab search shortcut disable failed:", error);
-    });
-  });
+  }
 
   const discardCollapsedTabs = document.getElementById("discard-collapsed-tabs");
   if (discardCollapsedTabs) {
@@ -3079,6 +3448,8 @@ document.addEventListener("DOMContentLoaded", () => {
       console.error("Firefox container refresh failed:", error);
     });
   });
+
+  setupAnchorNav();
 
   loadAll().catch((error) => {
     console.error("Tabloupe options load failed:", error);

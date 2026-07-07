@@ -50,7 +50,39 @@ main {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 28px;
+  margin-bottom: 18px;
+}
+
+.anchor-nav {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-bottom: 18px;
+  padding: 8px 0;
+  background: var(--bg);
+  border-bottom: 1px solid var(--card-border);
+}
+
+.anchor-nav a {
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.anchor-nav a:hover {
+  color: var(--accent-text);
+  background: var(--accent-tint);
+  text-decoration: none;
+}
+
+.anchor-nav a.active {
+  color: var(--accent-text);
+  background: var(--accent-tint);
 }
 
 h1,
@@ -90,7 +122,8 @@ a:hover {
   border: 1px solid var(--card-border);
   border-radius: var(--radius);
   padding: 22px 24px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
+  scroll-margin-top: 72px;
   box-shadow: var(--shadow);
 }
 
@@ -313,6 +346,107 @@ label span {
   margin-top: 12px;
   font-size: 12px;
   color: var(--faint);
+}
+
+.shortcut-footnote {
+  margin-top: 16px;
+}
+
+.shortcut-list {
+  display: grid;
+}
+
+.shortcut-binding {
+  display: grid;
+  gap: 8px;
+  padding: 14px 0;
+  border-top: 1px solid var(--card-border);
+}
+
+.shortcut-list > .shortcut-binding:first-child {
+  border-top: 0;
+  padding-top: 2px;
+}
+
+.shortcut-binding-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.shortcut-binding-label {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.shortcut-binding-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.shortcut-binding-desc {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.shortcut-binding-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--faint);
+}
+
+.shortcut-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.shortcut-error:empty,
+#shortcut-status:empty {
+  display: none;
+}
+
+.shortcut-error.is-error {
+  color: var(--danger);
+}
+
+.lens-shortcut-list {
+  display: grid;
+}
+
+.shortcut-empty {
+  margin: 0;
+  padding: 14px 0 2px;
+  border-top: 1px solid var(--card-border);
+  font-size: 13px;
+  color: var(--faint);
+}
+
+.setting-group {
+  display: grid;
+  gap: 8px;
+}
+
+.setting-group + .setting-group {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--card-border);
+}
+
+.setting-group-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+/* An explicit `display` overrides the UA [hidden] rule, so restore it. */
+.lens-code-import[hidden] {
+  display: none;
 }
 
 .diagnostics-details {
