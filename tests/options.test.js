@@ -22,12 +22,15 @@ async function settle() {
   await nextTick();
 }
 
-function createHarness({ storage = {}, groups = [], grantPermission = true, platform = "MacIntel" } = {}) {
+function createHarness({ storage = {}, groups = [], grantPermission = true, platform = "MacIntel", fetchHandler = null } = {}) {
   const storageData = clone(storage) || {};
   const groupState = clone(groups);
   const storageListeners = [];
   const messages = [];
   const permissionRequests = [];
+  const fetchCalls = [];
+  const clipboardWrites = [];
+  const prompts = [];
 
   const browser = {
     storage: {
@@ -49,6 +52,17 @@ function createHarness({ storage = {}, groups = [], grantPermission = true, plat
           for (const [key, value] of Object.entries(values)) {
             changes[key] = { oldValue: clone(storageData[key]), newValue: clone(value) };
             storageData[key] = clone(value);
+          }
+          for (const listener of storageListeners) {
+            listener(changes, "local");
+          }
+        },
+        async remove(keys) {
+          const list = Array.isArray(keys) ? keys : [keys];
+          const changes = {};
+          for (const key of list) {
+            changes[key] = { oldValue: clone(storageData[key]), newValue: undefined };
+            delete storageData[key];
           }
           for (const listener of storageListeners) {
             listener(changes, "local");
@@ -156,6 +170,26 @@ function createHarness({ storage = {}, groups = [], grantPermission = true, plat
         // Older jsdom versions may expose platform as non-configurable.
       }
       window.browser = browser;
+      Object.defineProperty(window.navigator, "clipboard", {
+        value: {
+          async writeText(text) {
+            clipboardWrites.push(text);
+          },
+        },
+        configurable: true,
+      });
+      window.prompt = (message, value) => {
+        prompts.push({ message, value });
+        return value;
+      };
+      window.fetch = async (url, init) => {
+        fetchCalls.push({ url: String(url), init });
+        if (typeof fetchHandler !== "function") {
+          throw new Error("unexpected fetch: " + url);
+        }
+        return fetchHandler(String(url), init);
+      };
+      window.AbortController = AbortController;
       // Polyfill requestAnimationFrame for jsdom if needed, but setTimeout works for settle
     }
   });
@@ -169,6 +203,9 @@ function createHarness({ storage = {}, groups = [], grantPermission = true, plat
     groupState,
     messages,
     permissionRequests,
+    fetchCalls,
+    clipboardWrites,
+    prompts,
   };
 }
 
@@ -367,6 +404,44 @@ test("chip remove sends lens-update without that selector", async () => {
 
   const update = lastMessageOfType(messages, "lens-update");
   assert.deepEqual(clone(update.patch.groupSelectors), [{ type: "glob", value: "Client *" }]);
+});
+
+test("Calendar events editor adds and removes patterns with lens-update patches", async () => {
+  const { document, messages } = createHarness({
+    storage: {
+      lenses: [lensFixture({
+        triggers: {
+          appleFocusIds: ["com.apple.focus.work"],
+          calendarPatterns: ["Daily Sync"],
+        },
+      })],
+    },
+  });
+  await settle();
+
+  const input = lensCard(document).querySelector(".calendar-editor .group-chip-input");
+  input.value = "Client *";
+  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await settle();
+
+  const addUpdate = lastMessageOfType(messages, "lens-update");
+  assert.ok(addUpdate);
+  assert.equal(addUpdate.lensId, "lens_work");
+  assert.deepEqual(clone(addUpdate.patch.triggers), {
+    appleFocusIds: ["com.apple.focus.work"],
+    calendarPatterns: ["Daily Sync", "Client *"],
+  });
+
+  lensCard(document).querySelector('[aria-label="Remove calendar pattern Daily Sync"]').click();
+  await settle();
+
+  const removeUpdate = lastMessageOfType(messages, "lens-update");
+  assert.ok(removeUpdate);
+  assert.equal(removeUpdate.lensId, "lens_work");
+  assert.deepEqual(clone(removeUpdate.patch.triggers), {
+    appleFocusIds: ["com.apple.focus.work"],
+    calendarPatterns: ["Client *"],
+  });
 });
 
 test("selector chips show no-match and glob match indicators", async () => {
@@ -1097,4 +1172,178 @@ test("saveProvider accepts loopback http:// URLs", async () => {
 
     assert.deepEqual(harness.storageData.aiProvider, { kind: "custom", baseURL, model: "m", apiKey: "k" });
   }
+});
+
+test("lens share exports only portable lens fields", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [{
+        id: "lens_work",
+        name: "Work",
+        icon: "briefcase",
+        color: "#3366ff",
+        groupSelectors: [{ type: "title", value: "Work" }],
+        triggers: { appleFocusIds: ["com.apple.focus.work"], calendarPatterns: ["Planning *"] },
+        createdAt: 1,
+        updatedAt: 2,
+      }],
+    },
+  });
+  await settle();
+
+  harness.document.querySelector(".lens-share-button").click();
+  await settle();
+
+  const payload = JSON.parse(harness.clipboardWrites[0]);
+  assert.deepEqual(Object.keys(payload).sort(), ["lens", "tabloupeLens"]);
+  assert.equal(payload.tabloupeLens, 1);
+  assert.deepEqual(payload.lens, {
+    name: "Work",
+    icon: "briefcase",
+    color: "#3366ff",
+    groupSelectors: [{ type: "title", value: "Work" }],
+  });
+});
+
+test("lens import appends a fresh lens and rejects malformed codes without writing", async () => {
+  const existing = lensFixture({ id: "lens_existing", name: "Existing" });
+  const harness = createHarness({ storage: { lenses: [existing] } });
+  await settle();
+
+  const importedCode = JSON.stringify({
+    tabloupeLens: 1,
+    lens: {
+      id: "lens_stolen",
+      name: "Imported",
+      icon: "star",
+      color: "#ff00aa",
+      groupSelectors: [{ type: "glob", value: "Client*" }],
+      triggers: { appleFocusIds: ["com.apple.focus.personal"] },
+      calendarPatterns: ["Private *"],
+    },
+  });
+  harness.document.getElementById("lens-import-code").value = importedCode;
+  harness.document.getElementById("lens-import-add").click();
+  await settle();
+
+  assert.equal(harness.storageData.lenses.length, 2);
+  const imported = harness.storageData.lenses[1];
+  assert.ok(imported.id.startsWith("lens_"));
+  assert.notEqual(imported.id, "lens_stolen");
+  assert.equal(imported.name, "Imported");
+  assert.equal(imported.icon, "star");
+  assert.equal(imported.color, "#ff00aa");
+  assert.deepEqual(imported.groupSelectors, [{ type: "glob", value: "Client*" }]);
+  assert.deepEqual(imported.triggers.appleFocusIds, []);
+  assert.deepEqual(imported.triggers.calendarPatterns, []);
+
+  const before = JSON.stringify(harness.storageData.lenses);
+  harness.document.getElementById("lens-import-code").value = "{not json";
+  harness.document.getElementById("lens-import-add").click();
+  await settle();
+
+  assert.equal(JSON.stringify(harness.storageData.lenses), before);
+  assert.equal(harness.document.querySelector("#toast-host .toast").textContent, "Not a valid lens code.");
+});
+
+test("provider test connection lists models and persists successful diagnostics", async () => {
+  const harness = createHarness({
+    fetchHandler: async (url) => {
+      assert.equal(url, "https://api.example.com/v1/models");
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { data: [{ id: "model-a" }, { id: "model-b" }] };
+        },
+      };
+    },
+  });
+  await settle();
+
+  const custom = harness.document.querySelector('input[name="provider-kind"][value="custom"]');
+  custom.checked = true;
+  custom.dispatchEvent(new harness.window.Event("change"));
+  harness.document.getElementById("provider-url").value = "https://api.example.com/v1";
+  harness.document.getElementById("provider-model").value = "model-a";
+  harness.document.getElementById("provider-key").value = "sk-test";
+  harness.document.getElementById("provider-test").click();
+  await settle();
+
+  assert.deepEqual([...harness.document.querySelectorAll("#provider-models option")].map((option) => option.value), ["model-a", "model-b"]);
+  assert.equal(harness.document.getElementById("provider-test-status").textContent, "Found 2 models.");
+  assert.equal(harness.storageData.lastProviderCheck.ok, true);
+  assert.equal(harness.storageData.lastProviderCheck.detail, "Found 2 models.");
+});
+
+test("provider test connection falls back to completions and records HTTP failures", async () => {
+  const harness = createHarness({
+    fetchHandler: async (url) => {
+      if (url === "https://api.example.com/v1/models") {
+        return { ok: false, status: 404 };
+      }
+      assert.equal(url, "https://api.example.com/v1/chat/completions");
+      return { ok: false, status: 500 };
+    },
+  });
+  await settle();
+
+  const custom = harness.document.querySelector('input[name="provider-kind"][value="custom"]');
+  custom.checked = true;
+  custom.dispatchEvent(new harness.window.Event("change"));
+  harness.document.getElementById("provider-url").value = "https://api.example.com/v1";
+  harness.document.getElementById("provider-model").value = "model-a";
+  harness.document.getElementById("provider-test").click();
+  await settle();
+
+  assert.deepEqual(harness.fetchCalls.map((call) => call.url), [
+    "https://api.example.com/v1/models",
+    "https://api.example.com/v1/chat/completions",
+  ]);
+  assert.equal(harness.document.getElementById("provider-test-status").textContent, "Connection failed: HTTP 500");
+  assert.equal(harness.storageData.lastProviderCheck.ok, false);
+  assert.equal(harness.storageData.lastProviderCheck.detail, "Connection failed: HTTP 500");
+});
+
+test("sync toggle persists syncLenses and renders syncLastError", async () => {
+  const harness = createHarness({ storage: { syncLastError: "quota exceeded" } });
+  await settle();
+
+  const error = harness.document.getElementById("sync-last-error");
+  assert.equal(error.hidden, false);
+  assert.equal(error.textContent, "Sync issue: quota exceeded");
+
+  const checkbox = harness.document.getElementById("sync-lenses");
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new harness.window.Event("change"));
+  await settle();
+  assert.equal(harness.storageData.syncLenses, true);
+
+  await harness.browser.storage.local.set({ syncLastError: "network down" });
+  assert.equal(error.hidden, false);
+  assert.equal(error.textContent, "Sync issue: network down");
+});
+
+test("pairing token field saves lowercase hex, rejects invalid input, and clears empty saves", async () => {
+  const harness = createHarness();
+  await settle();
+
+  const input = harness.document.getElementById("bus-token");
+  input.value = "A".repeat(64);
+  harness.document.getElementById("bus-token-save").click();
+  await settle();
+  assert.equal(harness.storageData.busToken, "a".repeat(64));
+  assert.equal(input.value, "a".repeat(64));
+
+  input.value = "g".repeat(64);
+  harness.document.getElementById("bus-token-save").click();
+  await settle();
+  assert.equal(harness.storageData.busToken, "a".repeat(64));
+  assert.equal(harness.document.querySelector("#toast-host .toast").textContent, "Pairing token must be 64 lowercase hex characters.");
+
+  input.value = "";
+  harness.document.getElementById("bus-token-save").click();
+  await settle();
+  assert.equal(Object.prototype.hasOwnProperty.call(harness.storageData, "busToken"), false);
+  assert.equal(harness.document.querySelector("#toast-host .toast").textContent, "Pairing token cleared.");
 });

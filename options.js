@@ -164,6 +164,7 @@ function normalizeLens(value) {
     groupSelectors: normalizeSelectors(value.groupSelectors),
     triggers: {
       appleFocusIds: isRecord(value.triggers) ? normalizeStringArray(value.triggers.appleFocusIds) : [],
+      calendarPatterns: isRecord(value.triggers) ? normalizePatternArray(value.triggers.calendarPatterns) : [],
     },
     createdAt: typeof value.createdAt === "number" ? value.createdAt : Date.now(),
     updatedAt: typeof value.updatedAt === "number" ? value.updatedAt : Date.now(),
@@ -244,6 +245,23 @@ function normalizeCurrentGroups(value) {
 function normalizeStringArray(value) {
   return Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
 }
+function normalizePatternArray(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set();
+  const result = [];
+  for (const entry of value) {
+    const pattern = typeof entry === "string" ? entry.trim() : "";
+    if (!pattern || seen.has(pattern)) {
+      continue;
+    }
+    seen.add(pattern);
+    result.push(pattern);
+  }
+  return result;
+}
+
 
 function normalizeLastError(value) {
   if (
@@ -582,7 +600,7 @@ function cloneLensForRestore(lens) {
   return {
     ...lens,
     groupSelectors: lens.groupSelectors.map((selector) => ({ ...selector })),
-    triggers: { appleFocusIds: [...lens.triggers.appleFocusIds] },
+    triggers: { appleFocusIds: [...lens.triggers.appleFocusIds], calendarPatterns: [...lens.triggers.calendarPatterns] },
   };
 }
 
@@ -599,7 +617,7 @@ function isProvisionalDefaultName(name) {
 }
 
 function lensHasNoBindings(lens) {
-  return lens.groupSelectors.length === 0 && lens.triggers.appleFocusIds.length === 0;
+  return lens.groupSelectors.length === 0 && lens.triggers.appleFocusIds.length === 0 && lens.triggers.calendarPatterns.length === 0;
 }
 
 function syncUntouchedDefaultLenses() {
@@ -722,7 +740,7 @@ function importedLensFromCode(code, existingLenses) {
     icon: parsed.lens.icon,
     color: parsed.lens.color,
     groupSelectors: parsed.lens.groupSelectors,
-    triggers: { appleFocusIds: [] },
+    triggers: { appleFocusIds: [], calendarPatterns: [] },
     createdAt: now,
     updatedAt: now,
   });
@@ -869,6 +887,37 @@ function removeSelectorFromLens(lensId, selector) {
     setStatus("Save failed. See extension console.", "error");
   });
 }
+function addCalendarPatternToLens(lensId, value) {
+  const lens = findLens(lensId);
+  const pattern = typeof value === "string" ? value.trim() : "";
+  if (!lens || !pattern || lens.triggers.calendarPatterns.includes(pattern)) return;
+  const triggers = {
+    ...lens.triggers,
+    calendarPatterns: [...lens.triggers.calendarPatterns, pattern],
+  };
+  const patch = {
+    triggers,
+    ...firstBindingAutoNamePatch(lens, pattern, lensHasNoBindings(lens)),
+  };
+  persistLensPatch(lensId, patch, "Calendar pattern saved").catch((error) => {
+    console.error("Calendar pattern save failed:", error);
+    setStatus("Save failed. See extension console.", "error");
+  });
+}
+
+function removeCalendarPatternFromLens(lensId, pattern) {
+  const lens = findLens(lensId);
+  if (!lens) return;
+  const triggers = {
+    ...lens.triggers,
+    calendarPatterns: lens.triggers.calendarPatterns.filter((entry) => entry !== pattern),
+  };
+  persistLensPatch(lensId, { triggers }, "Calendar pattern removed").catch((error) => {
+    console.error("Calendar pattern removal failed:", error);
+    setStatus("Save failed. See extension console.", "error");
+  });
+}
+
 
 function globToRegExp(pattern) {
   const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -947,6 +996,25 @@ function makePatternChip(lensId, selector) {
   chip.querySelector(".group-chip-remove").setAttribute("aria-label", `Remove pattern ${selector.value}`);
   return chip;
 }
+function makeCalendarPatternChip(lensId, pattern) {
+  const chip = document.createElement("span");
+  chip.className = "group-chip group-chip-pattern";
+  const label = document.createElement("span");
+  label.className = "group-chip-label";
+  label.textContent = pattern;
+  const badge = document.createElement("span");
+  badge.className = "group-chip-badge";
+  badge.textContent = "calendar";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "group-chip-remove";
+  remove.setAttribute("aria-label", `Remove calendar pattern ${pattern}`);
+  remove.textContent = "\u00d7";
+  remove.addEventListener("click", () => removeCalendarPatternFromLens(lensId, pattern));
+  chip.append(label, badge, remove);
+  return chip;
+}
+
 
 function lensIconGlyph(icon) {
   const glyphs = {
@@ -1477,6 +1545,40 @@ function makeScheduleEditor(lens) {
   wrap.append(label, row, hint);
   return wrap;
 }
+function makeCalendarPatternEditor(lens) {
+  const wrap = document.createElement("div");
+  wrap.className = "calendar-editor";
+  const heading = document.createElement("p");
+  heading.className = "selector-heading";
+  heading.textContent = "Calendar events";
+  const chips = document.createElement("span");
+  chips.className = "group-chips";
+  for (const pattern of lens.triggers.calendarPatterns) {
+    chips.append(makeCalendarPatternChip(lens.id, pattern));
+  }
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "group-chip-input";
+  input.autocomplete = "off";
+  input.placeholder = "+ add event pattern\u2026";
+  input.setAttribute("aria-label", `Add a calendar event pattern to ${lens.name}`);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addCalendarPatternToLens(lens.id, input.value);
+    } else if (event.key === "Escape") {
+      input.value = "";
+      input.blur();
+    }
+  });
+  chips.append(input);
+  const hint = document.createElement("p");
+  hint.className = "field-hint";
+  hint.textContent = "Activates this lens while a matching calendar event is running (requires the macOS helper with calendar enabled). Glob patterns match event titles.";
+  wrap.append(heading, chips, hint);
+  return wrap;
+}
+
 
 
 function renderLensCard(lens, index) {
@@ -1662,7 +1764,7 @@ function renderLensCard(lens, index) {
   const hint = document.createElement("p");
   hint.className = "pattern-hint";
   hint.textContent = "* = any text, ? = one character, e.g. Client *";
-  panel.append(hint, makeLensStyleEditor(lens), makeScheduleEditor(lens));
+  panel.append(hint, makeLensStyleEditor(lens), makeScheduleEditor(lens), makeCalendarPatternEditor(lens));
   selectorSection.append(panel);
   card.append(selectorSection);
 
@@ -1994,11 +2096,14 @@ async function restoreDeletedLens(deletedLens, originalIndex) {
     color: deletedLens.color,
     groupSelectors: deletedLens.groupSelectors.map((selector) => ({ ...selector })),
   };
+  if (deletedLens.triggers.calendarPatterns.length > 0) {
+    patch.triggers = { calendarPatterns: [...deletedLens.triggers.calendarPatterns] };
+  }
   await browser.runtime.sendMessage({ type: "lens-update", lensId, patch });
   let restored = normalizeLens({
     ...response.lens,
     ...patch,
-    triggers: { appleFocusIds: [] },
+    triggers: { appleFocusIds: [], calendarPatterns: [...deletedLens.triggers.calendarPatterns] },
   });
   if (restored) {
     state.lenses = normalizeLenses([...state.lenses.filter((lens) => lens.id !== lensId), restored]);
@@ -2006,7 +2111,10 @@ async function restoreDeletedLens(deletedLens, originalIndex) {
   for (const focusId of deletedLens.triggers.appleFocusIds) {
     await browser.runtime.sendMessage({ type: "lens-link-focus", lensId, focusId });
     restored = replaceLensInState(lensId, {
-      triggers: { appleFocusIds: [...((restored && restored.triggers.appleFocusIds) || []), focusId] },
+      triggers: {
+        ...((restored && restored.triggers) || { calendarPatterns: [] }),
+        appleFocusIds: [...((restored && restored.triggers.appleFocusIds) || []), focusId],
+      },
     });
   }
   const orderedIds = state.lenses.map((lens) => lens.id).filter((id) => id !== lensId);

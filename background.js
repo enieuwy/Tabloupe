@@ -70,6 +70,7 @@ const LEGACY_MAP_KEY = "focus" + "Mappings";
 // (not memory) so a focus-off arriving after the event page suspended, or a
 // stale same-id replay on reconnect, is still handled correctly.
 const LAST_APPLIED_APPLE_FOCUS_KEY = "lastAppliedAppleFocusId";
+const LAST_APPLIED_CALENDAR_TRIGGER_KEY = "lastAppliedCalendarTriggerId";
 let focusBadge = { text: "", color: null, title: "Tabloupe" };
 const transientViewsByWindow = new Map();
 let lastError = null;
@@ -437,6 +438,22 @@ function normalizedSelectors(value) {
   }
   return selectors;
 }
+function normalizedTriggerStrings(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set();
+  const result = [];
+  for (const entry of value) {
+    const raw = typeof entry === "string" ? entry.trim() : "";
+    if (raw === "" || seen.has(raw)) {
+      continue;
+    }
+    seen.add(raw);
+    result.push(raw);
+  }
+  return result;
+}
 
 function isSpecialCookieStoreId(cookieStoreId) {
   return cookieStoreId === DEFAULT_COOKIE_STORE_ID || cookieStoreId === PRIVATE_COOKIE_STORE_ID;
@@ -499,9 +516,8 @@ function normalizeLens(lens) {
     color: typeof lens.color === "string" ? lens.color : null,
     groupSelectors: normalizedSelectors(lens.groupSelectors),
     triggers: {
-      appleFocusIds: Array.isArray(triggers.appleFocusIds)
-        ? [...new Set(triggers.appleFocusIds.filter((id) => typeof id === "string" && id !== ""))]
-        : [],
+      appleFocusIds: normalizedTriggerStrings(triggers.appleFocusIds),
+      calendarPatterns: normalizedTriggerStrings(triggers.calendarPatterns),
     },
     createdAt: typeof lens.createdAt === "number" ? lens.createdAt : Date.now(),
     updatedAt: typeof lens.updatedAt === "number" ? lens.updatedAt : Date.now(),
@@ -1287,7 +1303,7 @@ async function migrateToLensesV2() {
         icon: typeof catalogEntry.icon === "string" && catalogEntry.icon ? catalogEntry.icon : "target",
         color: typeof catalogEntry.color === "string" ? catalogEntry.color : null,
         groupSelectors: selectors,
-        triggers: { appleFocusIds: [] },
+        triggers: { appleFocusIds: [], calendarPatterns: [] },
         createdAt: now,
         updatedAt: now,
         migratedFrom: { focusIds: [] },
@@ -1312,27 +1328,30 @@ function isGlobPattern(entry) {
   return /[*?]/.test(entry);
 }
 
-function globToRegExp(pattern) {
+function globToRegExp(pattern, flags = "") {
   const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const body = escaped.replace(/\\\*/g, ".*").replace(/\\\?/g, ".");
-  return new RegExp(`^${body}$`);
+  return new RegExp(`^${body}$`, flags);
 }
 
-function buildTitleMatcher(titles) {
+function buildTitleMatcher(titles, { caseInsensitive = false } = {}) {
   const exact = new Set();
   const globs = [];
   for (const entry of titles) {
     if (isGlobPattern(entry)) {
       try {
-        globs.push(globToRegExp(entry));
+        globs.push(globToRegExp(entry, caseInsensitive ? "i" : ""));
       } catch (error) {
         console.error("Invalid title selector glob:", entry, error);
       }
     } else {
-      exact.add(entry);
+      exact.add(caseInsensitive ? entry.toLowerCase() : entry);
     }
   }
-  return (title) => exact.has(title) || globs.some((re) => re.test(title));
+  return (title) => {
+    const value = caseInsensitive ? title.toLowerCase() : title;
+    return exact.has(value) || globs.some((re) => re.test(title));
+  };
 }
 
 // MCC owns the Focus catalog (id -> {name, icon, color}); cache what it
@@ -1429,13 +1448,92 @@ async function handleAppleFocus(rawId) {
     await browser.storage.local.set({ [LAST_APPLIED_APPLE_FOCUS_KEY]: rawId });
   }
 }
+function normalizeCalendarEvents(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter(isRecord)
+    .map((event) => {
+      const id = typeof event.id === "string" ? event.id.trim() : "";
+      const title = typeof event.title === "string" ? event.title : "";
+      const start = typeof event.start === "string" ? event.start : "";
+      const startMs = Date.parse(start);
+      if (!id || !title || !start || !Number.isFinite(startMs)) {
+        return null;
+      }
+      return { id, title, start, triggerId: `${id}|${start}`, startMs };
+    })
+    .filter(Boolean);
+}
+
+function calendarLensMatch(events, lenses) {
+  const matchers = lenses
+    .map((lens, lensIndex) => ({
+      lens,
+      lensIndex,
+      matches: buildTitleMatcher(lens.triggers.calendarPatterns, { caseInsensitive: true }),
+    }))
+    .filter((entry) => entry.lens.triggers.calendarPatterns.length > 0);
+  let best = null;
+  for (const event of events) {
+    for (const entry of matchers) {
+      if (!entry.matches(event.title)) {
+        continue;
+      }
+      if (!best ||
+          event.startMs < best.event.startMs ||
+          (event.startMs === best.event.startMs && entry.lensIndex < best.lensIndex)) {
+        best = { event, lens: entry.lens, lensIndex: entry.lensIndex };
+      }
+      break;
+    }
+  }
+  return best;
+}
+
+async function handleCalendarEvents(payload) {
+  const events = normalizeCalendarEvents(isRecord(payload) ? payload.events : []);
+  const activeTriggerIds = new Set(events.map((event) => event.triggerId));
+  const [lenses, stored] = await Promise.all([
+    getLenses(),
+    browser.storage.local.get(["lastActivation", LAST_APPLIED_CALENDAR_TRIGGER_KEY]),
+  ]);
+  const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
+  const previousTriggerId = typeof stored[LAST_APPLIED_CALENDAR_TRIGGER_KEY] === "string"
+    ? stored[LAST_APPLIED_CALENDAR_TRIGGER_KEY]
+    : null;
+  const match = calendarLensMatch(events, lenses);
+  if (match) {
+    if (match.event.triggerId === previousTriggerId) {
+      return;
+    }
+    const applied = await activateView(
+      { kind: "lens", lensId: match.lens.id },
+      { trigger: "calendar", triggerId: match.event.triggerId }
+    );
+    if (applied !== false) {
+      await browser.storage.local.set({ [LAST_APPLIED_CALENDAR_TRIGGER_KEY]: match.event.triggerId });
+    }
+    return;
+  }
+  if (previousTriggerId === null || activeTriggerIds.has(previousTriggerId)) {
+    return;
+  }
+  await browser.storage.local.set({ [LAST_APPLIED_CALENDAR_TRIGGER_KEY]: null });
+  if (lastActivation.trigger !== "calendar" || lastActivation.triggerId !== previousTriggerId) {
+    return;
+  }
+  await activateView(await getAutomationFallback(), { trigger: "calendar", triggerId: previousTriggerId });
+}
+
 
 async function handleMessage(event) {
   const msg = isRecord(event) && hasOwn(event, "data") ? JSON.parse(event.data) : event;
   // MCC multiplexes several state subsystems on this socket (focus, bluetooth,
-  // wireguard, ...), each wrapped in a StateEnvelope { type, schemaVersion, ts,
-  // payload }. Apple Focus envelopes optionally trigger a lens; focusCatalog
-  // carries the id -> {name, icon, color} table.
+  // calendar, wireguard, ...), each wrapped in a StateEnvelope { type,
+  // schemaVersion, ts, payload }. Apple Focus and Calendar envelopes optionally
+  // trigger a lens; focusCatalog carries the id -> {name, icon, color} table.
   if (!isRecord(msg)) {
     return;
   }
@@ -1446,6 +1544,10 @@ async function handleMessage(event) {
   if (msg.type === "focusCatalog") {
     const payload = isRecord(msg.payload) ? msg.payload : {};
     await mergeFocusCatalog(payload.entries);
+    return;
+  }
+  if (msg.type === "calendarEvents") {
+    await handleCalendarEvents(isRecord(msg.payload) ? msg.payload : {});
     return;
   }
   if (msg.type !== "focus") {
@@ -1673,7 +1775,7 @@ async function handleLensSave(msg) {
     icon: typeof msg.icon === "string" && msg.icon ? msg.icon : "target",
     color: typeof msg.color === "string" ? msg.color : null,
     groupSelectors: selectorsFromTitles(titles),
-    triggers: { appleFocusIds: [] },
+    triggers: { appleFocusIds: [], calendarPatterns: [] },
     createdAt: now,
     updatedAt: now,
   };
@@ -1700,9 +1802,12 @@ async function handleLensUpdate(msg) {
   if (hasOwn(patch, "groupSelectors")) updated.groupSelectors = normalizedSelectors(patch.groupSelectors);
   if (isRecord(patch.triggers)) {
     updated.triggers = {
-      appleFocusIds: Array.isArray(patch.triggers.appleFocusIds)
-        ? [...new Set(patch.triggers.appleFocusIds.filter((id) => typeof id === "string" && id !== ""))]
+      appleFocusIds: hasOwn(patch.triggers, "appleFocusIds")
+        ? normalizedTriggerStrings(patch.triggers.appleFocusIds)
         : updated.triggers.appleFocusIds,
+      calendarPatterns: hasOwn(patch.triggers, "calendarPatterns")
+        ? normalizedTriggerStrings(patch.triggers.calendarPatterns)
+        : updated.triggers.calendarPatterns,
     };
   }
   updated.updatedAt = Date.now();
@@ -1737,7 +1842,7 @@ async function handleLensLinkFocus(msg) {
   for (const lens of lenses) {
     const ids = Array.isArray(lens.triggers?.appleFocusIds) ? lens.triggers.appleFocusIds : [];
     if (ids.includes(focusId)) {
-      lens.triggers = { appleFocusIds: ids.filter((id) => id !== focusId) };
+      lens.triggers = { ...lens.triggers, appleFocusIds: ids.filter((id) => id !== focusId) };
       lens.updatedAt = Date.now();
       changed = true;
     }
@@ -1748,7 +1853,7 @@ async function handleLensLinkFocus(msg) {
       return { ok: false, error: "missing_lens" };
     }
     const ids = Array.isArray(target.triggers?.appleFocusIds) ? target.triggers.appleFocusIds : [];
-    target.triggers = { appleFocusIds: [...new Set([...ids, focusId])] };
+    target.triggers = { ...target.triggers, appleFocusIds: [...new Set([...ids, focusId])] };
     target.updatedAt = Date.now();
     changed = true;
   }

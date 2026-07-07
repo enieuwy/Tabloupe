@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
+const crypto = require("node:crypto");
 
 const backgroundSource = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
 
@@ -60,8 +61,11 @@ function createHarness({
   noSearchApi = false,
   groupFailTabIds = [],
   sessionData: sessionDataInput = null,
+  storageSync = null,
+  containers = null,
 } = {}) {
   const storageData = clone(storage) || {};
+  const syncData = storageSync === null ? null : clone(storageSync) || {};
   const sessionData = sessionDataInput || {};
   const groupState = clone(groups);
   const tabState = clone(tabs);
@@ -81,15 +85,21 @@ function createHarness({
   const groupCreations = [];
   const windowUpdates = [];
   const removedTabs = [];
+  const discardedTabs = [];
   const tabCreations = [];
   const tabMessages = [];
   const commandListeners = [];
   const tabCreatedListeners = [];
   const tabUpdatedListeners = [];
+  const syncSets = [];
+  const syncRemoves = [];
+  const identityQueries = [];
+  const identityListeners = [];
   const fetchCalls = [];
   const historySearches = [];
   const searchQueries = [];
   let historyResults = history;
+  let nextTabId = Math.max(1000, ...tabState.map((tab) => (typeof tab.id === "number" ? tab.id : 0))) + 1;
   const timers = new Map();
   const consoleErrors = [];
   const consoleWarnings = [];
@@ -199,6 +209,64 @@ function createHarness({
           }
         },
       },
+      ...(syncData ? {
+        sync: {
+          async get(keys) {
+            if (keys === null || keys === undefined) {
+              return clone(syncData) || {};
+            }
+            if (typeof keys === "string") {
+              return { [keys]: clone(syncData[keys]) };
+            }
+            if (Array.isArray(keys)) {
+              const output = {};
+              for (const key of keys) {
+                output[key] = clone(syncData[key]);
+              }
+              return output;
+            }
+            const output = { ...keys };
+            for (const key of Object.keys(keys)) {
+              if (Object.prototype.hasOwnProperty.call(syncData, key)) {
+                output[key] = clone(syncData[key]);
+              }
+            }
+            return output;
+          },
+          async set(values) {
+            const changes = {};
+            syncSets.push(clone(values));
+            for (const [key, value] of Object.entries(values)) {
+              changes[key] = {
+                oldValue: clone(syncData[key]),
+                newValue: clone(value),
+              };
+              syncData[key] = clone(value);
+            }
+            for (const listener of storageListeners) {
+              Promise.resolve().then(() => listener(changes, "sync"));
+            }
+          },
+          async remove(keys) {
+            const list = Array.isArray(keys) ? keys : [keys];
+            const changes = {};
+            syncRemoves.push(clone(list));
+            for (const key of list) {
+              if (typeof key !== "string") continue;
+              changes[key] = {
+                oldValue: clone(syncData[key]),
+                newValue: undefined,
+              };
+              delete syncData[key];
+            }
+            if (Object.keys(changes).length > 0) {
+              for (const listener of storageListeners) {
+                Promise.resolve().then(() => listener(changes, "sync"));
+              }
+            }
+          },
+        },
+      } : {}),
       session: {
         async get(keys) {
           if (keys === null || keys === undefined) {
@@ -291,8 +359,20 @@ function createHarness({
         }));
       },
       async create(props) {
+        const created = { id: nextTabId, windowId: currentWindowId, active: false, ...clone(props) };
+        nextTabId += 1;
+        if (created.active) {
+          const targetWindowId = typeof created.windowId === "number" ? created.windowId : currentWindowId;
+          for (const candidate of tabState) {
+            const candidateWindowId = typeof candidate.windowId === "number" ? candidate.windowId : currentWindowId;
+            if (candidateWindowId === targetWindowId) {
+              candidate.active = false;
+            }
+          }
+        }
+        tabState.push(clone(created));
         tabCreations.push(clone(props));
-        return { id: 999, ...props };
+        return clone(created);
       },
       async update(id, patch) {
         const tab = tabState.find((candidate) => candidate.id === id);
@@ -368,10 +448,16 @@ function createHarness({
         return clone(tabIds.map((tabId) => tabState.find((candidate) => candidate.id === tabId)).filter(Boolean));
       },
       async discard(id) {
-        const tab = tabState.find((candidate) => candidate.id === id);
-        assert.ok(tab, `tab ${id} exists`);
-        tab.discarded = true;
-        return clone(tab);
+        const ids = Array.isArray(id) ? id : [id];
+        const discarded = [];
+        for (const tabId of ids) {
+          const tab = tabState.find((candidate) => candidate.id === tabId);
+          assert.ok(tab, `tab ${tabId} exists`);
+          tab.discarded = true;
+          discardedTabs.push(tabId);
+          discarded.push(clone(tab));
+        }
+        return Array.isArray(id) ? discarded : discarded[0];
       },
       async sendMessage(tabId, message) {
         tabMessages.push({ tabId, message: clone(message) });
@@ -391,6 +477,24 @@ function createHarness({
       },
     },
   };
+
+  if (containers !== null) {
+    const containerState = clone(containers) || [];
+    const event = {
+      addListener(listener) {
+        identityListeners.push(listener);
+      },
+    };
+    browser.contextualIdentities = {
+      async query(query = {}) {
+        identityQueries.push(clone(query));
+        return clone(containerState);
+      },
+      onCreated: event,
+      onRemoved: event,
+      onUpdated: event,
+    };
+  }
 
   if (!noHistoryApi) {
     browser.history = {
@@ -465,6 +569,8 @@ function createHarness({
     fetch: fakeFetch,
     AbortController,
     URL,
+    crypto: crypto.webcrypto,
+    TextEncoder,
   };
   vm.createContext(context);
   vm.runInContext(backgroundSource, context, { filename: "background.js" });
@@ -497,10 +603,16 @@ function createHarness({
     firstGroupUpdate,
     windowUpdates,
     removedTabs,
+    discardedTabs,
     tabCreations,
     tabMessages,
     historySearches,
     searchQueries,
+    syncData,
+    syncSets,
+    syncRemoves,
+    identityQueries,
+    identityListeners,
     commandListeners,
     tabCreatedListeners,
     tabUpdatedListeners,
@@ -560,17 +672,57 @@ function twoGroups() {
   };
 }
 
-function lens(id, name, selectors, appleFocusIds = []) {
+function lens(id, name, selectors, appleFocusIds = [], calendarPatterns = []) {
   return {
     id,
     name,
     icon: "target",
     color: null,
     groupSelectors: selectors,
-    triggers: { appleFocusIds },
+    triggers: { appleFocusIds, calendarPatterns },
     createdAt: 1,
     updatedAt: 1,
   };
+}
+
+function nodeHmacHex(token, message) {
+  return crypto.createHmac("sha256", Buffer.from(token, "utf8")).update(message).digest("hex");
+}
+
+async function sendSocketFrame(socket, message) {
+  socket.onmessage({ data: JSON.stringify(message) });
+  await settle();
+}
+
+async function authenticateBus(harness, token, nonce = "00112233445566778899aabbccddeeff") {
+  const socket = harness.sockets[0];
+  socket.onopen();
+  await settle();
+
+  await sendSocketFrame(socket, { type: "hello", schemaVersion: 1, payload: { nonce } });
+  await waitFor(() => assert.equal(harness.sentMessages[0] && harness.sentMessages[0].type, "auth"));
+  const auth = harness.sentMessages[0];
+  assert.equal(
+    auth.payload.mac,
+    nodeHmacHex(token, `tabloupe-client|${nonce}|${auth.payload.clientNonce}`)
+  );
+
+  await sendSocketFrame(socket, {
+    type: "authOk",
+    schemaVersion: 1,
+    payload: {
+      mac: nodeHmacHex(token, `tabloupe-server|${auth.payload.clientNonce}|${nonce}`),
+    },
+  });
+  await waitFor(() => assert.equal(harness.storageData.busPairingStatus, "paired"));
+  return { socket, auth };
+}
+
+const BUS_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+async function authenticatedBusSocket(harness) {
+  const { socket } = await authenticateBus(harness, BUS_TOKEN);
+  return socket;
 }
 
 test("badge error indicator takes priority and clears back to focus badge", async () => {
@@ -881,6 +1033,249 @@ test("Apple Focus off returns to fallback only while automation owns the view", 
   await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 3, payload: { focus: null } }) });
   assert.deepEqual(harness.storageData.activeView, { kind: "all" });
   assert.equal(harness.groupState.every((group) => group.collapsed === false), true);
+});
+
+test("Calendar events activate glob and exact-title lenses without substring matches", async () => {
+  const exactStart = "2026-07-07T09:00:00.000Z";
+  const globStart = "2026-07-07T10:00:00.000Z";
+  const harness = createHarness({
+    storage: {
+      busToken: BUS_TOKEN,
+      lenses: [
+        lens("lens_substring", "Substring", [{ type: "title", value: "Substring" }], [], ["Hands"]),
+        lens("lens_exact", "Exact", [{ type: "title", value: "Exact" }], [], ["All Hands"]),
+        lens("lens_glob", "Glob", [{ type: "title", value: "Glob" }], [], ["Sprint *"]),
+      ],
+    },
+    groups: [
+      { id: 1, title: "Substring", collapsed: false },
+      { id: 2, title: "Exact", collapsed: true },
+      { id: 3, title: "Glob", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, groupId: 1, active: true },
+      { id: 20, groupId: 2, active: false },
+      { id: 30, groupId: 3, active: false },
+    ],
+  });
+  await settle();
+  const socket = await authenticatedBusSocket(harness);
+
+  await sendSocketFrame(socket, {
+    type: "calendarEvents",
+    schemaVersion: 1,
+    payload: { events: [{ id: "evt-exact", title: "All Hands", start: exactStart }] },
+  });
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_exact" }));
+  assert.equal(harness.storageData.lastActivation.trigger, "calendar");
+  assert.equal(harness.storageData.lastActivation.triggerId, `evt-exact|${exactStart}`);
+  assert.equal(harness.storageData.lastAppliedCalendarTriggerId, `evt-exact|${exactStart}`);
+  assert.equal(harness.groupState.find((group) => group.title === "Substring").collapsed, true);
+  assert.equal(harness.groupState.find((group) => group.title === "Exact").collapsed, false);
+
+  await sendSocketFrame(socket, {
+    type: "calendarEvents",
+    schemaVersion: 1,
+    payload: { events: [{ id: "evt-glob", title: "Sprint Planning", start: globStart }] },
+  });
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_glob" }));
+  assert.equal(harness.storageData.lastActivation.trigger, "calendar");
+  assert.equal(harness.storageData.lastActivation.triggerId, `evt-glob|${globStart}`);
+  assert.equal(harness.storageData.lastAppliedCalendarTriggerId, `evt-glob|${globStart}`);
+  assert.equal(harness.groupState.find((group) => group.title === "Glob").collapsed, false);
+});
+
+test("Calendar events choose the earliest start and use lens order for equal starts", async () => {
+  const earlyStart = "2026-07-07T08:30:00.000Z";
+  const laterStart = "2026-07-07T09:30:00.000Z";
+  const earliestHarness = createHarness({
+    storage: {
+      busToken: BUS_TOKEN,
+      lenses: [
+        lens("lens_later", "Later", [], [], ["Later"]),
+        lens("lens_early", "Early", [], [], ["Early"]),
+      ],
+    },
+  });
+  await settle();
+  const earliestSocket = await authenticatedBusSocket(earliestHarness);
+
+  await sendSocketFrame(earliestSocket, {
+    type: "calendarEvents",
+    schemaVersion: 1,
+    payload: {
+      events: [
+        { id: "evt-later", title: "Later", start: laterStart },
+        { id: "evt-early", title: "Early", start: earlyStart },
+      ],
+    },
+  });
+  await waitFor(() => assert.deepEqual(earliestHarness.storageData.activeView, { kind: "lens", lensId: "lens_early" }));
+  assert.equal(earliestHarness.storageData.lastActivation.triggerId, `evt-early|${earlyStart}`);
+
+  const tieStart = "2026-07-07T11:00:00.000Z";
+  const tieHarness = createHarness({
+    storage: {
+      busToken: BUS_TOKEN,
+      lenses: [
+        lens("lens_first", "First", [], [], ["First"]),
+        lens("lens_second", "Second", [], [], ["Second"]),
+      ],
+    },
+  });
+  await settle();
+  const tieSocket = await authenticatedBusSocket(tieHarness);
+
+  await sendSocketFrame(tieSocket, {
+    type: "calendarEvents",
+    schemaVersion: 1,
+    payload: {
+      events: [
+        { id: "evt-second", title: "Second", start: tieStart },
+        { id: "evt-first", title: "First", start: tieStart },
+      ],
+    },
+  });
+  await waitFor(() => assert.deepEqual(tieHarness.storageData.activeView, { kind: "lens", lensId: "lens_first" }));
+  assert.equal(tieHarness.storageData.lastActivation.triggerId, `evt-first|${tieStart}`);
+});
+
+test("Calendar rebroadcast does not override a manual switch for the same event", async () => {
+  const start = "2026-07-07T12:00:00.000Z";
+  const harness = createHarness({
+    storage: {
+      busToken: BUS_TOKEN,
+      lenses: [
+        lens("lens_calendar", "Calendar", [{ type: "title", value: "Calendar" }], [], ["Calendar Sync"]),
+        lens("lens_manual", "Manual", [{ type: "title", value: "Manual" }]),
+      ],
+    },
+    groups: [
+      { id: 1, title: "Calendar", collapsed: true },
+      { id: 2, title: "Manual", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, groupId: 1, active: false },
+      { id: 20, groupId: 2, active: false },
+    ],
+  });
+  await settle();
+  const socket = await authenticatedBusSocket(harness);
+  const frame = {
+    type: "calendarEvents",
+    schemaVersion: 1,
+    payload: { events: [{ id: "evt-manual-guard", title: "Calendar Sync", start }] },
+  };
+
+  await sendSocketFrame(socket, frame);
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_calendar" }));
+  await harness.request({ type: "lens-activate", windowId: 1, view: { kind: "lens", lensId: "lens_manual" } });
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_manual" }));
+
+  await sendSocketFrame(socket, frame);
+  await settle();
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_manual" });
+  assert.equal(harness.storageData.lastActivation.trigger, "manual");
+  assert.equal(harness.groupState.find((group) => group.title === "Calendar").collapsed, true);
+  assert.equal(harness.groupState.find((group) => group.title === "Manual").collapsed, false);
+});
+
+test("Calendar event-gone fallback only applies while calendar owns the view", async () => {
+  const start = "2026-07-07T13:00:00.000Z";
+  const event = { id: "evt-fallback", title: "Calendar Sync", start };
+  const harness = createHarness({
+    storage: {
+      busToken: BUS_TOKEN,
+      automationFallback: { kind: "lens", lensId: "lens_fallback" },
+      lenses: [
+        lens("lens_calendar", "Calendar", [{ type: "title", value: "Calendar" }], [], ["Calendar Sync"]),
+        lens("lens_fallback", "Fallback", [{ type: "title", value: "Fallback" }]),
+      ],
+    },
+    groups: [
+      { id: 1, title: "Calendar", collapsed: true },
+      { id: 2, title: "Fallback", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, groupId: 1, active: false },
+      { id: 20, groupId: 2, active: false },
+    ],
+  });
+  await settle();
+  const socket = await authenticatedBusSocket(harness);
+
+  await sendSocketFrame(socket, { type: "calendarEvents", schemaVersion: 1, payload: { events: [event] } });
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_calendar" }));
+  await sendSocketFrame(socket, { type: "calendarEvents", schemaVersion: 1, payload: { events: [] } });
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_fallback" }));
+  assert.equal(harness.storageData.lastAppliedCalendarTriggerId, null);
+  assert.equal(harness.groupState.find((group) => group.title === "Calendar").collapsed, true);
+  assert.equal(harness.groupState.find((group) => group.title === "Fallback").collapsed, false);
+
+  const manualHarness = createHarness({
+    storage: {
+      busToken: BUS_TOKEN,
+      automationFallback: { kind: "lens", lensId: "lens_fallback" },
+      lenses: [
+        lens("lens_calendar", "Calendar", [{ type: "title", value: "Calendar" }], [], ["Calendar Sync"]),
+        lens("lens_fallback", "Fallback", [{ type: "title", value: "Fallback" }]),
+      ],
+    },
+    groups: [
+      { id: 1, title: "Calendar", collapsed: true },
+      { id: 2, title: "Fallback", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, groupId: 1, active: false },
+      { id: 20, groupId: 2, active: false },
+    ],
+  });
+  await settle();
+  const manualSocket = await authenticatedBusSocket(manualHarness);
+
+  await sendSocketFrame(manualSocket, { type: "calendarEvents", schemaVersion: 1, payload: { events: [event] } });
+  await waitFor(() => assert.deepEqual(manualHarness.storageData.activeView, { kind: "lens", lensId: "lens_calendar" }));
+  await manualHarness.request({ type: "lens-activate", windowId: 1, view: { kind: "all" } });
+  await waitFor(() => assert.deepEqual(manualHarness.storageData.activeView, { kind: "all" }));
+  await sendSocketFrame(manualSocket, { type: "calendarEvents", schemaVersion: 1, payload: { events: [] } });
+  await settle();
+  assert.deepEqual(manualHarness.storageData.activeView, { kind: "all" });
+  assert.equal(manualHarness.storageData.lastActivation.trigger, "manual");
+  assert.equal(manualHarness.groupState.every((group) => group.collapsed === false), true);
+});
+
+test("Malformed Calendar events are ignored without closing the bus", async () => {
+  const harness = createHarness({
+    storage: {
+      busToken: BUS_TOKEN,
+      lenses: [lens("lens_calendar", "Calendar", [], [], ["Calendar Sync"])],
+    },
+  });
+  await settle();
+  const socket = await authenticatedBusSocket(harness);
+
+  await sendSocketFrame(socket, {
+    type: "calendarEvents",
+    schemaVersion: 1,
+    payload: { events: { id: "not-an-array", title: "Calendar Sync", start: "2026-07-07T14:00:00.000Z" } },
+  });
+  await sendSocketFrame(socket, {
+    type: "calendarEvents",
+    schemaVersion: 1,
+    payload: {
+      events: [
+        { id: "missing-title", start: "2026-07-07T14:00:00.000Z" },
+        { id: "missing-start", title: "Calendar Sync" },
+        null,
+      ],
+    },
+  });
+  await settle();
+
+  assert.equal(harness.storageData.activeView, undefined);
+  assert.equal(harness.storageData.lastAppliedCalendarTriggerId, undefined);
+  assert.equal(socket.readyState, 1);
+  assert.deepEqual(harness.consoleErrors, []);
 });
 
 test("unbound Apple Focus leaves groups untouched and prompts to bind in options", async () => {
@@ -2880,4 +3275,375 @@ test("window profile overrides survive suspension via storage.session", async ()
 
   const state = await harness2.request({ type: "lens-state", windowId: 1 });
   assert.equal(state.windowProfile.kind, "none");
+});
+
+test("lens commands activate slots, cycle through lenses, and show all groups", async () => {
+  const lenses = [
+    lens("lens_one", "One", []),
+    lens("lens_two", "Two", []),
+    lens("lens_three", "Three", []),
+  ];
+  const harness = createHarness({ storage: { lenses } });
+  await settle();
+
+  await harness.runCommand("activate-lens-2");
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_two" }));
+  assert.equal(harness.storageData.lastActivation.trigger, "manual");
+
+  const twoLensHarness = createHarness({ storage: { lenses: lenses.slice(0, 2), activeView: { kind: "lens", lensId: "lens_one" } } });
+  await settle();
+  await twoLensHarness.runCommand("activate-lens-9");
+  await settle();
+  assert.deepEqual(twoLensHarness.storageData.activeView, { kind: "lens", lensId: "lens_one" });
+
+  await harness.browser.storage.local.set({ activeView: { kind: "all" } });
+  await settle();
+  await harness.runCommand("cycle-lens-next");
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_one" }));
+
+  await harness.browser.storage.local.set({ activeView: { kind: "lens", lensId: "lens_three" } });
+  await settle();
+  await harness.runCommand("cycle-lens-next");
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "all" }));
+
+  await harness.browser.storage.local.set({ activeView: { kind: "lens", lensId: "lens_two" } });
+  await settle();
+  await harness.runCommand("show-all-groups");
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "all" }));
+});
+
+test("open-tab-search message acknowledges and opens the content overlay path", async () => {
+  const harness = createHarness({
+    tabs: [{ id: 10, windowId: 1, active: true, url: "https://example.test" }],
+  });
+  await settle();
+
+  const result = await harness.request({ type: "open-tab-search" });
+  await waitFor(() => assert.equal(harness.tabMessages.length, 1));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(harness.tabMessages[0], { tabId: 10, message: { type: "tabsearch-open" } });
+});
+
+test("discardCollapsedTabs discards only eligible tabs in newly collapsed groups", async () => {
+  const harness = createHarness({
+    storage: {
+      discardCollapsedTabs: true,
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+      { id: 3, windowId: 1, title: "Already collapsed", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: true, url: "https://work.test" },
+      { id: 20, windowId: 1, groupId: 2, active: false, url: "https://eligible.test" },
+      { id: 21, windowId: 1, groupId: 2, active: false, pinned: true, url: "https://pinned.test" },
+      { id: 22, windowId: 1, groupId: 2, active: false, audible: true, url: "https://audio.test" },
+      { id: 23, windowId: 1, groupId: 2, active: false, discarded: true, url: "https://discarded.test" },
+      { id: 24, windowId: 1, groupId: 2, active: false, url: "about:config" },
+      { id: 30, windowId: 1, groupId: 3, active: false, url: "https://already.test" },
+    ],
+  });
+  await settle();
+
+  const result = await harness.request({ type: "lens-activate", view: { kind: "lens", lensId: "lens_work" } });
+  await waitFor(() => assert.deepEqual(harness.discardedTabs, [20]));
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.tabState.find((tab) => tab.id === 20).discarded, true);
+  assert.equal(harness.tabState.find((tab) => tab.id === 30).discarded, undefined);
+});
+
+test("discardCollapsedTabs absent leaves newly collapsed tabs loaded", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: true, url: "https://work.test" },
+      { id: 20, windowId: 1, groupId: 2, active: false, url: "https://eligible.test" },
+    ],
+  });
+  await settle();
+
+  const result = await harness.request({ type: "lens-activate", view: { kind: "lens", lensId: "lens_work" } });
+  await settle();
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(harness.discardedTabs, []);
+  assert.equal(harness.tabState.find((tab) => tab.id === 20).discarded, undefined);
+});
+
+test("container selectors match groups containing tabs in the named container", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("lens_work_container", "Work container", [{ type: "container", value: "Work" }])],
+    },
+    containers: [
+      { cookieStoreId: "firefox-container-work", name: "Work", color: "blue", icon: "briefcase" },
+      { cookieStoreId: "firefox-container-personal", name: "Personal", color: "red", icon: "fingerprint" },
+    ],
+    groups: [
+      { id: 1, windowId: 1, title: "Alpha", collapsed: true },
+      { id: 2, windowId: 1, title: "Beta", collapsed: false },
+      { id: 3, windowId: 2, title: "Gamma", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: true, cookieStoreId: "firefox-container-work", url: "https://work.test" },
+      { id: 20, windowId: 1, groupId: 2, active: false, cookieStoreId: "firefox-container-personal", url: "https://personal.test" },
+      { id: 30, windowId: 2, groupId: 3, active: false, cookieStoreId: "firefox-default", url: "https://default.test" },
+    ],
+  });
+  await settle();
+
+  const result = await harness.request({ type: "lens-activate", view: { kind: "lens", lensId: "lens_work_container" } });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.groupState.find((group) => group.id === 1).collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, true);
+  assert.equal(harness.groupState.find((group) => group.id === 3).collapsed, true);
+  assert.deepEqual(harness.storageData.expandedGroups, ["Alpha"]);
+});
+
+test("container selectors are ignored safely when contextualIdentities is unavailable", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("lens_work_container", "Work container", [{ type: "container", value: "Work" }])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Alpha", collapsed: true },
+      { id: 2, windowId: 1, title: "Beta", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false, cookieStoreId: "firefox-container-work", url: "https://work.test" },
+      { id: 20, windowId: 1, groupId: 2, active: false, cookieStoreId: "firefox-default", url: "https://default.test" },
+    ],
+  });
+  await settle();
+
+  const result = await harness.request({ type: "lens-activate", view: { kind: "lens", lensId: "lens_work_container" } });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.storageData.lastAction, "no_matching_group");
+  assert.equal(harness.groupState.every((group) => group.collapsed === false), true);
+});
+
+test("tabsearch-move-container recreates only http tabs in the target container and returns a fresh list", async () => {
+  const harness = createHarness({
+    containers: [{ cookieStoreId: "firefox-container-work", name: "Work", color: "blue", icon: "briefcase" }],
+    tabs: [
+      { id: 1, windowId: 1, index: 0, title: "One", url: "https://one.test", active: false, cookieStoreId: "firefox-default" },
+      { id: 2, windowId: 1, index: 1, title: "About", url: "about:config", active: false, cookieStoreId: "firefox-default" },
+      { id: 3, windowId: 1, index: 2, title: "Two", url: "http://two.test", active: false, pinned: true, cookieStoreId: "firefox-default" },
+    ],
+  });
+  await settle();
+
+  const result = await harness.request({
+    type: "tabsearch-move-container",
+    tabIds: [1, 2, 3],
+    cookieStoreId: "firefox-container-work",
+  });
+
+  assert.deepEqual(harness.tabCreations.map((entry) => ({
+    url: entry.url,
+    cookieStoreId: entry.cookieStoreId,
+    pinned: entry.pinned,
+    index: entry.index,
+  })), [
+    { url: "https://one.test", cookieStoreId: "firefox-container-work", pinned: false, index: 1 },
+    { url: "http://two.test", cookieStoreId: "firefox-container-work", pinned: true, index: 3 },
+  ]);
+  assert.deepEqual(harness.removedTabs, [1, 3]);
+  assert.equal(result.some((tab) => tab.id === 1 || tab.id === 3), false);
+  assert.equal(result.some((tab) => tab.id === 2 && tab.url === "about:config"), true);
+  assert.equal(result.filter((tab) => tab.cookieStoreId === "firefox-container-work").length, 2);
+});
+
+test("lens sync pushes edited lenses and lens order to storage.sync when enabled", async () => {
+  const localLens = lens("lens_sync", "Sync me", [{ type: "title", value: "Sync" }]);
+  const harness = createHarness({
+    storage: { syncLenses: true, lenses: [localLens] },
+    storageSync: {},
+  });
+  await waitFor(() => assert.ok(harness.syncData.lensOrder));
+  harness.syncSets.length = 0;
+
+  const result = await harness.request({
+    type: "lens-update",
+    lensId: "lens_sync",
+    patch: { name: "Synced name" },
+  });
+  await settle();
+  assert.equal(result.ok, true);
+  const timer = [...harness.timers.entries()].find(([, entry]) => entry.delay === 2000);
+  assert.ok(timer, "lens sync push is debounced");
+  harness.runTimer(timer[0]);
+  await waitFor(() => assert.equal(harness.syncData["lens/lens_sync"].lens.name, "Synced name"));
+
+  assert.deepEqual(harness.syncData.lensOrder.ids, ["lens_sync"]);
+  assert.ok(harness.syncSets.some((values) => values["lens/lens_sync"] && values.lensOrder));
+});
+
+test("lens sync applies newer inbound lenses, ignores older inbound lenses, and stays quiet when disabled", async () => {
+  const localLens = { ...lens("lens_sync", "Local", [{ type: "title", value: "Local" }]), updatedAt: 1000 };
+  const harness = createHarness({
+    storage: { syncLenses: true, lenses: [localLens], lensSyncMeta: { lensOrderUpdatedAt: 1000 } },
+    storageSync: { lensOrder: { ids: ["lens_sync"], updatedAt: 1000 } },
+  });
+  await settle();
+
+  await harness.browser.storage.sync.set({
+    "lens/lens_sync": { lens: { ...localLens, name: "Remote newer", updatedAt: 2000 }, schedule: null },
+  });
+  await waitFor(() => assert.equal(harness.storageData.lenses[0].name, "Remote newer"));
+
+  await harness.browser.storage.sync.set({
+    "lens/lens_sync": { lens: { ...localLens, name: "Remote older", updatedAt: 1500 }, schedule: null },
+  });
+  await settle();
+  assert.equal(harness.storageData.lenses[0].name, "Remote newer");
+
+  const disabled = createHarness({
+    storage: { lenses: [localLens] },
+    storageSync: {},
+  });
+  await settle();
+  await disabled.request({
+    type: "lens-update",
+    lensId: "lens_sync",
+    patch: { name: "Local only" },
+  });
+  await settle();
+  assert.deepEqual(disabled.syncSets, []);
+  assert.deepEqual(disabled.syncData, {});
+});
+
+test("bus pairing authenticates hello, handles focus and activateView envelopes, and publishes lensState", async () => {
+  const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  const harness = createHarness({
+    storage: {
+      busToken: token,
+      lenses: [
+        lens("lens_focus", "Focus", [{ type: "title", value: "Focus" }], ["com.apple.focus.work"]),
+        lens("lens_unique", "Unique", [{ type: "title", value: "Unique" }]),
+      ],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Focus", collapsed: true },
+      { id: 2, windowId: 1, title: "Unique", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false, url: "https://focus.test" },
+      { id: 20, windowId: 1, groupId: 2, active: true, url: "https://unique.test" },
+    ],
+  });
+  await settle();
+
+  const { socket } = await authenticateBus(harness, token);
+  await waitFor(() => assert.ok(harness.sentMessages.some((message) => message.type === "lensState")));
+
+  await sendSocketFrame(socket, {
+    type: "focus",
+    schemaVersion: 1,
+    payload: { focus: { id: "com.apple.focus.work", name: "Work" } },
+  });
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_focus" }));
+  assert.equal(harness.storageData.lastActivation.trigger, "appleFocus");
+
+  harness.sentMessages.length = 0;
+  await sendSocketFrame(socket, {
+    type: "activateView",
+    schemaVersion: 1,
+    payload: { view: { kind: "lens", name: "Unique" } },
+  });
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_unique" }));
+  await waitFor(() => assert.equal(harness.sentMessages.filter((message) => message.type === "lensState").length, 1));
+  assert.equal(harness.storageData.lastActivation.trigger, "external");
+  assert.equal(harness.storageData.lastActivation.triggerId, "ws");
+  assert.deepEqual(harness.sentMessages[0], {
+    type: "lensState",
+    schemaVersion: 1,
+    payload: {
+      activeView: { kind: "lens", lensId: "lens_unique" },
+      lens: { id: "lens_unique", name: "Unique", icon: "target", color: null },
+      lastActivation: harness.storageData.lastActivation,
+    },
+  });
+});
+
+test("bus pairing rejects wrong server MACs and missing tokens", async () => {
+  const token = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+  const wrongMacHarness = createHarness({ storage: { busToken: token } });
+  await settle();
+  const wrongSocket = wrongMacHarness.sockets[0];
+  wrongSocket.onopen();
+  await sendSocketFrame(wrongSocket, {
+    type: "hello",
+    schemaVersion: 1,
+    payload: { nonce: "11112222333344445555666677778888" },
+  });
+  await waitFor(() => assert.equal(wrongMacHarness.sentMessages[0] && wrongMacHarness.sentMessages[0].type, "auth"));
+
+  await sendSocketFrame(wrongSocket, { type: "authOk", schemaVersion: 1, payload: { mac: "00" } });
+  await waitFor(() => assert.equal(wrongMacHarness.storageData.busPairingStatus, "pairing_failed"));
+  assert.equal(wrongSocket.readyState, wrongMacHarness.context.WebSocket.CLOSED);
+
+  const missingTokenHarness = createHarness();
+  await settle();
+  const missingTokenSocket = missingTokenHarness.sockets[0];
+  missingTokenSocket.onopen();
+  await sendSocketFrame(missingTokenSocket, {
+    type: "hello",
+    schemaVersion: 1,
+    payload: { nonce: "99990000111122223333444455556666" },
+  });
+  await waitFor(() => assert.equal(missingTokenHarness.storageData.busPairingStatus, "pairing_required"));
+  assert.equal(missingTokenSocket.readyState, missingTokenHarness.context.WebSocket.CLOSED);
+  assert.deepEqual(missingTokenHarness.sentMessages, []);
+});
+
+test("legacy bus frames still handle focus but ignore unauthenticated activateView", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [
+        lens("lens_focus", "Focus", [{ type: "title", value: "Focus" }], ["com.apple.focus.work"]),
+        lens("lens_unique", "Unique", [{ type: "title", value: "Unique" }]),
+      ],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Focus", collapsed: true },
+      { id: 2, windowId: 1, title: "Unique", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false, url: "https://focus.test" },
+      { id: 20, windowId: 1, groupId: 2, active: true, url: "https://unique.test" },
+    ],
+  });
+  await settle();
+  const socket = harness.sockets[0];
+  socket.onopen();
+
+  await sendSocketFrame(socket, {
+    type: "focus",
+    schemaVersion: 1,
+    payload: { focus: { id: "com.apple.focus.work", name: "Work" } },
+  });
+  await waitFor(() => assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_focus" }));
+  assert.equal(harness.storageData.busPairingStatus, "legacy (unpaired)");
+
+  await sendSocketFrame(socket, {
+    type: "activateView",
+    schemaVersion: 1,
+    payload: { view: { kind: "lens", name: "Unique" } },
+  });
+  await settle();
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_focus" });
+  assert.equal(harness.consoleWarnings.length, 1);
 });

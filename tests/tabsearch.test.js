@@ -1208,3 +1208,90 @@ test("closing the overlay on a normal page never closes the tab", async () => {
   assert.equal(closeCalls, 0);
   assert.deepEqual(removed, []);
 });
+
+test("computeDuplicateTabIds prefers active, then pinned, then first tab and never returns pinned tabs", () => {
+  const { window } = createHarness();
+  const tabs = [
+    { id: 1, url: "https://same.test/a", active: false, pinned: false },
+    { id: 2, url: "https://same.test/a", active: true, pinned: false },
+    { id: 3, url: "https://same.test/a", active: false, pinned: true },
+    { id: 4, url: "https://same.test/a", active: false, pinned: false },
+    { id: 5, url: "https://same.test/b", active: false, pinned: true },
+    { id: 6, url: "https://same.test/b", active: false, pinned: false },
+    { id: 7, url: "https://same.test/b", active: false, pinned: false },
+    { id: 8, url: "https://same.test/c", active: false, pinned: false },
+    { id: 9, url: "https://same.test/c", active: false, pinned: false },
+    { id: 10, url: "https://same.test/d", active: false, pinned: true },
+    { id: 11, url: "https://same.test/d", active: false, pinned: true },
+  ];
+
+  assert.deepEqual(Array.from(window.computeDuplicateTabIds(tabs)), [1, 4, 6, 7, 9]);
+});
+
+test("Select duplicates marks exactly duplicate tabs and shows the bulk action bar", async () => {
+  const harness = createHarness({
+    tabs: [
+      { id: 1, windowId: 1, title: "A first", url: "https://same.test/a", active: false, pinned: false, currentWindow: true },
+      { id: 2, windowId: 1, title: "A active", url: "https://same.test/a", active: true, pinned: false, currentWindow: true },
+      { id: 3, windowId: 1, title: "A pinned", url: "https://same.test/a", active: false, pinned: true, currentWindow: true },
+      { id: 4, windowId: 1, title: "A extra", url: "https://same.test/a", active: false, pinned: false, currentWindow: true },
+      { id: 5, windowId: 1, title: "B pinned", url: "https://same.test/b", active: false, pinned: true, currentWindow: true },
+      { id: 6, windowId: 1, title: "B extra", url: "https://same.test/b", active: false, pinned: false, currentWindow: true },
+      { id: 7, windowId: 1, title: "Unique", url: "https://unique.test", active: false, pinned: false, currentWindow: true },
+    ],
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  const root = overlayRoot(harness);
+  const selectDuplicates = [...root.querySelectorAll(".actions button")]
+    .find((button) => button.textContent === "Select 3 duplicates");
+  assert.ok(selectDuplicates, "duplicate selector is offered");
+  selectDuplicates.click();
+  await settle();
+
+  assert.deepEqual(markedRows(harness).map((row) => row.querySelector(".name").textContent), [
+    "A first",
+    "A extra",
+    "B extra",
+  ]);
+  assert.equal(root.querySelector(".actions .count").textContent, "3 selected");
+  assert.equal(root.querySelector(".actions button.primary").textContent, "Group");
+});
+
+test("container badges render for non-default containers only", async () => {
+  const harness = createHarness({
+    tabs: [
+      {
+        id: 1,
+        windowId: 1,
+        title: "Work tab",
+        url: "https://work.test",
+        active: false,
+        currentWindow: true,
+        cookieStoreId: "firefox-container-work",
+        containerName: "Work",
+        containerColor: "blue",
+      },
+      {
+        id: 2,
+        windowId: 1,
+        title: "Default tab",
+        url: "https://default.test",
+        active: false,
+        currentWindow: true,
+        cookieStoreId: "firefox-default",
+        containerName: "Default",
+        containerColor: "grey",
+      },
+    ],
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  const byTitle = new Map(rows(harness).map((row) => [row.querySelector(".name").textContent, row]));
+  const badge = byTitle.get("Work tab").querySelector(".container-badge");
+  assert.equal(badge.querySelector(".container-name").textContent, "Work");
+  assert.equal(badge.dataset.color, "blue");
+  assert.equal(byTitle.get("Default tab").querySelector(".container-badge"), null);
+});
