@@ -22,6 +22,8 @@
     "alarms",
     "history",
     "search",
+    "contextualIdentities",
+    "cookies",
     "ws://127.0.0.1/*"
   ],
   "optional_permissions": [

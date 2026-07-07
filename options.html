@@ -85,7 +85,8 @@
         </div>
         <div class="field">
           <label for="provider-model">Model</label>
-          <input id="provider-model" class="mono" type="text" placeholder="gpt-4o-mini" autocomplete="off" spellcheck="false">
+          <input id="provider-model" class="mono" type="text" placeholder="gpt-4o-mini" autocomplete="off" spellcheck="false" list="provider-models">
+          <datalist id="provider-models"></datalist>
         </div>
         <div class="field">
           <label for="provider-key">API key</label>
@@ -106,11 +107,24 @@
 
       <div class="provider-actions">
         <button id="provider-save" type="button" class="primary">Save AI settings</button>
+        <button id="provider-test" type="button" class="secondary" hidden>Test connection</button>
         <button id="ai-prompt-reset" type="button" class="reset-btn">
           <svg class="reset-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
           Reset to default
         </button>
       </div>
+      <p id="provider-test-status" class="field-hint" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="card">
+      <div class="section-heading">
+        <h2>Performance</h2>
+      </div>
+      <label class="toggle inline-toggle" for="discard-collapsed-tabs">
+        <input id="discard-collapsed-tabs" type="checkbox">
+        <span>Discard tabs in collapsed groups when switching lenses</span>
+      </label>
+      <p class="field-hint">Frees memory. Tabs reload when you return to them. Pinned, active, and audio-playing tabs are never discarded.</p>
     </section>
 
     <section class="card">

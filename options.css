@@ -1097,6 +1097,10 @@ input.mono {
   background: var(--accent-tint);
 }
 
+.group-chip-container {
+  background: color-mix(in srgb, var(--accent-tint), var(--surface-2) 50%);
+}
+
 .group-chip-badge,
 .group-chip-meta,
 .palette-chip-meta {
@@ -1129,6 +1133,18 @@ input.mono {
 .group-chip-remove:hover {
   background: var(--danger-tint);
   color: var(--danger);
+}
+
+.group-chip-type {
+  flex: 0 0 96px;
+  width: auto;
+  min-width: 86px;
+  padding: 5px 8px;
+  font-size: 12px;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
 }
 
 .group-chip-input {

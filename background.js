@@ -17,6 +17,7 @@ const AI_PIN_TO_FOCUS_KEY = "aiPinToFocus";
 const AI_GROUPING_PROMPT_KEY = "aiGroupingPrompt";
 const AI_GROUPING_PROMPT_MAX = 4000;
 const AI_AUTO_GROUP_KEY = "aiAutoGroup";
+const DISCARD_COLLAPSED_TABS_KEY = "discardCollapsedTabs";
 const AUTO_GROUP_DEBOUNCE_MS = 5000;
 const AUTO_GROUP_COOLDOWN_MS = 30000;
 const SCHEDULE_ALARM_NAME = "lens-schedule-tick";
@@ -31,6 +32,8 @@ const GROUPING_SYSTEM_PROMPT =
   '(1-4 words). Respond with ONLY a JSON object of the form ' +
   '{"groups":[{"topic":"...","tabIndices":[0,1]}]} and nothing else.';
 const GROUPABLE_URL = /^https?:\/\//i;
+const DEFAULT_COOKIE_STORE_ID = "firefox-default";
+const PRIVATE_COOKIE_STORE_ID = "firefox-private";
 // Firefox tab-group colors. Assigned round-robin so adjacent groups differ;
 // the model only proposes topics + members, never presentation.
 const TAB_GROUP_COLORS = ["blue", "cyan", "green", "orange", "pink", "purple", "red", "yellow"];
@@ -73,6 +76,7 @@ const autoGroupCooldown = new Set();
 // then fail re-validation ("no_groups") on tabs the first run already grouped.
 const autoGroupInflight = new Set();
 const windowProfileOverrides = new Map();
+let containersCache = null;
 
 // Per-window ephemeral view state (transient views, automation overrides).
 // windowIds are only stable within one browser session, so this is mirrored
@@ -214,6 +218,10 @@ async function recordSeen(rawId) {
   });
 }
 
+function isSelectorType(type) {
+  return type === "title" || type === "glob" || type === "container";
+}
+
 function normalizedSelectors(value) {
   if (!Array.isArray(value)) {
     return [];
@@ -221,7 +229,7 @@ function normalizedSelectors(value) {
   const seen = new Set();
   const selectors = [];
   for (const selector of value) {
-    if (!isRecord(selector) || (selector.type !== "title" && selector.type !== "glob")) {
+    if (!isRecord(selector) || !isSelectorType(selector.type)) {
       continue;
     }
     const raw = typeof selector.value === "string" ? selector.value.trim() : "";
@@ -235,6 +243,55 @@ function normalizedSelectors(value) {
     }
   }
   return selectors;
+}
+
+function isSpecialCookieStoreId(cookieStoreId) {
+  return cookieStoreId === DEFAULT_COOKIE_STORE_ID || cookieStoreId === PRIVATE_COOKIE_STORE_ID;
+}
+
+function normalizeContainer(identity) {
+  if (!isRecord(identity) || typeof identity.cookieStoreId !== "string" || isSpecialCookieStoreId(identity.cookieStoreId)) {
+    return null;
+  }
+  return {
+    cookieStoreId: identity.cookieStoreId,
+    name: typeof identity.name === "string" ? identity.name : "",
+    color: typeof identity.color === "string" ? identity.color : "",
+    icon: typeof identity.icon === "string" ? identity.icon : "",
+  };
+}
+
+function invalidateContainersCache() {
+  containersCache = null;
+}
+
+async function getContainers() {
+  if (containersCache) {
+    return containersCache;
+  }
+  const api = browser.contextualIdentities;
+  if (!api || typeof api.query !== "function") {
+    containersCache = [];
+    return containersCache;
+  }
+  try {
+    const identities = await api.query({});
+    containersCache = (Array.isArray(identities) ? identities : [])
+      .map(normalizeContainer)
+      .filter(Boolean);
+  } catch (error) {
+    containersCache = [];
+  }
+  return containersCache;
+}
+
+function containersByCookieStore(containers) {
+  return new Map((Array.isArray(containers) ? containers : []).map((container) => [container.cookieStoreId, container]));
+}
+
+async function containersForSearch() {
+  const containers = await getContainers();
+  return { ok: true, containers: containers.map((container) => ({ ...container })) };
 }
 
 function normalizeLens(lens) {
@@ -440,13 +497,13 @@ async function syncScheduleAlarm() {
   }
 }
 
-function selectorMatcher(selectors) {
+function titleSelectorMatcher(selectors) {
   const exact = new Set();
   const globValues = [];
   for (const selector of normalizedSelectors(selectors)) {
     if (selector.type === "glob") {
       globValues.push(selector.value);
-    } else {
+    } else if (selector.type === "title") {
       exact.add(selector.value);
     }
   }
@@ -454,8 +511,60 @@ function selectorMatcher(selectors) {
   return (title) => exact.has(title) || globMatches(title);
 }
 
+function selectorMatcher(selectors) {
+  return titleSelectorMatcher(selectors);
+}
+
 function lensSelectorsMatch(lens, title) {
-  return selectorMatcher(lens && lens.groupSelectors)(title);
+  return titleSelectorMatcher(lens && lens.groupSelectors)(title);
+}
+
+async function selectorMatcherForGroups(selectors, groups) {
+  const normalized = normalizedSelectors(selectors);
+  const titleMatches = titleSelectorMatcher(normalized);
+  const containerNames = new Set(
+    normalized
+      .filter((selector) => selector.type === "container")
+      .map((selector) => selector.value.toLowerCase())
+  );
+  if (containerNames.size === 0) {
+    return (group) => titleMatches(group.title);
+  }
+
+  const matchingStoreIds = new Set();
+  for (const container of await getContainers()) {
+    if (containerNames.has(container.name.toLowerCase())) {
+      matchingStoreIds.add(container.cookieStoreId);
+    }
+  }
+  if (matchingStoreIds.size === 0) {
+    return (group) => titleMatches(group.title);
+  }
+
+  const candidateGroupIds = new Set((Array.isArray(groups) ? groups : [])
+    .map((group) => group && group.id)
+    .filter((id) => typeof id === "number"));
+  const windowIds = [...new Set((Array.isArray(groups) ? groups : [])
+    .map((group) => group && group.windowId)
+    .filter((id) => typeof id === "number"))];
+  const tabsByWindow = await Promise.all(windowIds.map((windowId) =>
+    browser.tabs.query({ windowId }).catch(() => [])
+  ));
+  const matchingContainerGroups = new Set();
+  for (const tabs of tabsByWindow) {
+    for (const tab of tabs) {
+      if (
+        typeof tab.groupId === "number" &&
+        candidateGroupIds.has(tab.groupId) &&
+        typeof tab.cookieStoreId === "string" &&
+        matchingStoreIds.has(tab.cookieStoreId)
+      ) {
+        matchingContainerGroups.add(tab.groupId);
+      }
+    }
+  }
+
+  return (group) => titleMatches(group.title) || matchingContainerGroups.has(group.id);
 }
 
 function lensesMatchingTitle(title, lenses) {
@@ -974,6 +1083,9 @@ browser.runtime.onMessage.addListener((message) => {
   if (message && message.type === "tabsearch-list") {
     return listTabsForSearch();
   }
+  if (message && message.type === "tabsearch-containers") {
+    return containersForSearch();
+  }
   if (message && message.type === "tabsearch-activate") {
     return activateTabFromSearch(message.tabId, message.windowId);
   }
@@ -1000,6 +1112,9 @@ browser.runtime.onMessage.addListener((message) => {
   }
   if (message && message.type === "tabsearch-move") {
     return moveTabsFromSearch(message.tabIds, message.windowId, message.anchorId, message.placeAfter, message.groupId);
+  }
+  if (message && message.type === "tabsearch-move-container") {
+    return moveTabsToContainerFromSearch(message.tabIds, message.cookieStoreId);
   }
   if (message && message.type === "tabsearch-ai-preview") {
     return tabsearchAiPreview(message.windowId, message.tabIds);
@@ -1045,6 +1160,15 @@ if (browser.tabs && browser.tabs.onUpdated && browser.tabs.onUpdated.addListener
     }
   });
 }
+if (browser.contextualIdentities) {
+  for (const eventName of ["onCreated", "onRemoved", "onUpdated"]) {
+    const event = browser.contextualIdentities[eventName];
+    if (event && typeof event.addListener === "function") {
+      event.addListener(invalidateContainersCache);
+    }
+  }
+}
+
 
 browser.notifications.onClicked.addListener((notificationId) => {
   if (notificationId.startsWith(OPTIONS_NOTIFICATION_PREFIX)) {
@@ -1319,6 +1443,51 @@ async function rememberActivatedView(resolvedView, activation) {
   await setActiveView(resolvedView, activation);
 }
 
+async function discardCollapsedGroupTabs(groups) {
+  if (!browser.tabs || typeof browser.tabs.discard !== "function" || groups.length === 0) {
+    return;
+  }
+  if (!(await discardCollapsedTabsEnabled())) {
+    return;
+  }
+
+  const groupIdsByWindow = new Map();
+  for (const group of groups) {
+    if (typeof group.id !== "number" || typeof group.windowId !== "number") {
+      continue;
+    }
+    const groupIds = groupIdsByWindow.get(group.windowId);
+    if (groupIds) {
+      groupIds.add(group.id);
+    } else {
+      groupIdsByWindow.set(group.windowId, new Set([group.id]));
+    }
+  }
+
+  await Promise.all(Array.from(groupIdsByWindow, async ([windowId, groupIds]) => {
+    let tabs;
+    try {
+      tabs = await browser.tabs.query({ windowId });
+    } catch (error) {
+      return;
+    }
+    const ids = tabs
+      .filter((tab) => (
+        groupIds.has(tab.groupId) &&
+        !tab.active &&
+        !tab.pinned &&
+        !tab.audible &&
+        !tab.discarded &&
+        GROUPABLE_URL.test(tab.url || "") &&
+        typeof tab.id === "number"
+      ))
+      .map((tab) => tab.id);
+    if (ids.length > 0) {
+      browser.tabs.discard(ids).catch(() => {});
+    }
+  }));
+}
+
 async function applyResolvedToGroups(resolved, allGroups, activation, { persist = true } = {}) {
   if (resolved.view.kind === "all") {
     const updateFailures = await setGroupsCollapsed(allGroups, false);
@@ -1343,9 +1512,9 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
     return { ok: true, expandedGroups: [], collapsedGroups: [], updateFailures: [] };
   }
 
-  const matches = selectorMatcher(resolved.selectors);
-  const matching = allGroups.filter((group) => matches(group.title));
-  const others = allGroups.filter((group) => !matches(group.title));
+  const matches = await selectorMatcherForGroups(resolved.selectors, allGroups);
+  const matching = allGroups.filter((group) => matches(group));
+  const others = allGroups.filter((group) => !matches(group));
   const selectorText = normalizedSelectors(resolved.selectors).map((selector) => selector.value).join(", ");
 
   if (matching.length === 0) {
@@ -1383,6 +1552,7 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
     return { ok: true, expandedGroups: [], collapsedGroups: [], updateFailures: [] };
   }
 
+  const groupsToCollapse = others.filter((group) => group.collapsed !== true);
   const [expandFailures, collapseFailures] = await Promise.all([
     setGroupsCollapsed(matching, false),
     setGroupsCollapsed(others, true),
@@ -1403,12 +1573,15 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
     });
     await rememberActivatedView(resolved.view, activation);
   }
-  return {
+  const result = {
     ok: true,
     expandedGroups: matching.map((group) => group.title),
     collapsedGroups: others.map((group) => group.title),
     updateFailures,
   };
+  const collapsedNow = groupsToCollapse.filter((group) => group.collapsed === true);
+  discardCollapsedGroupTabs(collapsedNow).catch(() => {});
+  return result;
 }
 
 async function activateWithWindowProfiles(resolved, activation) {
@@ -1893,6 +2066,11 @@ async function aiGroupingEnabled() {
   return stored[AI_GROUPING_ENABLED_KEY] === true;
 }
 
+async function discardCollapsedTabsEnabled() {
+  const stored = await browser.storage.local.get(DISCARD_COLLAPSED_TABS_KEY);
+  return stored[DISCARD_COLLAPSED_TABS_KEY] === true;
+}
+
 async function aiPinToFocusEnabled() {
   const stored = await browser.storage.local.get(AI_PIN_TO_FOCUS_KEY);
   return stored[AI_PIN_TO_FOCUS_KEY] === true;
@@ -2140,7 +2318,11 @@ async function listTabsForSearch() {
     ? await browser.windows.getCurrent().catch(() => null)
     : null;
   const currentWindowId = currentWindow ? currentWindow.id : null;
-  const tabs = await browser.tabs.query({});
+  const [tabs, containers] = await Promise.all([
+    browser.tabs.query({}),
+    getContainers(),
+  ]);
+  const containersByStore = containersByCookieStore(containers);
   let groupsById = null;
   const hasGroupedTabs = tabs.some((tab) => typeof tab.groupId === "number" && tab.groupId !== -1);
   if (hasGroupedTabs && browser.tabGroups && typeof browser.tabGroups.query === "function") {
@@ -2151,7 +2333,9 @@ async function listTabsForSearch() {
     const group = groupsById && typeof tab.groupId === "number" && tab.groupId !== -1
       ? groupsById.get(tab.groupId)
       : null;
-    return {
+    const cookieStoreId = typeof tab.cookieStoreId === "string" ? tab.cookieStoreId : DEFAULT_COOKIE_STORE_ID;
+    const container = !isSpecialCookieStoreId(cookieStoreId) ? containersByStore.get(cookieStoreId) : null;
+    const row = {
       id: tab.id,
       windowId: tab.windowId,
       title: tab.title || tab.url || "Untitled",
@@ -2164,7 +2348,13 @@ async function listTabsForSearch() {
       pinned: Boolean(tab.pinned),
       grouped: typeof tab.groupId === "number" && tab.groupId !== -1,
       groupId: typeof tab.groupId === "number" ? tab.groupId : -1,
+      cookieStoreId,
     };
+    if (container) {
+      row.containerName = container.name;
+      row.containerColor = container.color;
+    }
+    return row;
   });
   // Stable sort keeps native tab order within a window; current window floats first.
   mapped.sort((a, b) => {
@@ -2349,6 +2539,49 @@ async function moveTabsToNewWindow(tabIds) {
     }
   } catch (error) {
     // Keep the overlay responsive if one of the selected tabs no longer exists.
+  }
+  return listTabsForSearch();
+}
+
+async function moveTabsToContainerFromSearch(tabIds, cookieStoreId) {
+  const validIds = validTabIds(tabIds);
+  const targetCookieStoreId = typeof cookieStoreId === "string" ? cookieStoreId : "";
+  if (validIds.length < 1 || !targetCookieStoreId) {
+    return listTabsForSearch();
+  }
+  const containers = await getContainers();
+  const validTarget = targetCookieStoreId === DEFAULT_COOKIE_STORE_ID ||
+    containers.some((container) => container.cookieStoreId === targetCookieStoreId);
+  if (!validTarget) {
+    return listTabsForSearch();
+  }
+
+  const wanted = new Set(validIds);
+  const tabs = (await browser.tabs.query({}))
+    .filter((tab) =>
+      wanted.has(tab.id) &&
+      typeof tab.url === "string" &&
+      GROUPABLE_URL.test(tab.url) &&
+      typeof tab.windowId === "number"
+    )
+    .sort((a, b) => (a.windowId - b.windowId) || ((a.index || 0) - (b.index || 0)));
+  for (const tab of tabs) {
+    const createProperties = {
+      url: tab.url,
+      windowId: tab.windowId,
+      pinned: Boolean(tab.pinned),
+      active: false,
+      cookieStoreId: targetCookieStoreId,
+    };
+    if (typeof tab.index === "number") {
+      createProperties.index = tab.index + 1;
+    }
+    try {
+      await browser.tabs.create(createProperties);
+      await browser.tabs.remove(tab.id);
+    } catch (error) {
+      // Skip tabs that vanish or reject container moves; the refreshed list tells the truth.
+    }
   }
   return listTabsForSearch();
 }

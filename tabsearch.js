@@ -28,6 +28,7 @@ let inputEl = null;
 let listEl = null;
 let footerEl = null;
 let groupDraftOpen = false;
+let containerPickerOpen = false;
 let actionMessage = "";
 let previewState = null;
 const collapsedGroups = new Set();
@@ -36,6 +37,7 @@ let dropIndicator = null;
 let historyResults = [];
 let historyQuery = "";
 let historyDebounceTimer = null;
+let tabContainers = [];
 const MAX_RENDERED_RESULTS = 50;
 
 const DEFAULT_TAB_SEARCH_SHORTCUT = { ctrl: true, alt: false, shift: false, meta: false, key: "s" };
@@ -147,7 +149,7 @@ function scheduleHistoryFetch(query) {
 function prepareTabsForSearch(tabs) {
   if (!Array.isArray(tabs)) return [];
   for (const tab of tabs) {
-    tab._searchHaystack = `${tab.title || ""} ${tab.url || ""} ${tab.groupTitle || ""}`.toLowerCase();
+    tab._searchHaystack = `${tab.title || ""} ${tab.url || ""} ${tab.groupTitle || ""} ${tab.containerName || ""}`.toLowerCase();
   }
   return tabs;
 }
@@ -283,6 +285,24 @@ function buildOverlay() {
     .row .group-badge[data-color="purple"] { background: rgba(120, 75, 190, 0.42); }
     .row .group-badge[data-color="red"] { background: rgba(190, 55, 55, 0.42); }
     .row .group-badge[data-color="yellow"] { background: rgba(160, 125, 0, 0.42); }
+    .row .container-badge {
+      flex: 0 1 auto; display: inline-flex; align-items: center; gap: 5px;
+      min-width: 0; max-width: 140px; padding: 2px 7px; border-radius: 999px;
+      color: #f0eff4; background: rgba(255, 255, 255, 0.10);
+      font-size: 10px; font-weight: 600;
+    }
+    .row .container-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 999px; background: #8a8896; }
+    .row .container-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .row .container-badge[data-color="blue"] .container-dot { background: #0061e0; }
+    .row .container-badge[data-color="turquoise"] .container-dot,
+    .row .container-badge[data-color="cyan"] .container-dot { background: #00c8d7; }
+    .row .container-badge[data-color="green"] .container-dot { background: #12bc00; }
+    .row .container-badge[data-color="yellow"] .container-dot { background: #ffe900; }
+    .row .container-badge[data-color="orange"] .container-dot { background: #ff9400; }
+    .row .container-badge[data-color="red"] .container-dot { background: #d70022; }
+    .row .container-badge[data-color="pink"] .container-dot { background: #ff4aa2; }
+    .row .container-badge[data-color="purple"] .container-dot { background: #a47fef; }
+    .row .container-badge[data-color="toolbar"] .container-dot { background: #8a8896; }
     .row .close {
       flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
       border: 0; background: transparent; color: var(--faint);
@@ -367,7 +387,7 @@ function buildOverlay() {
       background: #2b2a33; box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
     }
     .actions .menu button { width: 100%; text-align: left; margin: 2px 0; background: transparent; border: 0; }
-    .actions input {
+    .actions input, .actions select {
       min-width: 160px; padding: 5px 8px; border-radius: 7px;
       border: 1px solid rgba(255, 255, 255, 0.14); background: #2b2a33; color: var(--text);
       font: inherit; font-size: 12px; outline: 0;
@@ -695,6 +715,18 @@ function makeTabRow(tab, index, interactive, opts = {}) {
     badge.className = "group-badge";
     badge.textContent = tab.groupTitle;
     if (tab.groupColor) badge.dataset.color = tab.groupColor;
+    title.appendChild(badge);
+  }
+  if (tab.containerName && tab.cookieStoreId !== "firefox-default" && tab.cookieStoreId !== "firefox-private") {
+    const badge = document.createElement("span");
+    badge.className = "container-badge";
+    if (tab.containerColor) badge.dataset.color = tab.containerColor;
+    const dot = document.createElement("span");
+    dot.className = "container-dot";
+    const label = document.createElement("span");
+    label.className = "container-name";
+    label.textContent = tab.containerName;
+    badge.append(dot, label);
     title.appendChild(badge);
   }
   const url = document.createElement("div");
@@ -1038,6 +1070,7 @@ function markRange(index) {
   }
   anchorIndex = index;
   groupDraftOpen = false;
+  containerPickerOpen = false;
   actionMessage = "";
   render(inputEl.value);
 }
@@ -1052,6 +1085,7 @@ function toggleMark(index) {
   }
   anchorIndex = index;
   groupDraftOpen = false;
+  containerPickerOpen = false;
   actionMessage = "";
   render(inputEl.value);
 }
@@ -1060,6 +1094,7 @@ function clearMarks() {
   marked.clear();
   anchorIndex = null;
   groupDraftOpen = false;
+  containerPickerOpen = false;
   actionMessage = "";
 }
 
@@ -1069,6 +1104,7 @@ function markDuplicateTabs() {
   for (const tabId of duplicateTabIds) marked.add(tabId);
   anchorIndex = null;
   groupDraftOpen = false;
+  containerPickerOpen = false;
   actionMessage = "";
   render(inputEl.value);
 }
@@ -1110,6 +1146,7 @@ function renderFooter() {
 
   const group = makeActionButton("Group", () => {
     groupDraftOpen = true;
+    containerPickerOpen = false;
     actionMessage = "";
     render(inputEl.value);
   });
@@ -1132,6 +1169,15 @@ function renderFooter() {
   const menu = document.createElement("div");
   menu.className = "menu";
   menu.appendChild(makeActionButton("Move to new window", () => runBulkListAction("tabsearch-move-new-window", { tabIds: tabs.map((tab) => tab.id) })));
+  const moveContainer = makeActionButton("Move to container\u2026", () => {
+    groupDraftOpen = false;
+    containerPickerOpen = true;
+    actionMessage = "";
+    render(inputEl.value);
+  });
+  moveContainer.disabled = tabContainers.length === 0;
+  if (tabContainers.length === 0) moveContainer.title = "No containers available";
+  menu.appendChild(moveContainer);
   const ungroup = makeActionButton("Ungroup", () => runBulkListAction("tabsearch-ungroup", { tabIds: tabs.map((tab) => tab.id) }));
   ungroup.disabled = !canUngroup;
   if (!sameWindow) ungroup.title = "select tabs from one window to group";
@@ -1149,7 +1195,7 @@ function renderFooter() {
   });
   footerEl.appendChild(clear);
 
-  if (!sameWindow || actionMessage) {
+  if ((!sameWindow && !containerPickerOpen) || actionMessage) {
     const message = document.createElement("span");
     message.className = "message";
     message.textContent = actionMessage || "select tabs from one window to group";
@@ -1158,6 +1204,8 @@ function renderFooter() {
 
   if (groupDraftOpen && sameWindow) {
     renderGroupDraft(tabs, windowId);
+  } else if (containerPickerOpen) {
+    renderContainerPicker(tabs);
   }
 }
 
@@ -1187,6 +1235,36 @@ function renderGroupDraft(tabs, windowId) {
   });
   footerEl.appendChild(form);
   input.focus();
+}
+
+function renderContainerPicker(tabs) {
+  const form = document.createElement("form");
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", "Move selected tabs to container");
+
+  const defaultOption = document.createElement("option");
+  defaultOption.value = "firefox-default";
+  defaultOption.textContent = "No container";
+  select.appendChild(defaultOption);
+
+  for (const container of tabContainers) {
+    const option = document.createElement("option");
+    option.value = container.cookieStoreId;
+    option.textContent = container.name || container.cookieStoreId;
+    select.appendChild(option);
+  }
+
+  form.appendChild(select);
+  form.appendChild(makeActionButton("Move", () => {}, "submit"));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    runBulkListAction("tabsearch-move-container", {
+      tabIds: tabs.map((tab) => tab.id),
+      cookieStoreId: select.value,
+    });
+  });
+  footerEl.appendChild(form);
+  select.focus();
 }
 
 function renderPreviewFooter() {
@@ -1304,9 +1382,17 @@ async function openOverlay() {
   selectedIndex = 0;
   focusInput();
   try {
-    allTabs = prepareTabsForSearch((await browser.runtime.sendMessage({ type: "tabsearch-list" })) || []);
+    const [tabs, containersResult] = await Promise.all([
+      browser.runtime.sendMessage({ type: "tabsearch-list" }),
+      browser.runtime.sendMessage({ type: "tabsearch-containers" }).catch(() => ({ ok: false, containers: [] })),
+    ]);
+    allTabs = prepareTabsForSearch(tabs || []);
+    tabContainers = containersResult && containersResult.ok && Array.isArray(containersResult.containers)
+      ? containersResult.containers
+      : [];
   } catch (error) {
     allTabs = [];
+    tabContainers = [];
   }
   if (!isOpen()) return; // closed while awaiting
   render(inputEl.value);
@@ -1324,6 +1410,7 @@ function closeOverlay() {
   selectedIndex = 0;
   clearMarks();
   previewState = null;
+  tabContainers = [];
   dropIndicator = null;
   // When we are the extension-hosted new-tab page (not an in-page overlay),
   // removing the host leaves a blank extension tab behind. Close the tab instead.

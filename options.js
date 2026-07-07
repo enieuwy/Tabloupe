@@ -50,10 +50,12 @@ const STORAGE_KEYS = [
   "tabSearchShortcut",
   "aiProvider",
   "aiGroupingPrompt",
+  "lastProviderCheck",
   "focusCatalog",
   "lensSchedules",
   "focusSessionHistory",
   "automationFallback",
+  "discardCollapsedTabs",
 ];
 
 const state = {
@@ -69,6 +71,8 @@ const state = {
   firefoxGroupTitles: [],
   firefoxGroupTitleCounts: {},
   currentGroups: [],
+  containers: [],
+  containerNames: [],
   unmappedFocusId: null,
   missingGroup: null,
   emptyGroup: null,
@@ -80,10 +84,12 @@ const state = {
   tabSearchShortcut: { ...DEFAULT_TAB_SEARCH_SHORTCUT },
   aiProvider: { kind: "foundation" },
   aiGroupingPrompt: "",
+  lastProviderCheck: null,
   focusCatalog: {},
   lensSchedules: [],
   focusSessionHistory: [],
   automationFallback: { kind: "all" },
+  discardCollapsedTabs: false,
 };
 
 let recordingShortcut = false;
@@ -113,7 +119,7 @@ function normalizeSelector(value) {
   if (!isRecord(value)) {
     return null;
   }
-  const type = value.type === "glob" ? "glob" : value.type === "title" ? "title" : null;
+  const type = value.type === "glob" ? "glob" : value.type === "title" ? "title" : value.type === "container" ? "container" : null;
   const selectorValue = typeof value.value === "string" ? value.value.trim() : "";
   if (!type || !selectorValue) {
     return null;
@@ -337,6 +343,30 @@ async function requestLensState(windowId) {
   }
 }
 
+function normalizeContainers(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter(isRecord)
+    .map((container) => ({
+      cookieStoreId: typeof container.cookieStoreId === "string" ? container.cookieStoreId : "",
+      name: typeof container.name === "string" ? container.name.trim() : "",
+      color: typeof container.color === "string" ? container.color : "",
+      icon: typeof container.icon === "string" ? container.icon : "",
+    }))
+    .filter((container) => container.cookieStoreId && container.name);
+}
+
+async function requestContainers() {
+  try {
+    const response = await browser.runtime.sendMessage({ type: "tabsearch-containers" });
+    return response && response.ok ? normalizeContainers(response.containers) : [];
+  } catch (error) {
+    return [];
+  }
+}
+
 function mergeLensStateSummaries(lensSummaries) {
   if (!Array.isArray(lensSummaries)) {
     return;
@@ -364,10 +394,11 @@ function mergeLensStateSummaries(lensSummaries) {
 async function loadAll() {
   const windowId = await currentWindowId();
   state.windowId = windowId;
-  const [stored, firefoxSnapshot, lensState] = await Promise.all([
+  const [stored, firefoxSnapshot, lensState, containers] = await Promise.all([
     browser.storage.local.get(STORAGE_KEYS),
     queryFirefoxGroupSnapshot(),
     requestLensState(windowId),
+    requestContainers(),
   ]);
 
   state.lenses = normalizeLenses(stored.lenses);
@@ -381,6 +412,8 @@ async function loadAll() {
   state.firefoxGroupTitles = firefoxSnapshot.titles;
   state.firefoxGroupTitleCounts = firefoxSnapshot.counts;
   state.currentGroups = firefoxSnapshot.currentGroups;
+  state.containers = containers;
+  state.containerNames = uniqueSortedTitlesFromValues(containers.map((container) => container.name));
   state.unmappedFocusId = typeof stored.unmappedFocusId === "string" ? stored.unmappedFocusId : null;
   state.missingGroup = typeof stored.missingGroup === "string" ? stored.missingGroup : null;
   state.emptyGroup = typeof stored.emptyGroup === "string" ? stored.emptyGroup : null;
@@ -394,6 +427,8 @@ async function loadAll() {
     : { ...DEFAULT_TAB_SEARCH_SHORTCUT };
   state.aiProvider = normalizeProvider(stored.aiProvider);
   state.aiGroupingPrompt = normalizeGroupingPrompt(stored.aiGroupingPrompt);
+  state.lastProviderCheck = normalizeProviderCheck(stored.lastProviderCheck);
+  state.discardCollapsedTabs = stored.discardCollapsedTabs === true;
   state.focusCatalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
   state.lensSchedules = normalizeLensSchedules(stored.lensSchedules);
   state.focusSessionHistory = normalizeFocusSessionHistory(stored.focusSessionHistory);
@@ -704,6 +739,19 @@ function makeRowDatalist(listId, excluded) {
   return datalist;
 }
 
+function makeContainerDatalist(listId, excluded) {
+  const datalist = document.createElement("datalist");
+  datalist.id = listId;
+  const excludedSet = new Set(excluded.map((value) => value.toLowerCase()));
+  const available = state.containerNames.filter((name) => !excludedSet.has(name.toLowerCase()));
+  datalist.replaceChildren(...available.map((name) => {
+    const option = document.createElement("option");
+    option.value = name;
+    return option;
+  }));
+  return datalist;
+}
+
 function replaceLensInState(lensId, patch) {
   const index = state.lenses.findIndex((lens) => lens.id === lensId);
   if (index === -1) {
@@ -742,6 +790,20 @@ function selectorFromText(value) {
     return null;
   }
   return { type: isGlobPattern(trimmed) ? "glob" : "title", value: trimmed };
+}
+
+function selectorFromTypedInput(type, value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed) {
+    return null;
+  }
+  if (type === "container") {
+    return { type: "container", value: trimmed };
+  }
+  if (type === "glob") {
+    return { type: "glob", value: trimmed };
+  }
+  return selectorFromText(trimmed);
 }
 
 function addSelectorToLens(lensId, selector) {
@@ -786,12 +848,19 @@ function selectorMatchesTitle(selector, title) {
   if (selector.type === "title") {
     return selector.value === title;
   }
-  return globToRegExp(selector.value).test(title);
+  if (selector.type === "glob") {
+    return globToRegExp(selector.value).test(title);
+  }
+  return false;
 }
 
 function selectorMatchCount(selector) {
   if (selector.type === "title") {
     return state.firefoxGroupTitleCounts[selector.value] || 0;
+  }
+  if (selector.type === "container") {
+    const target = selector.value.toLowerCase();
+    return state.containerNames.some((name) => name.toLowerCase() === target) ? 1 : 0;
   }
   const regex = globToRegExp(selector.value);
   return Object.entries(state.firefoxGroupTitleCounts).reduce((count, [title, titleCount]) => {
@@ -802,16 +871,16 @@ function selectorMatchCount(selector) {
 function makeChip(lensId, selector) {
   const chip = document.createElement("span");
   const count = selectorMatchCount(selector);
-  chip.className = `group-chip${selector.type === "glob" ? " group-chip-pattern" : ""}${count === 0 ? " is-muted" : ""}`;
+  chip.className = `group-chip${selector.type === "glob" ? " group-chip-pattern" : ""}${selector.type === "container" ? " group-chip-container" : ""}${count === 0 ? " is-muted" : ""}`;
   const label = document.createElement("span");
   label.className = "group-chip-label";
   label.textContent = selector.value;
   chip.append(label);
 
-  if (selector.type === "glob") {
+  if (selector.type === "glob" || selector.type === "container") {
     const badge = document.createElement("span");
     badge.className = "group-chip-badge";
-    badge.textContent = "pattern";
+    badge.textContent = selector.type === "container" ? "container" : "pattern";
     chip.append(badge);
   }
   if (count === 0) {
@@ -1445,17 +1514,42 @@ function renderLensCard(lens, index) {
   for (const selector of lens.groupSelectors) {
     chips.append(selector.type === "glob" ? makePatternChip(lens.id, selector) : makeChip(lens.id, selector));
   }
+  const groupListId = "firefox-groups-lens-" + index;
+  const containerListId = "firefox-containers-lens-" + index;
+  const typeSelect = document.createElement("select");
+  typeSelect.className = "group-chip-type";
+  typeSelect.setAttribute("aria-label", `Selector type for ${lens.name}`);
+  for (const option of [
+    ["title", "Group"],
+    ["glob", "Pattern"],
+    ["container", "Container"],
+  ]) {
+    const element = document.createElement("option");
+    element.value = option[0];
+    element.textContent = option[1];
+    typeSelect.appendChild(element);
+  }
   const input = document.createElement("input");
   input.type = "text";
   input.className = "group-chip-input";
-  input.setAttribute("list", "firefox-groups-lens-" + index);
+  input.setAttribute("list", groupListId);
   input.autocomplete = "off";
-  input.setAttribute("aria-label", `Add a group selector to ${lens.name}`);
+  input.setAttribute("aria-label", `Add a selector to ${lens.name}`);
   input.placeholder = "+ add group\u2026";
+  const updateSelectorInput = () => {
+    if (typeSelect.value === "container") {
+      input.setAttribute("list", containerListId);
+      input.placeholder = "+ add container\u2026";
+    } else {
+      input.setAttribute("list", groupListId);
+      input.placeholder = typeSelect.value === "glob" ? "+ add pattern\u2026" : "+ add group\u2026";
+    }
+  };
+  typeSelect.addEventListener("change", updateSelectorInput);
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
-      const selector = selectorFromText(input.value);
+      const selector = selectorFromTypedInput(typeSelect.value, input.value);
       if (selector) {
         addSelectorToLens(lens.id, selector);
       }
@@ -1464,9 +1558,10 @@ function renderLensCard(lens, index) {
       input.blur();
     }
   });
-  chips.append(input);
+  chips.append(typeSelect, input);
   selectorSection.append(selectorHeading, chips);
-  selectorSection.append(makeRowDatalist("firefox-groups-lens-" + index, lensSelectorValues(lens, "title")));
+  selectorSection.append(makeRowDatalist(groupListId, lensSelectorValues(lens, "title")));
+  selectorSection.append(makeContainerDatalist(containerListId, lensSelectorValues(lens, "container")));
 
   const panel = document.createElement("div");
   panel.className = "row-options";
@@ -2012,6 +2107,7 @@ function render() {
   renderDiagnostics();
   renderActivity();
   renderShortcut();
+  renderPerformanceSettings();
   applyPendingFocus();
 }
 
@@ -2025,6 +2121,19 @@ function renderShortcut() {
   }
   button.classList.remove("recording");
   button.textContent = formatShortcut(state.tabSearchShortcut);
+}
+
+function renderPerformanceSettings() {
+  const checkbox = document.getElementById("discard-collapsed-tabs");
+  if (checkbox) {
+    checkbox.checked = state.discardCollapsedTabs === true;
+  }
+}
+
+async function persistDiscardCollapsedTabs(enabled) {
+  await browser.storage.local.set({ discardCollapsedTabs: enabled });
+  state.discardCollapsedTabs = enabled;
+  renderPerformanceSettings();
 }
 
 function setShortcutStatus(message, kind = "") {
@@ -2144,6 +2253,14 @@ function applyStorageChange(changes) {
     state.aiGroupingPrompt = normalizeGroupingPrompt(changes.aiGroupingPrompt.newValue);
     renderGroupingPrompt();
   }
+  if (changes.discardCollapsedTabs) {
+    state.discardCollapsedTabs = changes.discardCollapsedTabs.newValue === true;
+    renderPerformanceSettings();
+  }
+  if (changes.lastProviderCheck) {
+    state.lastProviderCheck = normalizeProviderCheck(changes.lastProviderCheck.newValue);
+    renderProviderLastCheck();
+  }
   if (changes.focusCatalog) {
     state.focusCatalog = isRecord(changes.focusCatalog.newValue) ? changes.focusCatalog.newValue : {};
   }
@@ -2164,6 +2281,13 @@ async function refreshFirefoxGroups() {
   state.firefoxGroupTitles = snapshot.titles;
   state.firefoxGroupTitleCounts = snapshot.counts;
   state.currentGroups = snapshot.currentGroups;
+  render();
+}
+
+async function refreshContainers() {
+  const containers = await requestContainers();
+  state.containers = containers;
+  state.containerNames = uniqueSortedTitlesFromValues(containers.map((container) => container.name));
   render();
 }
 
@@ -2206,6 +2330,237 @@ function normalizeProvider(value) {
   return { kind: "foundation" };
 }
 
+function normalizeProviderCheck(value) {
+  if (
+    isRecord(value) &&
+    typeof value.at === "number" &&
+    Number.isFinite(value.at) &&
+    typeof value.detail === "string"
+  ) {
+    return {
+      at: value.at,
+      ok: value.ok === true,
+      detail: value.detail,
+    };
+  }
+  return null;
+}
+
+function validateProviderBaseURL(baseURL) {
+  let parsed;
+  try {
+    parsed = new URL(baseURL);
+  } catch (error) {
+    return { error: "That base URL is not valid." };
+  }
+  const loopbackHosts = ["localhost", "127.0.0.1", "[::1]"];
+  if (parsed.protocol !== "https:" && !loopbackHosts.includes(parsed.hostname)) {
+    return { error: "Use an https:// URL. Plain http is only allowed for localhost." };
+  }
+  return { parsed, origin: parsed.origin };
+}
+
+function requestProviderOriginPermission(origin) {
+  return browser.permissions.request({ origins: [`${origin}/*`] });
+}
+
+function providerEndpoint(baseURL, path) {
+  return `${baseURL.replace(/\/+$/, "")}${path}`;
+}
+
+function providerHeaders(apiKey, body = false) {
+  const headers = { Accept: "application/json" };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  if (body) {
+    headers["Content-Type"] = "application/json";
+  }
+  return headers;
+}
+
+function setProviderTestStatus(message) {
+  const status = document.getElementById("provider-test-status");
+  if (status) {
+    status.textContent = message;
+  }
+}
+
+function formatProviderCheckTime(at) {
+  const elapsed = Date.now() - at;
+  if (elapsed >= 0 && elapsed < 60000) {
+    return "just now";
+  }
+  if (elapsed >= 0 && elapsed < 3600000) {
+    const minutes = Math.max(1, Math.round(elapsed / 60000));
+    return `${minutes} min ago`;
+  }
+  if (elapsed >= 0 && elapsed < 86400000) {
+    const hours = Math.max(1, Math.round(elapsed / 3600000));
+    return `${hours} hr ago`;
+  }
+  return new Date(at).toLocaleString();
+}
+
+function renderProviderLastCheck() {
+  const status = document.getElementById("provider-test-status");
+  if (!status || status.textContent) {
+    return;
+  }
+  if (!state.lastProviderCheck) {
+    status.textContent = "";
+    return;
+  }
+  status.textContent = `Last check: ${formatProviderCheckTime(state.lastProviderCheck.at)} \u2014 ${state.lastProviderCheck.detail}`;
+}
+
+async function rememberProviderCheck(ok, detail) {
+  const check = { at: Date.now(), ok, detail };
+  state.lastProviderCheck = check;
+  setProviderTestStatus(detail);
+  try {
+    await browser.storage.local.set({ lastProviderCheck: check });
+  } catch (error) {
+    // The visible result is still useful if private browsing or quota blocks diagnostics.
+  }
+}
+
+function providerNetworkFailure(error) {
+  if (error && error.name === "AbortError") {
+    return "Connection failed: Request timed out.";
+  }
+  return `Connection failed: ${error && error.message ? error.message : "Network error"}`;
+}
+
+async function fetchProvider(url, options) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 10000);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function openAIModelIds(payload) {
+  if (!isRecord(payload) || !Array.isArray(payload.data)) {
+    return null;
+  }
+  const ids = [];
+  for (const item of payload.data) {
+    if (isRecord(item) && typeof item.id === "string" && item.id) {
+      ids.push(item.id);
+      if (ids.length >= 100) {
+        break;
+      }
+    }
+  }
+  if (payload.data.length > 0 && ids.length === 0) {
+    return null;
+  }
+  return ids;
+}
+
+function fillProviderModels(ids) {
+  const datalist = document.getElementById("provider-models");
+  if (!datalist) {
+    return;
+  }
+  const options = ids.map((id) => {
+    const option = document.createElement("option");
+    option.value = id;
+    return option;
+  });
+  datalist.replaceChildren(...options);
+}
+
+async function testProviderConnection() {
+  const button = document.getElementById("provider-test");
+  if (button) {
+    button.disabled = true;
+  }
+  setProviderTestStatus("Testing connection\u2026");
+  try {
+    const baseURL = document.getElementById("provider-url").value.trim();
+    const model = document.getElementById("provider-model").value.trim();
+    const apiKey = document.getElementById("provider-key").value.trim();
+    if (!baseURL) {
+      await rememberProviderCheck(false, "Enter an API base URL.");
+      return;
+    }
+
+    const validation = validateProviderBaseURL(baseURL);
+    if (validation.error) {
+      await rememberProviderCheck(false, validation.error);
+      return;
+    }
+
+    let granted;
+    try {
+      granted = await requestProviderOriginPermission(validation.origin);
+    } catch (error) {
+      await rememberProviderCheck(false, "Could not request permission for that domain.");
+      return;
+    }
+    if (!granted) {
+      await rememberProviderCheck(false, "Permission denied \u2014 the extension can't reach that domain.");
+      return;
+    }
+
+    const modelsURL = providerEndpoint(baseURL, "/models");
+    let response = null;
+    try {
+      response = await fetchProvider(modelsURL, {
+        method: "GET",
+        headers: providerHeaders(apiKey),
+      });
+    } catch (error) {
+      response = null;
+    }
+
+    if (response && response.ok) {
+      try {
+        const ids = openAIModelIds(await response.json());
+        if (ids) {
+          fillProviderModels(ids);
+          await rememberProviderCheck(true, `Found ${ids.length} models.`);
+          return;
+        }
+      } catch (error) {
+        // Non-JSON responses commonly mean the provider uses a different models path.
+      }
+    }
+
+    if (!model) {
+      await rememberProviderCheck(false, "Set a model to run the fallback check.");
+      return;
+    }
+
+    try {
+      const fallback = await fetchProvider(providerEndpoint(baseURL, "/chat/completions"), {
+        method: "POST",
+        headers: providerHeaders(apiKey, true),
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: "ping" }],
+          max_tokens: 1,
+        }),
+      });
+      if (fallback.ok) {
+        await rememberProviderCheck(true, `Model list unavailable, but the endpoint responded (HTTP ${fallback.status}).`);
+      } else {
+        await rememberProviderCheck(false, `Connection failed: HTTP ${fallback.status}`);
+      }
+    } catch (error) {
+      await rememberProviderCheck(false, providerNetworkFailure(error));
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+    }
+  }
+}
+
 let toastTimer = null;
 function showToast(message, kind = "") {
   if (!message) {
@@ -2236,6 +2591,10 @@ function providerCustomVisible(visible) {
   if (custom) {
     custom.hidden = !visible;
   }
+  const test = document.getElementById("provider-test");
+  if (test) {
+    test.hidden = !visible;
+  }
 }
 
 function renderProvider() {
@@ -2250,6 +2609,7 @@ function renderProvider() {
     document.getElementById("provider-model").value = provider.model || "";
     document.getElementById("provider-key").value = provider.apiKey || "";
   }
+  renderProviderLastCheck();
 }
 
 function applyProviderPreset(presetKey) {
@@ -2311,24 +2671,16 @@ async function saveProvider() {
     showToast("Enter both an API base URL and a model.", "error");
     return;
   }
-  let parsed;
-  try {
-    parsed = new URL(baseURL);
-  } catch (error) {
-    showToast("That base URL is not valid.", "error");
+  const validation = validateProviderBaseURL(baseURL);
+  if (validation.error) {
+    showToast(validation.error, "error");
     return;
   }
-  const loopbackHosts = ["localhost", "127.0.0.1", "[::1]"];
-  if (parsed.protocol !== "https:" && !loopbackHosts.includes(parsed.hostname)) {
-    showToast("Use an https:// URL. Plain http is only allowed for localhost.", "error");
-    return;
-  }
-  const origin = parsed.origin;
-
+  const origin = validation.origin;
 
   let granted;
   try {
-    granted = await browser.permissions.request({ origins: [`${origin}/*`] });
+    granted = await requestProviderOriginPermission(origin);
   } catch (error) {
     console.error("Host permission request failed:", error);
     showToast("Could not request permission for that domain.", "error");
@@ -2388,6 +2740,17 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
+  const discardCollapsedTabs = document.getElementById("discard-collapsed-tabs");
+  if (discardCollapsedTabs) {
+    discardCollapsedTabs.addEventListener("change", () => {
+      persistDiscardCollapsedTabs(discardCollapsedTabs.checked).catch((error) => {
+        console.error("Discard collapsed tabs setting save failed:", error);
+        renderPerformanceSettings();
+        showToast("Save failed. See extension console.", "error");
+      });
+    });
+  }
+
   document.getElementById("preset-openai").addEventListener("click", () => applyProviderPreset("openai"));
   document.getElementById("preset-groq").addEventListener("click", () => applyProviderPreset("groq"));
   document.getElementById("preset-openrouter").addEventListener("click", () => applyProviderPreset("openrouter"));
@@ -2403,6 +2766,10 @@ document.addEventListener("DOMContentLoaded", () => {
       console.error("Provider save failed:", error);
       showToast("Save failed. See extension console.", "error");
     });
+  });
+
+  document.getElementById("provider-test").addEventListener("click", () => {
+    testProviderConnection();
   });
 
   document.getElementById("ai-prompt-reset").addEventListener("click", () => {
@@ -2447,6 +2814,9 @@ document.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("focus", () => {
     refreshFirefoxGroups().catch((error) => {
       console.error("Firefox tab group refresh failed:", error);
+    });
+    refreshContainers().catch((error) => {
+      console.error("Firefox container refresh failed:", error);
     });
   });
 
