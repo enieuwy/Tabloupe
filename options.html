@@ -28,11 +28,11 @@
     <section class="card" id="lenses-card">
       <div class="section-heading section-heading-row">
         <div>
-          <h2>Lenses — each shows only the tab groups you choose.</h2>
+          <h2>Lenses</h2>
         </div>
         <div class="lens-create-actions">
           <button id="new-empty-lens" type="button">+ New lens</button>
-          <button id="save-window-lens" type="button" class="secondary">Save current window's groups as a lens</button>
+          <button id="save-window-lens" type="button" class="secondary" title="Save current window's groups as a lens">Save current groups</button>
           <button id="import-lens-toggle" type="button" class="ghost" aria-expanded="false" aria-controls="lens-import-row">Import</button>
         </div>
       </div>
@@ -179,7 +179,7 @@
       <div class="field">
         <label for="ai-grouping-prompt">Grouping prompt</label>
         <textarea id="ai-grouping-prompt" rows="8" maxlength="4000" spellcheck="false"></textarea>
-        <p class="field-hint">The full instruction sent to the model. Edit to change how tabs are grouped, or reset to the built-in default. Used by the <strong>Custom API</strong> path; the on-device Foundation model uses its own prompt.</p>
+        <p class="field-hint">The full instruction sent to the model, used by the <strong>Custom API</strong> path. The on-device Foundation model uses its own prompt.</p>
       </div>
 
       <div class="provider-actions">

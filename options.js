@@ -2004,16 +2004,9 @@ function renderEmptyLenses() {
   title.textContent = "No lenses yet.";
   const copy = document.createElement("p");
   copy.textContent = "A lens shows only the tab groups you pick. To start, create a tab group in Firefox (or use Organize tabs in the toolbar), then add it to a lens.";
-  const button = document.createElement("button");
-  button.type = "button";
-  button.textContent = "+ New lens";
-  button.addEventListener("click", () => {
-    createEmptyLens().catch((error) => {
-      console.error("Create empty lens failed:", error);
-      setStatus("Create failed. See extension console for details.", "error");
-    });
-  });
-  empty.append(title, copy, button);
+  const pointer = document.createElement("p");
+  pointer.textContent = "Use + New lens or Save current groups above to get started.";
+  empty.append(title, copy, pointer);
   return empty;
 }
 
@@ -2091,7 +2084,7 @@ function renderLenses() {
   if (!list) return;
   renderMigrationSummary();
   if (state.lenses.length === 0) {
-    list.replaceChildren(renderActiveViewSummary(), renderEmptyLenses());
+    list.replaceChildren(renderEmptyLenses());
     return;
   }
   const rows = document.createElement("div");

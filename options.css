@@ -137,7 +137,7 @@ a:hover {
 
 .section-heading-row {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
 }
@@ -939,8 +939,15 @@ input.mono {
 .lens-create-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   justify-content: flex-end;
+}
+
+.lens-create-actions > button {
+  height: 32px;
+  padding: 0 12px;
+  font-size: 13px;
 }
 
 .lenses-list {
