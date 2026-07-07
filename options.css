@@ -477,6 +477,38 @@ label span {
   background: var(--surface-2);
 }
 
+/* Per-lens schedule and calendar editors (advanced lens controls). */
+.schedule-editor,
+.calendar-editor {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.schedule-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Recent-session log: a quiet text list, not a bulleted UA list. */
+.activity-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.summary {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
 /* An explicit `display` overrides the UA [hidden] rule, so restore it. */
 .lens-code-import[hidden] {
   display: none;
