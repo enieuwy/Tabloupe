@@ -1,7 +1,7 @@
 {
   "name": "tabloupe",
   "version": "1.0.0",
-  "description": "",
+  "description": "Firefox tab-group view switcher: save and switch lenses over your tab groups.",
   "main": "background.js",
   "directories": {
     "test": "tests"
@@ -18,8 +18,8 @@
     "url": "https://github.com/enieuwy/Tabloupe.git"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "enieuwy",
+  "license": "MIT",
   "type": "commonjs",
   "devDependencies": {
     "jsdom": "^29.1.1",
