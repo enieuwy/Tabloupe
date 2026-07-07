@@ -3220,10 +3220,21 @@ function applyProviderPreset(presetKey) {
   document.getElementById("provider-key").focus();
 }
 
+let promptDetailsInitialized = false;
+
 function renderGroupingPrompt() {
   const field = document.getElementById("ai-grouping-prompt");
   if (field) {
     field.value = state.aiGroupingPrompt || DEFAULT_GROUPING_PROMPT;
+  }
+  // Surface an existing customization once at load; after that the
+  // open/closed state belongs to the user (render runs often).
+  if (!promptDetailsInitialized) {
+    promptDetailsInitialized = true;
+    const details = document.getElementById("ai-prompt-details");
+    if (details && state.aiGroupingPrompt) {
+      details.open = true;
+    }
   }
 }
 

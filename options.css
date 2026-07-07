@@ -477,6 +477,19 @@ label span {
   background: var(--surface-2);
 }
 
+/* Collapsed-by-default grouping prompt; opens automatically when a custom
+   override is stored so users can see they diverged from the default. */
+.prompt-details summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  user-select: none;
+}
+
+.prompt-details[open] summary {
+  margin-bottom: 8px;
+}
+
 /* Per-lens schedule and calendar editors (advanced lens controls). */
 .schedule-editor,
 .calendar-editor {

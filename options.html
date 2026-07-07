@@ -19,8 +19,8 @@
     <nav class="anchor-nav" aria-label="Settings sections">
       <a href="#lenses-card">Lenses</a>
       <a href="#shortcuts-card">Shortcuts</a>
-      <a href="#ai-card">AI</a>
       <a href="#automation-card">Automation</a>
+      <a href="#ai-card">AI</a>
       <a href="#general-card">General</a>
       <a href="#activity-card">Activity</a>
     </nav>
@@ -118,6 +118,25 @@
       <p class="shortcut-hint shortcut-footnote">Shortcuts can also be managed in <a href="about:addons">about:addons</a>.</p>
     </section>
 
+    <section class="card" id="automation-card">
+      <div class="section-heading">
+        <h2>Automation</h2>
+        <p>Pair with mac-command-centre for local automation and on-device tab grouping.</p>
+      </div>
+      <p class="automation-status-line">
+        <span id="automation-helper-status" class="helper-status">No helper connected</span>
+        <span id="automation-pairing-status" class="helper-status">Pairing unknown</span>
+      </p>
+      <div class="field">
+        <label for="bus-token">Pairing token</label>
+        <div class="key-input">
+          <input id="bus-token" class="mono" type="password" autocomplete="off" spellcheck="false" inputmode="text">
+          <button id="bus-token-save" type="button" class="secondary">Save</button>
+        </div>
+        <p class="field-hint">Paste the token shown by <code>mac-command-centre pairing-token</code>. Pairing lets the helper and Tabloupe verify each other.</p>
+      </div>
+    </section>
+
     <section class="card" id="ai-card">
       <div class="section-heading">
         <h2>AI tab grouping</h2>
@@ -176,40 +195,23 @@
       </div>
 
 
-      <div class="field">
-        <label for="ai-grouping-prompt">Grouping prompt</label>
-        <textarea id="ai-grouping-prompt" rows="8" maxlength="4000" spellcheck="false"></textarea>
-        <p class="field-hint">The full instruction sent to the model, used by the <strong>Custom API</strong> path. The on-device Foundation model uses its own prompt.</p>
-      </div>
+      <details class="prompt-details" id="ai-prompt-details">
+        <summary>Grouping prompt</summary>
+        <div class="field">
+          <textarea id="ai-grouping-prompt" rows="8" maxlength="4000" spellcheck="false" aria-label="Grouping prompt"></textarea>
+          <p class="field-hint">The full instruction sent to the model, used by the <strong>Custom API</strong> path. The on-device Foundation model uses its own prompt.</p>
+          <button id="ai-prompt-reset" type="button" class="reset-btn">
+            <svg class="reset-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+            Reset to default
+          </button>
+        </div>
+      </details>
 
       <div class="provider-actions">
         <button id="provider-save" type="button" class="primary">Save AI settings</button>
         <button id="provider-test" type="button" class="secondary" hidden>Test connection</button>
-        <button id="ai-prompt-reset" type="button" class="reset-btn">
-          <svg class="reset-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
-          Reset to default
-        </button>
       </div>
       <p id="provider-test-status" class="field-hint" role="status" aria-live="polite"></p>
-    </section>
-
-    <section class="card" id="automation-card">
-      <div class="section-heading">
-        <h2>Automation</h2>
-        <p>Pair with mac-command-centre for local automation and on-device tab grouping.</p>
-      </div>
-      <p class="automation-status-line">
-        <span id="automation-helper-status" class="helper-status">No helper connected</span>
-        <span id="automation-pairing-status" class="helper-status">Pairing unknown</span>
-      </p>
-      <div class="field">
-        <label for="bus-token">Pairing token</label>
-        <div class="key-input">
-          <input id="bus-token" class="mono" type="password" autocomplete="off" spellcheck="false" inputmode="text">
-          <button id="bus-token-save" type="button" class="secondary">Save</button>
-        </div>
-        <p class="field-hint">Paste the token shown by <code>mac-command-centre pairing-token</code>. Pairing lets the helper and Tabloupe verify each other.</p>
-      </div>
     </section>
 
     <section class="card" id="general-card">
