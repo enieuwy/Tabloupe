@@ -1598,7 +1598,7 @@ function makeScheduleEditor(lens) {
   const wrap = document.createElement("div");
   wrap.className = "schedule-editor";
   const label = document.createElement("label");
-  label.className = "toggle inline-toggle";
+  label.className = "toggle";
   const checkbox = document.createElement("input");
   checkbox.type = "checkbox";
   checkbox.checked = schedule.enabled;

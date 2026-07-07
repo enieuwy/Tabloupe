@@ -218,18 +218,16 @@
       </div>
 
       <div class="setting-group">
-        <h3 class="setting-group-title">Sync</h3>
-        <label class="toggle inline-toggle" for="sync-lenses">
+        <label class="toggle" for="sync-lenses">
           <input id="sync-lenses" type="checkbox">
           <span>Sync lenses across devices (Firefox Sync)</span>
         </label>
-        <p class="field-hint">Syncs lenses (including calendar patterns), schedules, the AI grouping prompt, and the Tab Search shortcut. Never syncs API keys or the AI provider.</p>
+        <p class="field-hint">Syncs lenses, schedules, the grouping prompt, and shortcuts — never API keys or the AI provider.</p>
         <p id="sync-last-error" class="field-hint" role="status" aria-live="polite" hidden></p>
       </div>
 
       <div class="setting-group">
-        <h3 class="setting-group-title">Performance</h3>
-        <label class="toggle inline-toggle" for="discard-collapsed-tabs">
+        <label class="toggle" for="discard-collapsed-tabs">
           <input id="discard-collapsed-tabs" type="checkbox">
           <span>Discard tabs in collapsed groups when switching lenses</span>
         </label>
@@ -237,7 +235,6 @@
       </div>
 
       <div class="setting-group">
-        <h3 class="setting-group-title">Backup and transfer</h3>
         <p class="field-hint">Export lenses, schedules, shortcuts, and AI settings as JSON. API keys are excluded.</p>
         <div class="provider-actions">
           <button id="settings-export" type="button" class="secondary">Export settings</button>
