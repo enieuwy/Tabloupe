@@ -56,6 +56,10 @@ const STORAGE_KEYS = [
   "focusSessionHistory",
   "automationFallback",
   "discardCollapsedTabs",
+  "syncLenses",
+  "syncLastError",
+  "busToken",
+  "busPairingStatus",
 ];
 
 const state = {
@@ -90,6 +94,10 @@ const state = {
   focusSessionHistory: [],
   automationFallback: { kind: "all" },
   discardCollapsedTabs: false,
+  syncLenses: false,
+  syncLastError: "",
+  busToken: "",
+  busPairingStatus: "",
 };
 
 let recordingShortcut = false;
@@ -321,6 +329,23 @@ function normalizeConnectionState(value) {
   return "disconnected";
 }
 
+function normalizeBusToken(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const token = value.trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(token) ? token : "";
+}
+
+function normalizeBusPairingStatus(value) {
+  return [
+    "paired",
+    "pairing_failed",
+    "pairing_required",
+    "legacy (unpaired)",
+  ].includes(value) ? value : "";
+}
+
 async function currentWindowId() {
   if (!browser.windows || typeof browser.windows.getCurrent !== "function") {
     return undefined;
@@ -427,12 +452,16 @@ async function loadAll() {
     : { ...DEFAULT_TAB_SEARCH_SHORTCUT };
   state.aiProvider = normalizeProvider(stored.aiProvider);
   state.aiGroupingPrompt = normalizeGroupingPrompt(stored.aiGroupingPrompt);
+  state.syncLenses = stored.syncLenses === true;
+  state.syncLastError = typeof stored.syncLastError === "string" ? stored.syncLastError : "";
   state.lastProviderCheck = normalizeProviderCheck(stored.lastProviderCheck);
   state.discardCollapsedTabs = stored.discardCollapsedTabs === true;
   state.focusCatalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
   state.lensSchedules = normalizeLensSchedules(stored.lensSchedules);
   state.focusSessionHistory = normalizeFocusSessionHistory(stored.focusSessionHistory);
   state.automationFallback = isRecord(stored.automationFallback) ? stored.automationFallback : { kind: "all" };
+  state.busToken = normalizeBusToken(stored.busToken);
+  state.busPairingStatus = normalizeBusPairingStatus(stored.busPairingStatus);
   if (isRecord(lensState)) {
     if (isRecord(lensState.activeView)) {
       state.activeView = lensState.activeView;
@@ -451,6 +480,9 @@ async function loadAll() {
       state.firefoxGroupTitleCounts = liveCounts;
     }
     mergeLensStateSummaries(lensState.lenses);
+    if (typeof lensState.busPairingStatus === "string") {
+      state.busPairingStatus = normalizeBusPairingStatus(lensState.busPairingStatus);
+    }
   }
   syncUntouchedDefaultLenses();
 
@@ -1225,6 +1257,67 @@ function helperStatusText() {
   return "No helper connected";
 }
 
+function busPairingStatusText() {
+  if (state.busPairingStatus === "paired") {
+    return "Pairing: paired";
+  }
+  if (state.busPairingStatus === "pairing_failed") {
+    return "Pairing: failed";
+  }
+  if (state.busPairingStatus === "pairing_required") {
+    return "Pairing: required";
+  }
+  if (state.busPairingStatus === "legacy (unpaired)") {
+    return "Pairing: legacy (unpaired)";
+  }
+  return state.busToken ? "Pairing token saved" : "Pairing token not saved";
+}
+
+function busPairingStatusClass() {
+  return `pairing-${(state.busPairingStatus || "unknown").replace(/[^a-z0-9_-]+/g, "-")}`;
+}
+
+function renderAutomationSettings() {
+  const helper = document.getElementById("automation-helper-status");
+  if (helper) {
+    helper.className = `helper-status ${state.connectionState}`.trim();
+    helper.textContent = helperStatusText();
+  }
+  const pairing = document.getElementById("automation-pairing-status");
+  if (pairing) {
+    pairing.className = `helper-status ${busPairingStatusClass()}`;
+    pairing.textContent = busPairingStatusText();
+  }
+  const token = document.getElementById("bus-token");
+  if (token && document.activeElement !== token) {
+    token.value = state.busToken;
+  }
+}
+
+async function saveBusToken() {
+  const input = document.getElementById("bus-token");
+  const token = input ? input.value.trim().toLowerCase() : "";
+  if (token && !/^[0-9a-f]{64}$/.test(token)) {
+    showToast("Pairing token must be 64 lowercase hex characters.", "error");
+    return;
+  }
+  state.busToken = token;
+  if (input) {
+    input.value = token;
+  }
+  if (token) {
+    await browser.storage.local.set({ busToken: token });
+    showToast("Pairing token saved.", "ok");
+    return;
+  }
+  if (browser.storage.local.remove) {
+    await browser.storage.local.remove("busToken");
+  } else {
+    await browser.storage.local.set({ busToken: null });
+  }
+  showToast("Pairing token cleared.", "ok");
+}
+
 function commitLensName(lens, input) {
   const name = input.value.trim();
   if (!name || name === lens.name) {
@@ -1679,6 +1772,10 @@ function renderFocusStrip() {
   helper.className = `helper-status ${state.connectionState}`.trim();
   helper.textContent = helperStatusText();
   heading.append(helper);
+  const pairing = document.createElement("span");
+  pairing.className = `helper-status ${busPairingStatusClass()}`;
+  pairing.textContent = busPairingStatusText();
+  heading.append(pairing);
   section.append(heading);
 
   const ids = unlinkedFocusIds();
@@ -2104,10 +2201,12 @@ function applyPendingFocus() {
 
 function render() {
   renderLenses();
+  renderSyncSettings();
   renderDiagnostics();
   renderActivity();
   renderShortcut();
   renderPerformanceSettings();
+  renderAutomationSettings();
   applyPendingFocus();
 }
 
@@ -2128,6 +2227,28 @@ function renderPerformanceSettings() {
   if (checkbox) {
     checkbox.checked = state.discardCollapsedTabs === true;
   }
+}
+
+function renderSyncSettings() {
+  const checkbox = document.getElementById("sync-lenses");
+  if (checkbox) {
+    checkbox.checked = state.syncLenses === true;
+  }
+  const error = document.getElementById("sync-last-error");
+  if (!error) return;
+  if (state.syncLastError) {
+    error.hidden = false;
+    error.textContent = `Sync issue: ${state.syncLastError}`;
+  } else {
+    error.hidden = true;
+    error.textContent = "";
+  }
+}
+
+async function persistSyncLenses(enabled) {
+  await browser.storage.local.set({ syncLenses: enabled });
+  state.syncLenses = enabled;
+  renderSyncSettings();
 }
 
 async function persistDiscardCollapsedTabs(enabled) {
@@ -2239,6 +2360,12 @@ function applyStorageChange(changes) {
   if (changes.connectionState) {
     state.connectionState = normalizeConnectionState(changes.connectionState.newValue);
   }
+  if (changes.busToken) {
+    state.busToken = normalizeBusToken(changes.busToken.newValue);
+  }
+  if (changes.busPairingStatus) {
+    state.busPairingStatus = normalizeBusPairingStatus(changes.busPairingStatus.newValue);
+  }
   if (changes.lastError) {
     state.lastError = normalizeLastError(changes.lastError.newValue);
   }
@@ -2256,6 +2383,14 @@ function applyStorageChange(changes) {
   if (changes.discardCollapsedTabs) {
     state.discardCollapsedTabs = changes.discardCollapsedTabs.newValue === true;
     renderPerformanceSettings();
+  }
+  if (changes.syncLenses) {
+    state.syncLenses = changes.syncLenses.newValue === true;
+    renderSyncSettings();
+  }
+  if (changes.syncLastError) {
+    state.syncLastError = typeof changes.syncLastError.newValue === "string" ? changes.syncLastError.newValue : "";
+    renderSyncSettings();
   }
   if (changes.lastProviderCheck) {
     state.lastProviderCheck = normalizeProviderCheck(changes.lastProviderCheck.newValue);
@@ -2722,6 +2857,16 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
 
+  const syncLenses = document.getElementById("sync-lenses");
+  if (syncLenses) {
+    syncLenses.addEventListener("change", () => {
+      persistSyncLenses(syncLenses.checked).catch((error) => {
+        console.error("Lens sync setting save failed:", error);
+        renderSyncSettings();
+      });
+    });
+  }
+
   const shortcutRecord = document.getElementById("shortcut-record");
   if (shortcutRecord) {
     shortcutRecord.addEventListener("click", startRecordingShortcut);
@@ -2776,6 +2921,13 @@ document.addEventListener("DOMContentLoaded", () => {
     resetGroupingPrompt().catch((error) => {
       console.error("Grouping prompt reset failed:", error);
       showToast("Reset failed. See extension console.", "error");
+    });
+  });
+
+  document.getElementById("bus-token-save").addEventListener("click", () => {
+    saveBusToken().catch((error) => {
+      console.error("Pairing token save failed:", error);
+      showToast("Save failed. See extension console.", "error");
     });
   });
 

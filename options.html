@@ -116,6 +116,36 @@
       <p id="provider-test-status" class="field-hint" role="status" aria-live="polite"></p>
     </section>
 
+    <section class="card" id="automation-card">
+      <div class="section-heading">
+        <h2>Automation</h2>
+        <p>Pair with mac-command-centre for local automation and on-device tab grouping.</p>
+      </div>
+      <p class="automation-status-line">
+        <span id="automation-helper-status" class="helper-status">No helper connected</span>
+        <span id="automation-pairing-status" class="helper-status">Pairing unknown</span>
+      </p>
+      <div class="field">
+        <label for="bus-token">Pairing token</label>
+        <div class="key-input">
+          <input id="bus-token" class="mono" type="password" autocomplete="off" spellcheck="false" inputmode="text">
+          <button id="bus-token-save" type="button" class="secondary">Save</button>
+        </div>
+        <p class="field-hint">Paste the token shown by <code>mac-command-centre pairing-token</code>. Pairing lets the helper and Tabloupe verify each other.</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-heading">
+        <h2>Sync</h2>
+      </div>
+      <label class="toggle inline-toggle" for="sync-lenses">
+        <input id="sync-lenses" type="checkbox">
+        <span>Sync lenses across devices (Firefox Sync)</span>
+      </label>
+      <p class="field-hint">Syncs lenses, schedules, the AI grouping prompt, and the Tab Search shortcut. Never syncs API keys or the AI provider.</p>
+      <p id="sync-last-error" class="field-hint" role="status" aria-live="polite" hidden></p>
+    </section>
     <section class="card">
       <div class="section-heading">
         <h2>Performance</h2>

@@ -11,17 +11,38 @@ const OPTIONS_NOTIFICATION_PREFIX = "focus-unmapped-";
 // Cloud backends return in a few seconds. Budget generously — the popup caches
 // per window, so a slow run isn't lost if the user closes the popup.
 const GROUPING_TIMEOUT_MS = 120000;
+const BUS_TOKEN_KEY = "busToken";
+const BUS_PAIRING_STATUS_KEY = "busPairingStatus";
+const AUTH_OK_TIMEOUT_MS = 5000;
+const BUS_AUTH_STATES = Object.freeze({
+  UNAUTHENTICATED: "unauthenticated",
+  AWAITING_AUTH_OK: "awaitingAuthOk",
+  AUTHENTICATED: "authenticated",
+  LEGACY: "legacy",
+});
+const BUS_PAIRING_STATUSES = Object.freeze({
+  PAIRED: "paired",
+  PAIRING_FAILED: "pairing_failed",
+  PAIRING_REQUIRED: "pairing_required",
+  LEGACY: "legacy (unpaired)",
+});
 const AI_GROUPING_ENABLED_KEY = "aiGroupingEnabled";
 const AI_PROVIDER_KEY = "aiProvider";
 const AI_PIN_TO_FOCUS_KEY = "aiPinToFocus";
 const AI_GROUPING_PROMPT_KEY = "aiGroupingPrompt";
 const AI_GROUPING_PROMPT_MAX = 4000;
 const AI_AUTO_GROUP_KEY = "aiAutoGroup";
+const DEFAULT_TAB_SEARCH_SHORTCUT = Object.freeze({ ctrl: true, alt: false, shift: false, meta: false, key: "s" });
 const DISCARD_COLLAPSED_TABS_KEY = "discardCollapsedTabs";
 const AUTO_GROUP_DEBOUNCE_MS = 5000;
 const AUTO_GROUP_COOLDOWN_MS = 30000;
 const SCHEDULE_ALARM_NAME = "lens-schedule-tick";
 const FOCUS_SESSION_HISTORY_KEY = "focusSessionHistory";
+const SYNC_LENSES_KEY = "syncLenses";
+const SYNC_LAST_ERROR_KEY = "syncLastError";
+const LENS_SYNC_META_KEY = "lensSyncMeta";
+const LENS_SYNC_PUSH_DEBOUNCE_MS = 2000;
+const MAX_SYNC_LENS_ITEM_BYTES = 7500;
 const MAX_FOCUS_SESSION_HISTORY = 1000;
 // Default system prompt. The user can replace it wholesale from Options (stored
 // in aiGroupingPrompt); an empty override falls back to this default.
@@ -58,6 +79,11 @@ let reconnectTimer = null;
 let messageQueue = Promise.resolve();
 let groupingRequestSeq = 0;
 const pendingGroupingRequests = new Map();
+let socketAuthState = BUS_AUTH_STATES.UNAUTHENTICATED;
+let socketAuthTimer = null;
+let socketAuthContext = null;
+let pairingStatus = null;
+let loggedLegacyActivateView = false;
 // Per-window cache of the last preview so the ephemeral popup can show a result
 // instantly on reopen (and survive being closed mid-compute). Cleared on apply,
 // dismiss, window close, or TTL expiry.
@@ -77,6 +103,14 @@ const autoGroupCooldown = new Set();
 const autoGroupInflight = new Set();
 const windowProfileOverrides = new Map();
 let containersCache = null;
+let lensSyncEnabled = false;
+let applyingInboundLensSync = false;
+let lensSyncPushTimer = null;
+let pendingLensSyncAll = false;
+let pendingLensSyncPrefs = false;
+let pendingLensSyncOrder = false;
+const pendingLensSyncIds = new Set();
+const pendingLensSyncRemovedIds = new Set();
 
 // Per-window ephemeral view state (transient views, automation overrides).
 // windowIds are only stable within one browser session, so this is mirrored
@@ -191,6 +225,165 @@ function scheduleReconnect() {
     delayInMinutes: Math.max(delay / 60000, MIN_RECONNECT_ALARM_MINUTES),
   });
   reconnectTimer = setTimeout(connect, delay);
+}
+
+function clearSocketAuthTimer() {
+  if (socketAuthTimer !== null) {
+    clearTimeout(socketAuthTimer);
+    socketAuthTimer = null;
+  }
+}
+
+function resetSocketAuthState() {
+  clearSocketAuthTimer();
+  socketAuthState = BUS_AUTH_STATES.UNAUTHENTICATED;
+  socketAuthContext = null;
+}
+
+async function setPairingStatus(status) {
+  pairingStatus = status;
+  await browser.storage.local.set({ [BUS_PAIRING_STATUS_KEY]: status });
+}
+
+function normalizeBusToken(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const token = value.trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(token) ? token : null;
+}
+
+async function getBusToken() {
+  const stored = await browser.storage.local.get(BUS_TOKEN_KEY);
+  return normalizeBusToken(stored[BUS_TOKEN_KEY]);
+}
+
+function authCryptoAvailable() {
+  return typeof crypto !== "undefined" &&
+    crypto &&
+    crypto.subtle &&
+    typeof crypto.subtle.importKey === "function" &&
+    typeof crypto.subtle.sign === "function" &&
+    typeof crypto.getRandomValues === "function" &&
+    typeof TextEncoder === "function";
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function randomHex(byteCount) {
+  const bytes = new Uint8Array(byteCount);
+  crypto.getRandomValues(bytes);
+  return bytesToHex(bytes);
+}
+
+async function hmacHex(token, input) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(token),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(input));
+  return bytesToHex(new Uint8Array(signature));
+}
+
+function canUseBusSocket() {
+  return socket &&
+    socket.readyState === WebSocket.OPEN &&
+    (socketAuthState === BUS_AUTH_STATES.AUTHENTICATED || socketAuthState === BUS_AUTH_STATES.LEGACY);
+}
+
+function sendBusEnvelope(envelope) {
+  if (!canUseBusSocket()) {
+    return;
+  }
+  try {
+    socket.send(JSON.stringify(envelope));
+  } catch (error) {
+    console.error("Bus send error:", error);
+  }
+}
+
+async function lensStatePayload() {
+  const [activeView, stored, lenses] = await Promise.all([
+    getActiveView(),
+    browser.storage.local.get("lastActivation"),
+    getLenses(),
+  ]);
+  const lens = activeView.kind === "lens"
+    ? lenses.find((entry) => entry.id === activeView.lensId)
+    : null;
+  return {
+    activeView,
+    lens: lens ? {
+      id: lens.id,
+      name: lens.name,
+      icon: lens.icon,
+      color: lens.color,
+    } : null,
+    lastActivation: isRecord(stored.lastActivation) ? stored.lastActivation : null,
+  };
+}
+
+async function publishLensState() {
+  if (!canUseBusSocket()) {
+    return;
+  }
+  sendBusEnvelope({
+    type: "lensState",
+    schemaVersion: 1,
+    payload: await lensStatePayload(),
+  });
+}
+
+function publishLensStateSoon() {
+  publishLensState().catch((error) => {
+    console.error("Lens state publish error:", error);
+  });
+}
+
+async function resolveExternalView(view) {
+  if (!isRecord(view)) {
+    return null;
+  }
+  if (view.kind === "all") {
+    return { kind: "all" };
+  }
+  if (view.kind !== "lens") {
+    return null;
+  }
+  const lenses = await getLenses();
+  if (typeof view.lensId === "string") {
+    return lenses.some((lens) => lens.id === view.lensId)
+      ? { kind: "lens", lensId: view.lensId }
+      : null;
+  }
+  if (typeof view.name === "string" && view.name.trim()) {
+    const wanted = view.name.trim().toLowerCase();
+    const matches = lenses.filter((lens) => lens.name.toLowerCase() === wanted);
+    return matches.length === 1 ? { kind: "lens", lensId: matches[0].id } : null;
+  }
+  return null;
+}
+
+async function handleActivateViewEnvelope(msg) {
+  if (socketAuthState !== BUS_AUTH_STATES.AUTHENTICATED) {
+    if (socketAuthState === BUS_AUTH_STATES.LEGACY && !loggedLegacyActivateView) {
+      loggedLegacyActivateView = true;
+      console.warn("Ignoring activateView from unauthenticated legacy helper.");
+    }
+    return;
+  }
+  const payload = isRecord(msg.payload) ? msg.payload : {};
+  const view = await resolveExternalView(payload.view);
+  if (!view) {
+    return;
+  }
+  await activateView(view, { trigger: "external", triggerId: "ws" });
 }
 
 async function recordSeen(rawId) {
@@ -436,6 +629,476 @@ function normalizeLensSchedules(value) {
 async function getLensSchedules() {
   const stored = await browser.storage.local.get("lensSchedules");
   return normalizeLensSchedules(stored.lensSchedules);
+}
+
+function syncStorageArea() {
+  if (
+    browser.storage &&
+    browser.storage.sync &&
+    typeof browser.storage.sync.get === "function" &&
+    typeof browser.storage.sync.set === "function" &&
+    typeof browser.storage.sync.remove === "function"
+  ) {
+    return browser.storage.sync;
+  }
+  return null;
+}
+
+function isQuotaExceeded(error) {
+  const name = error && typeof error.name === "string" ? error.name : "";
+  const message = error && typeof error.message === "string" ? error.message : "";
+  return name.includes("Quota") || /quota/i.test(message);
+}
+
+function syncErrorMessage(error, fallback) {
+  if (error && typeof error.message === "string" && error.message.trim()) {
+    return error.message.trim();
+  }
+  return fallback;
+}
+
+async function setLensSyncLastError(message) {
+  try {
+    await browser.storage.local.set({ [SYNC_LAST_ERROR_KEY]: typeof message === "string" ? message : "" });
+  } catch (error) {
+    console.error("Lens sync error state failed:", error);
+  }
+}
+
+async function safeSyncGet(keys) {
+  const sync = syncStorageArea();
+  if (!sync) {
+    return null;
+  }
+  return sync.get(keys).catch((error) => {
+    if (isQuotaExceeded(error)) {
+      setLensSyncLastError(syncErrorMessage(error, "Firefox Sync quota exceeded.")).catch(() => {});
+    }
+    return null;
+  });
+}
+
+async function safeSyncSet(values) {
+  const sync = syncStorageArea();
+  if (!sync || !isRecord(values) || Object.keys(values).length === 0) {
+    return sync ? true : null;
+  }
+  return sync.set(values)
+    .then(() => true)
+    .catch((error) => {
+      if (isQuotaExceeded(error)) {
+        setLensSyncLastError(syncErrorMessage(error, "Firefox Sync quota exceeded.")).catch(() => {});
+      }
+      return false;
+    });
+}
+
+async function safeSyncRemove(keys) {
+  const sync = syncStorageArea();
+  const list = Array.isArray(keys) ? keys.filter((key) => typeof key === "string" && key) : [];
+  if (!sync || list.length === 0) {
+    return sync ? true : null;
+  }
+  return sync.remove(list)
+    .then(() => true)
+    .catch((error) => {
+      if (isQuotaExceeded(error)) {
+        setLensSyncLastError(syncErrorMessage(error, "Firefox Sync quota exceeded.")).catch(() => {});
+      }
+      return false;
+    });
+}
+
+function normalizeLensSyncMeta(value) {
+  return {
+    lensOrderUpdatedAt: isRecord(value) && typeof value.lensOrderUpdatedAt === "number" ? value.lensOrderUpdatedAt : 0,
+    prefsUpdatedAt: isRecord(value) && typeof value.prefsUpdatedAt === "number" ? value.prefsUpdatedAt : 0,
+  };
+}
+
+function maxLensUpdatedAt(lenses) {
+  return (Array.isArray(lenses) ? lenses : []).reduce((max, lens) => (
+    lens && typeof lens.updatedAt === "number" && lens.updatedAt > max ? lens.updatedAt : max
+  ), 0);
+}
+
+function lensSyncJsonSize(value) {
+  try {
+    return encodeURIComponent(JSON.stringify(value)).replace(/%[0-9A-F]{2}/g, "x").length;
+  } catch (error) {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function scheduleByLensId(schedules) {
+  const byId = new Map();
+  for (const schedule of normalizeLensSchedules(schedules)) {
+    byId.set(schedule.lensId, schedule);
+  }
+  return byId;
+}
+
+function normalizeSyncLensEntry(value) {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const lens = normalizeLens(value.lens);
+  if (!lens) {
+    return null;
+  }
+  const schedule = value.schedule === null
+    ? null
+    : normalizeLensSchedules([{ ...(isRecord(value.schedule) ? value.schedule : {}), lensId: lens.id }])[0] || null;
+  return { lens, schedule };
+}
+
+function normalizeSyncLensOrder(value) {
+  if (!isRecord(value) || !Array.isArray(value.ids) || typeof value.updatedAt !== "number") {
+    return null;
+  }
+  return {
+    ids: value.ids.filter((id) => typeof id === "string" && id),
+    updatedAt: value.updatedAt,
+  };
+}
+
+function normalizeTabSearchShortcut(value) {
+  if (value === null) return null;
+  if (!isRecord(value) || typeof value.key !== "string" || value.key.length === 0) {
+    return { ...DEFAULT_TAB_SEARCH_SHORTCUT };
+  }
+  return {
+    ctrl: Boolean(value.ctrl),
+    alt: Boolean(value.alt),
+    shift: Boolean(value.shift),
+    meta: Boolean(value.meta),
+    key: value.key.length === 1 ? value.key.toLowerCase() : value.key,
+  };
+}
+
+function normalizeSyncPrefs(value) {
+  if (!isRecord(value) || typeof value.updatedAt !== "number") {
+    return null;
+  }
+  return {
+    aiGroupingPrompt: typeof value.aiGroupingPrompt === "string" ? value.aiGroupingPrompt.slice(0, AI_GROUPING_PROMPT_MAX) : "",
+    tabSearchShortcut: normalizeTabSearchShortcut(value.tabSearchShortcut),
+    updatedAt: value.updatedAt,
+  };
+}
+
+function queueLensSyncPushFromLocalChange(changes) {
+  if (changes.lenses) {
+    pendingLensSyncOrder = true;
+    const oldIds = new Set(normalizeLensesFromStorageChange(changes.lenses.oldValue).map((lens) => lens.id));
+    const newIds = new Set(normalizeLensesFromStorageChange(changes.lenses.newValue).map((lens) => lens.id));
+    for (const id of newIds) {
+      pendingLensSyncIds.add(id);
+      pendingLensSyncRemovedIds.delete(id);
+    }
+    for (const id of oldIds) {
+      if (!newIds.has(id)) {
+        pendingLensSyncRemovedIds.add(id);
+        pendingLensSyncIds.delete(id);
+      }
+    }
+  }
+  if (changes.lensSchedules) {
+    const oldSchedules = scheduleByLensId(changes.lensSchedules.oldValue);
+    const newSchedules = scheduleByLensId(changes.lensSchedules.newValue);
+    for (const id of new Set([...oldSchedules.keys(), ...newSchedules.keys()])) {
+      pendingLensSyncIds.add(id);
+    }
+  }
+  if (changes.aiGroupingPrompt || changes.tabSearchShortcut) {
+    pendingLensSyncPrefs = true;
+  }
+}
+
+function normalizeLensesFromStorageChange(value) {
+  return Array.isArray(value) ? value.map(normalizeLens).filter(Boolean) : [];
+}
+
+async function recordLocalLensSyncTimestamps(changes) {
+  if (applyingInboundLensSync || (!changes.lenses && !changes.aiGroupingPrompt && !changes.tabSearchShortcut)) {
+    return;
+  }
+  const stored = await browser.storage.local.get(LENS_SYNC_META_KEY);
+  const meta = normalizeLensSyncMeta(stored[LENS_SYNC_META_KEY]);
+  const now = Date.now();
+  const next = { ...meta };
+  if (changes.lenses) {
+    next.lensOrderUpdatedAt = now;
+  }
+  if (changes.aiGroupingPrompt || changes.tabSearchShortcut) {
+    next.prefsUpdatedAt = now;
+  }
+  if (next.lensOrderUpdatedAt !== meta.lensOrderUpdatedAt || next.prefsUpdatedAt !== meta.prefsUpdatedAt) {
+    await browser.storage.local.set({ [LENS_SYNC_META_KEY]: next });
+  }
+}
+
+function scheduleLensSyncPush(options = {}) {
+  if (!lensSyncEnabled || applyingInboundLensSync) {
+    return;
+  }
+  if (options.all) {
+    pendingLensSyncAll = true;
+  }
+  clearTimeout(lensSyncPushTimer);
+  lensSyncPushTimer = setTimeout(() => {
+    lensSyncPushTimer = null;
+    pushLensSync().catch((error) => console.error("Lens sync push failed:", error));
+  }, LENS_SYNC_PUSH_DEBOUNCE_MS);
+}
+
+function cancelLensSyncPush() {
+  if (lensSyncPushTimer !== null) {
+    clearTimeout(lensSyncPushTimer);
+    lensSyncPushTimer = null;
+  }
+}
+
+async function pushLensSync() {
+  if (!lensSyncEnabled || applyingInboundLensSync || !syncStorageArea()) {
+    return;
+  }
+  const all = pendingLensSyncAll;
+  const idsToPush = all ? null : new Set(pendingLensSyncIds);
+  const removedIds = all ? new Set() : new Set(pendingLensSyncRemovedIds);
+  const pushPrefs = all || pendingLensSyncPrefs;
+  const pushOrder = all || pendingLensSyncOrder || pendingLensSyncIds.size > 0 || pendingLensSyncRemovedIds.size > 0;
+  const stored = await browser.storage.local.get([
+    "lenses",
+    "lensSchedules",
+    AI_GROUPING_PROMPT_KEY,
+    "tabSearchShortcut",
+    LENS_SYNC_META_KEY,
+  ]);
+  const lenses = normalizeLensesFromStorageChange(stored.lenses);
+  const lensById = new Map(lenses.map((lens) => [lens.id, lens]));
+  const schedules = scheduleByLensId(stored.lensSchedules);
+  const meta = normalizeLensSyncMeta(stored[LENS_SYNC_META_KEY]);
+  const now = Date.now();
+  const values = {};
+  const removeKeys = [];
+  const errors = [];
+
+  if (pushOrder) {
+    values.lensOrder = {
+      ids: lenses.map((lens) => lens.id),
+      updatedAt: meta.lensOrderUpdatedAt || maxLensUpdatedAt(lenses) || now,
+    };
+  }
+
+  const lensIds = all ? lenses.map((lens) => lens.id) : [...idsToPush].filter((id) => lensById.has(id));
+  for (const id of lensIds) {
+    const lens = lensById.get(id);
+    const item = { lens, schedule: schedules.get(id) || null };
+    const key = `lens/${id}`;
+    if (lensSyncJsonSize(item) > MAX_SYNC_LENS_ITEM_BYTES) {
+      removeKeys.push(key);
+      errors.push(`Lens "${lens.name}" is too large for Firefox Sync and was skipped.`);
+      continue;
+    }
+    values[key] = item;
+  }
+
+  for (const id of removedIds) {
+    removeKeys.push(`lens/${id}`);
+  }
+
+  if (all) {
+    const remote = await safeSyncGet(null);
+    if (remote) {
+      const localIds = new Set(lenses.map((lens) => lens.id));
+      for (const key of Object.keys(remote)) {
+        if (key.startsWith("lens/") && !localIds.has(key.slice(5))) {
+          removeKeys.push(key);
+        }
+      }
+    }
+  }
+
+  if (pushPrefs) {
+    values.prefs = {
+      aiGroupingPrompt: typeof stored[AI_GROUPING_PROMPT_KEY] === "string" ? stored[AI_GROUPING_PROMPT_KEY] : "",
+      tabSearchShortcut: normalizeTabSearchShortcut(stored.tabSearchShortcut),
+      updatedAt: meta.prefsUpdatedAt || now,
+    };
+  }
+
+  const setOk = await safeSyncSet(values);
+  const removeOk = await safeSyncRemove([...new Set(removeKeys)]);
+  if (errors.length > 0) {
+    await setLensSyncLastError(errors.join(" "));
+  } else if (setOk !== false && removeOk !== false && (setOk === true || removeOk === true)) {
+    await setLensSyncLastError("");
+  }
+
+  if (all) {
+    pendingLensSyncAll = false;
+    pendingLensSyncIds.clear();
+    pendingLensSyncRemovedIds.clear();
+    pendingLensSyncOrder = false;
+    pendingLensSyncPrefs = false;
+  } else {
+    for (const id of idsToPush) pendingLensSyncIds.delete(id);
+    for (const id of removedIds) pendingLensSyncRemovedIds.delete(id);
+    if (pushOrder) pendingLensSyncOrder = false;
+    if (pushPrefs) pendingLensSyncPrefs = false;
+  }
+}
+
+function syncSnapshotsEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+async function pullLensSync() {
+  if (!lensSyncEnabled || applyingInboundLensSync || !syncStorageArea()) {
+    return false;
+  }
+  const remote = await safeSyncGet(null);
+  if (!remote) {
+    return false;
+  }
+  const stored = await browser.storage.local.get([
+    "lenses",
+    "lensSchedules",
+    AI_GROUPING_PROMPT_KEY,
+    "tabSearchShortcut",
+    LENS_SYNC_META_KEY,
+  ]);
+  const localLenses = normalizeLensesFromStorageChange(stored.lenses);
+  const localSchedules = normalizeLensSchedules(stored.lensSchedules);
+  const meta = normalizeLensSyncMeta(stored[LENS_SYNC_META_KEY]);
+  const remoteOrder = normalizeSyncLensOrder(remote.lensOrder);
+  const remotePrefs = normalizeSyncPrefs(remote.prefs);
+  const remoteEntries = new Map();
+  for (const [key, value] of Object.entries(remote)) {
+    if (!key.startsWith("lens/")) continue;
+    const entry = normalizeSyncLensEntry(value);
+    if (entry) {
+      remoteEntries.set(entry.lens.id, entry);
+    }
+  }
+
+  const localById = new Map(localLenses.map((lens) => [lens.id, lens]));
+  const mergedById = new Map(localById);
+  const mergedSchedules = scheduleByLensId(localSchedules);
+  for (const [id, entry] of remoteEntries) {
+    const local = localById.get(id);
+    if (!local || entry.lens.updatedAt > local.updatedAt) {
+      mergedById.set(id, entry.lens);
+      if (entry.schedule) {
+        mergedSchedules.set(id, entry.schedule);
+      } else {
+        mergedSchedules.delete(id);
+      }
+    } else if (entry.lens.updatedAt === local.updatedAt) {
+      if (entry.schedule) {
+        mergedSchedules.set(id, entry.schedule);
+      } else if (remoteOrder && remoteOrder.ids.includes(id)) {
+        mergedSchedules.delete(id);
+      }
+    }
+  }
+
+  const localOrderUpdatedAt = meta.lensOrderUpdatedAt || maxLensUpdatedAt(localLenses);
+  let nextLenses = localLenses.map((lens) => mergedById.get(lens.id)).filter(Boolean);
+  let nextMeta = { ...meta };
+  if (remoteOrder && remoteOrder.updatedAt > localOrderUpdatedAt) {
+    const ordered = [];
+    let keptOutsideRemoteOrder = false;
+    const used = new Set();
+    for (const id of remoteOrder.ids) {
+      const lens = mergedById.get(id);
+      if (lens) {
+        ordered.push(lens);
+        used.add(id);
+      }
+    }
+    for (const lens of localLenses) {
+      if (used.has(lens.id)) continue;
+      if (lens.updatedAt > remoteOrder.updatedAt) {
+        const merged = mergedById.get(lens.id);
+        if (merged) {
+          ordered.push(merged);
+          used.add(lens.id);
+          keptOutsideRemoteOrder = true;
+        }
+      } else {
+        mergedById.delete(lens.id);
+        mergedSchedules.delete(lens.id);
+      }
+    }
+    for (const [id, entry] of remoteEntries) {
+      if (!used.has(id) && entry.lens.updatedAt > remoteOrder.updatedAt) {
+        ordered.push(entry.lens);
+        used.add(id);
+        keptOutsideRemoteOrder = true;
+      }
+    }
+    nextLenses = ordered;
+    nextMeta.lensOrderUpdatedAt = keptOutsideRemoteOrder ? Math.max(remoteOrder.updatedAt, maxLensUpdatedAt(ordered)) : remoteOrder.updatedAt;
+  } else {
+    const used = new Set(nextLenses.map((lens) => lens.id));
+    let appendedNewerLens = false;
+    for (const [id, lens] of mergedById) {
+      if (!used.has(id) && lens.updatedAt > localOrderUpdatedAt) {
+        nextLenses.push(lens);
+        used.add(id);
+        appendedNewerLens = true;
+      }
+    }
+    if (appendedNewerLens) {
+      nextMeta.lensOrderUpdatedAt = Math.max(localOrderUpdatedAt, maxLensUpdatedAt(nextLenses));
+    }
+  }
+
+  const retainedIds = new Set(nextLenses.map((lens) => lens.id));
+  const nextSchedules = [...mergedSchedules.values()].filter((schedule) => retainedIds.has(schedule.lensId));
+  const localPrefsUpdatedAt = meta.prefsUpdatedAt || 0;
+  const localPrompt = typeof stored[AI_GROUPING_PROMPT_KEY] === "string" ? stored[AI_GROUPING_PROMPT_KEY] : "";
+  const localShortcut = normalizeTabSearchShortcut(stored.tabSearchShortcut);
+  const values = {};
+  if (!syncSnapshotsEqual(nextLenses, localLenses)) {
+    values.lenses = nextLenses;
+  }
+  if (!syncSnapshotsEqual(nextSchedules, localSchedules)) {
+    values.lensSchedules = nextSchedules;
+  }
+  if (remotePrefs && remotePrefs.updatedAt > localPrefsUpdatedAt) {
+    if (remotePrefs.aiGroupingPrompt !== localPrompt) {
+      values[AI_GROUPING_PROMPT_KEY] = remotePrefs.aiGroupingPrompt;
+    }
+    if (!syncSnapshotsEqual(remotePrefs.tabSearchShortcut, localShortcut)) {
+      values.tabSearchShortcut = remotePrefs.tabSearchShortcut;
+    }
+    nextMeta.prefsUpdatedAt = remotePrefs.updatedAt;
+  }
+  if (!syncSnapshotsEqual(nextMeta, meta)) {
+    values[LENS_SYNC_META_KEY] = nextMeta;
+  }
+  if (Object.keys(values).length === 0) {
+    return false;
+  }
+  applyingInboundLensSync = true;
+  try {
+    await browser.storage.local.set(values);
+  } finally {
+    applyingInboundLensSync = false;
+  }
+  return true;
+}
+
+async function reconcileLensSync() {
+  if (!lensSyncEnabled || !syncStorageArea()) {
+    return;
+  }
+  await pullLensSync();
+  pendingLensSyncAll = true;
+  await pushLensSync();
 }
 
 function minutesForTime(value) {
@@ -768,12 +1431,16 @@ async function handleAppleFocus(rawId) {
 }
 
 async function handleMessage(event) {
-  const msg = JSON.parse(event.data);
+  const msg = isRecord(event) && hasOwn(event, "data") ? JSON.parse(event.data) : event;
   // MCC multiplexes several state subsystems on this socket (focus, bluetooth,
   // wireguard, ...), each wrapped in a StateEnvelope { type, schemaVersion, ts,
   // payload }. Apple Focus envelopes optionally trigger a lens; focusCatalog
   // carries the id -> {name, icon, color} table.
   if (!isRecord(msg)) {
+    return;
+  }
+  if (msg.type === "activateView") {
+    await handleActivateViewEnvelope(msg);
     return;
   }
   if (msg.type === "focusCatalog") {
@@ -796,12 +1463,114 @@ async function handleMessage(event) {
   await handleAppleFocus(rawId);
 }
 
+async function sendAuthFrame(ws, hello) {
+  const payload = isRecord(hello.payload) ? hello.payload : {};
+  if (typeof payload.nonce !== "string" || !/^[0-9a-f]{32}$/.test(payload.nonce)) {
+    await setPairingStatus(BUS_PAIRING_STATUSES.PAIRING_FAILED);
+    ws.close();
+    return;
+  }
+  const token = await getBusToken();
+  if (!token) {
+    await setPairingStatus(BUS_PAIRING_STATUSES.PAIRING_REQUIRED);
+    ws.close();
+    return;
+  }
+  if (!authCryptoAvailable()) {
+    await setPairingStatus(BUS_PAIRING_STATUSES.PAIRING_FAILED);
+    ws.close();
+    return;
+  }
+  const clientNonce = randomHex(16);
+  const nonce = payload.nonce;
+  const mac = await hmacHex(token, `tabloupe-client|${nonce}|${clientNonce}`);
+  const expectedServerMac = await hmacHex(token, `tabloupe-server|${clientNonce}|${nonce}`);
+  socketAuthContext = { nonce, clientNonce, expectedServerMac };
+  socketAuthState = BUS_AUTH_STATES.AWAITING_AUTH_OK;
+  socketAuthTimer = setTimeout(() => {
+    if (socket === ws && socketAuthState === BUS_AUTH_STATES.AWAITING_AUTH_OK) {
+      setPairingStatus(BUS_PAIRING_STATUSES.PAIRING_FAILED).catch((error) => {
+        console.error("Pairing status error:", error);
+      });
+      ws.close();
+    }
+  }, AUTH_OK_TIMEOUT_MS);
+  ws.send(JSON.stringify({
+    type: "auth",
+    schemaVersion: 1,
+    payload: { clientNonce, mac },
+  }));
+}
+
+async function handleAuthOk(ws, msg) {
+  if (msg.type === "authFail") {
+    clearSocketAuthTimer();
+    await setPairingStatus(BUS_PAIRING_STATUSES.PAIRING_FAILED);
+    ws.close();
+    return;
+  }
+  if (msg.type !== "authOk") {
+    return;
+  }
+  const payload = isRecord(msg.payload) ? msg.payload : {};
+  const expected = socketAuthContext && socketAuthContext.expectedServerMac;
+  if (typeof payload.mac !== "string" || payload.mac !== expected) {
+    clearSocketAuthTimer();
+    await setPairingStatus(BUS_PAIRING_STATUSES.PAIRING_FAILED);
+    ws.close();
+    return;
+  }
+  clearSocketAuthTimer();
+  socketAuthState = BUS_AUTH_STATES.AUTHENTICATED;
+  socketAuthContext = null;
+  await setPairingStatus(BUS_PAIRING_STATUSES.PAIRED);
+  publishLensStateSoon();
+}
+
+function handleEstablishedFrame(msg) {
+  if (tryResolveGroupingResponse(msg)) {
+    return;
+  }
+  enqueueFocusWork(() => handleMessage(msg)).catch((error) => {
+    console.error("Focus message error:", error);
+  });
+}
+
+async function handleSocketFrame(ws, event) {
+  let msg;
+  try {
+    msg = JSON.parse(event.data);
+  } catch (error) {
+    return;
+  }
+  if (socket !== ws || !isRecord(msg)) {
+    return;
+  }
+  if (socketAuthState === BUS_AUTH_STATES.UNAUTHENTICATED) {
+    if (msg.type === "hello") {
+      await sendAuthFrame(ws, msg);
+      return;
+    }
+    socketAuthState = BUS_AUTH_STATES.LEGACY;
+    await setPairingStatus(BUS_PAIRING_STATUSES.LEGACY);
+    publishLensStateSoon();
+    handleEstablishedFrame(msg);
+    return;
+  }
+  if (socketAuthState === BUS_AUTH_STATES.AWAITING_AUTH_OK) {
+    await handleAuthOk(ws, msg);
+    return;
+  }
+  handleEstablishedFrame(msg);
+}
+
 async function connect() {
   if (socket && socket.readyState !== WebSocket.CLOSED) {
     return;
   }
 
   clearReconnectTimer();
+  resetSocketAuthState();
   setConnectionState("reconnecting").catch((error) => {
     console.error("Connection state error:", error);
   });
@@ -816,18 +1585,22 @@ async function connect() {
     });
   };
   ws.onmessage = (event) => {
-    if (tryResolveGroupingResponse(event)) {
-      return;
-    }
-    enqueueFocusWork(() => handleMessage(event)).catch((error) => {
-      console.error("Focus message error:", error);
+    handleSocketFrame(ws, event).catch((error) => {
+      console.error("Bus message error:", error);
+      if (socket === ws) {
+        setPairingStatus(BUS_PAIRING_STATUSES.PAIRING_FAILED).catch((statusError) => {
+          console.error("Pairing status error:", statusError);
+        });
+        ws.close();
+      }
     });
   };
 
   ws.onclose = () => {
     if (socket === ws) {
       socket = null;
-      rejectPendingGrouping(new Error("daemon_disconnected"));
+      resetSocketAuthState();
+      rejectPendingGrouping(new Error(groupingUnavailableCode()));
       setConnectionState("reconnecting").catch((error) => {
         console.error("Connection state error:", error);
       });
@@ -871,6 +1644,7 @@ async function handleLensState(windowId) {
     hasGroups: groups.length > 0,
     hasAppleBinding,
     aiEnabled,
+    busPairingStatus: pairingStatus,
   };
 }
 
@@ -1025,6 +1799,9 @@ function start() {
   browser.storage.local.get(AI_AUTO_GROUP_KEY)
     .then((stored) => { autoGroupEnabled = stored[AI_AUTO_GROUP_KEY] === true; })
     .catch((error) => console.error("Auto-group init error:", error));
+  const lensSyncInit = browser.storage.local.get(SYNC_LENSES_KEY)
+    .then((stored) => { lensSyncEnabled = stored[SYNC_LENSES_KEY] === true; })
+    .catch((error) => console.error("Lens sync init error:", error));
   syncScheduleAlarm().catch((error) => console.error("Schedule alarm init error:", error));
   migrateToLensesV2()
     .catch((error) => {
@@ -1032,6 +1809,14 @@ function start() {
     })
     .finally(() => {
       connect();
+      lensSyncInit
+        .then(() => {
+          if (lensSyncEnabled) {
+            return reconcileLensSync();
+          }
+          return undefined;
+        })
+        .catch((error) => console.error("Lens sync reconcile failed:", error));
     });
 }
 
@@ -1187,6 +1972,12 @@ if (browser.notifications.onButtonClicked) {
 }
 
 browser.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "sync") {
+    if (lensSyncEnabled) {
+      pullLensSync().catch((error) => console.error("Lens sync pull failed:", error));
+    }
+    return;
+  }
   if (areaName !== "local") {
     return;
   }
@@ -1212,6 +2003,33 @@ browser.storage.onChanged.addListener((changes, areaName) => {
 
   if (changes.lensSchedules) {
     syncScheduleAlarm().catch((error) => console.error("Schedule alarm sync error:", error));
+  }
+
+  if (changes[BUS_TOKEN_KEY]) {
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      socket.close();
+    } else {
+      connect();
+    }
+  }
+
+  const hasLensSyncChange = changes.lenses ||
+    changes.lensSchedules ||
+    changes[AI_GROUPING_PROMPT_KEY] ||
+    changes.tabSearchShortcut;
+  if (changes[SYNC_LENSES_KEY]) {
+    lensSyncEnabled = changes[SYNC_LENSES_KEY].newValue === true;
+    if (lensSyncEnabled) {
+      reconcileLensSync().catch((error) => console.error("Lens sync reconcile failed:", error));
+    } else {
+      cancelLensSyncPush();
+    }
+  }
+  if (hasLensSyncChange && !applyingInboundLensSync) {
+    queueLensSyncPushFromLocalChange(changes);
+    recordLocalLensSyncTimestamps(changes)
+      .catch((error) => console.error("Lens sync timestamp failed:", error))
+      .finally(() => scheduleLensSyncPush());
   }
 });
 
@@ -1441,6 +2259,7 @@ async function rememberActivatedView(resolvedView, activation) {
     persistSessionWindowState();
   }
   await setActiveView(resolvedView, activation);
+  publishLensStateSoon();
 }
 
 async function discardCollapsedGroupTabs(groups) {
@@ -1656,12 +2475,16 @@ function nextGroupingRequestId() {
   return `g${groupingRequestSeq}-${Date.now()}`;
 }
 
-function tryResolveGroupingResponse(event) {
+function tryResolveGroupingResponse(eventOrMessage) {
   let msg;
-  try {
-    msg = JSON.parse(event.data);
-  } catch (error) {
-    return false;
+  if (isRecord(eventOrMessage) && hasOwn(eventOrMessage, "data")) {
+    try {
+      msg = JSON.parse(eventOrMessage.data);
+    } catch (error) {
+      return false;
+    }
+  } else {
+    msg = eventOrMessage;
   }
   if (!isRecord(msg) || msg.type !== "groupTabsResult") {
     return false;
@@ -1692,9 +2515,33 @@ function rejectPendingGrouping(error) {
   }
 }
 
+function groupingUnavailableCode() {
+  if (socket && socket.readyState === WebSocket.OPEN && socketAuthState === BUS_AUTH_STATES.AWAITING_AUTH_OK) {
+    return "pairing_pending";
+  }
+  if (pairingStatus === BUS_PAIRING_STATUSES.PAIRING_FAILED) {
+    return "pairing_failed";
+  }
+  if (pairingStatus === BUS_PAIRING_STATUSES.PAIRING_REQUIRED) {
+    return "pairing_required";
+  }
+  return "daemon_disconnected";
+}
+
+function promoteOpenSocketToLegacy() {
+  if (socket && socket.readyState === WebSocket.OPEN && socketAuthState === BUS_AUTH_STATES.UNAUTHENTICATED) {
+    socketAuthState = BUS_AUTH_STATES.LEGACY;
+    setPairingStatus(BUS_PAIRING_STATUSES.LEGACY).catch((error) => {
+      console.error("Pairing status error:", error);
+    });
+    publishLensStateSoon();
+  }
+}
+
 function requestTabGrouping(tabsPayload, promptOverride) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    return Promise.reject(new Error("daemon_disconnected"));
+  promoteOpenSocketToLegacy();
+  if (!canUseBusSocket()) {
+    return Promise.reject(new Error(groupingUnavailableCode()));
   }
   const id = nextGroupingRequestId();
   return new Promise((resolve, reject) => {
@@ -1781,6 +2628,12 @@ function describeGroupingError(code) {
   switch (code) {
     case "daemon_disconnected":
       return "Not connected to mac-command-centre.";
+    case "pairing_pending":
+      return "Still pairing with mac-command-centre. Try again in a moment.";
+    case "pairing_failed":
+      return "Pairing with mac-command-centre failed. Check the pairing token.";
+    case "pairing_required":
+      return "Enter the mac-command-centre pairing token in Options.";
     case "grouping_timeout":
       return "The on-device model took too long to respond.";
     default:

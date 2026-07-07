@@ -743,6 +743,13 @@ input.mono {
   margin-top: 18px;
 }
 
+.automation-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
 .toast-host {
   position: fixed;
   bottom: 24px;
