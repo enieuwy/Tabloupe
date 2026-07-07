@@ -543,6 +543,10 @@ async function openAiSubview() {
   await refreshAi({ autoPreview: false });
 }
 
+function openTabSearch() {
+  browser.runtime.sendMessage({ type: "open-tab-search" }).finally(() => window.close());
+}
+
 async function closeAiSubview() {
   el("ai-view").hidden = true;
   el("lens-view").hidden = false;
@@ -597,6 +601,7 @@ async function init() {
       setLensStatus("Could not save this window's automation setting.", "error");
     });
   });
+  el("open-search").addEventListener("click", openTabSearch);
   el("open-ai").addEventListener("click", openAiSubview);
   el("empty-organize").addEventListener("click", openAiSubview);
   el("lens-options").addEventListener("click", (event) => {

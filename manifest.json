@@ -37,6 +37,42 @@
         "default": "Ctrl+S",
         "mac": "MacCtrl+S"
       }
+    },
+    "activate-lens-1": {
+      "description": "Activate lens 1"
+    },
+    "activate-lens-2": {
+      "description": "Activate lens 2"
+    },
+    "activate-lens-3": {
+      "description": "Activate lens 3"
+    },
+    "activate-lens-4": {
+      "description": "Activate lens 4"
+    },
+    "activate-lens-5": {
+      "description": "Activate lens 5"
+    },
+    "activate-lens-6": {
+      "description": "Activate lens 6"
+    },
+    "activate-lens-7": {
+      "description": "Activate lens 7"
+    },
+    "activate-lens-8": {
+      "description": "Activate lens 8"
+    },
+    "activate-lens-9": {
+      "description": "Activate lens 9"
+    },
+    "cycle-lens-next": {
+      "description": "Cycle to next lens"
+    },
+    "cycle-lens-prev": {
+      "description": "Cycle to previous lens"
+    },
+    "show-all-groups": {
+      "description": "Show all groups"
     }
   },
   "options_ui": {

@@ -36,6 +36,7 @@ function createHarness({ windowId = 7, respond = () => ({}), storage = {} } = {}
   const storageData = { ...storage };
   const optionsOpened = [];
   const storageListeners = [];
+  let closed = 0;
 
   const browser = {
     windows: {
@@ -86,7 +87,9 @@ function createHarness({ windowId = 7, respond = () => ({}), storage = {} } = {}
     runScripts: "dangerously",
     beforeParse(window) {
       window.browser = browser;
-      window.close = () => {};
+      window.close = () => {
+        closed += 1;
+      };
     },
   });
 
@@ -98,6 +101,9 @@ function createHarness({ windowId = 7, respond = () => ({}), storage = {} } = {}
     sent,
     storageData,
     optionsOpened,
+    get closed() {
+      return closed;
+    },
   };
 }
 
@@ -129,6 +135,19 @@ test("popup renders the active lens from lens-state", async () => {
   assert.equal(harness.document.getElementById("lens-showing").textContent, "Showing: Work");
   const stateMsg = harness.sent.find((message) => message.type === "lens-state");
   assert.equal(stateMsg.windowId, 7);
+  const footerButtons = [...harness.document.querySelectorAll(".footer-actions button")];
+  assert.deepEqual(
+    footerButtons.map((button) => button.textContent),
+    ["Search tabs", "Organize tabs…"],
+  );
+
+  harness.document.getElementById("open-search").click();
+  await settle();
+
+  const searchMessages = harness.sent.filter((message) => message.type === "open-tab-search");
+  assert.equal(searchMessages.length, 1);
+  assert.equal(searchMessages[0].type, "open-tab-search");
+  assert.equal(harness.closed, 1);
 });
 
 test("window automation selector saves a per-window profile", async () => {

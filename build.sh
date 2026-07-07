@@ -2,6 +2,21 @@
 set -euo pipefail
 # Automatically bumps version, loads API keys, and signs the Firefox extension.
 
+usage() {
+  echo "Usage: $0 [unlisted|listed]" >&2
+  exit 2
+}
+
+CHANNEL="${1:-unlisted}"
+if [[ $# -gt 1 ]]; then
+  usage
+fi
+
+case "$CHANNEL" in
+  unlisted|listed) ;;
+  *) usage ;;
+esac
+
 # 1. Load secrets from .env
 if [[ -f .env ]]; then
   set -a
@@ -43,8 +58,11 @@ manifest.write_text(json.dumps(data, indent=2) + "\n")
 print("Bumped version to:", data["version"])
 PY
 
-echo "Packaging and submitting to Mozilla..."
-npx --no-install web-ext sign --channel="unlisted"
+echo "Packaging and submitting to Mozilla ($CHANNEL)..."
+# The listed channel submits the build for AMO review. The first listed
+# submission creates the public listing, and the .xpi may not be signed
+# immediately.
+npx --no-install web-ext sign --channel="$CHANNEL"
 SIGN_SUCCEEDED=true
 
 echo "Done! You can install the new .xpi from ./web-ext-artifacts/ via about:addons"

@@ -27,6 +27,13 @@
           <button id="save-window-lens" type="button" class="secondary">Save current window's groups as a lens</button>
         </div>
       </div>
+      <div class="field lens-code-import">
+        <label for="lens-import-code">Add lens from code</label>
+        <textarea id="lens-import-code" rows="3" spellcheck="false" placeholder="Paste a shared lens JSON code"></textarea>
+        <div class="actions">
+          <button id="lens-import-add" type="button" class="secondary">Add lens</button>
+        </div>
+      </div>
       <div id="migration-summary" class="callout migration-summary" hidden></div>
       <div id="lenses-list" class="lenses-list"></div>
       <div class="actions">
@@ -118,6 +125,13 @@
         <span id="shortcut-status" role="status" aria-live="polite"></span>
       </div>
       <p class="shortcut-hint">The overlay can't run on privileged pages (<code>about:</code>, add-ons, PDF viewer). For a shortcut that works there too, assign one under <a href="about:addons">about:addons &rarr; Manage Extension Shortcuts</a>.</p>
+    </section>
+
+    <section class="card">
+      <div class="section-heading">
+        <h2>Keyboard shortcuts</h2>
+        <p>Lens slots 1–9, cycle next/previous, and show-all commands can be bound in <a href="about:addons">about:addons</a> → ⚙️ → Manage Extension Shortcuts. They ship unbound to avoid conflicts.</p>
+      </div>
     </section>
 
     <section class="card">

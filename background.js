@@ -967,6 +967,10 @@ browser.runtime.onMessage.addListener((message) => {
   if (message && message.type === "ai-group-clear") {
     return Promise.resolve(handleGroupClear(message.windowId));
   }
+  if (message && message.type === "open-tab-search") {
+    openTabSearchOverlay().catch((error) => console.error("Tab search error:", error));
+    return { ok: true };
+  }
   if (message && message.type === "tabsearch-list") {
     return listTabsForSearch();
   }
@@ -2464,11 +2468,50 @@ async function openTabSearchOverlay() {
   }
 }
 
+async function handleLensCommand(command) {
+  const lensSlot = /^activate-lens-([1-9])$/.exec(command);
+  if (lensSlot) {
+    const lenses = await getLenses();
+    const lens = lenses[Number(lensSlot[1]) - 1];
+    if (lens) {
+      await activateView({ kind: "lens", lensId: lens.id }, { trigger: "manual" });
+    }
+    return true;
+  }
+
+  if (command === "show-all-groups") {
+    await activateView({ kind: "all" }, { trigger: "manual" });
+    return true;
+  }
+
+  if (command === "cycle-lens-next" || command === "cycle-lens-prev") {
+    const lenses = await getLenses();
+    const ring = [{ kind: "all" }, ...lenses.map((lens) => ({ kind: "lens", lensId: lens.id }))];
+    const active = await getActiveView();
+    if (ring.length === 1 && viewKey(active) === "all") {
+      return true;
+    }
+    const currentIndex = ring.findIndex((view) => viewKey(view) === viewKey(active));
+    const startIndex = currentIndex === -1 ? 0 : currentIndex;
+    const step = command === "cycle-lens-next" ? 1 : -1;
+    await activateView(ring[(startIndex + step + ring.length) % ring.length], { trigger: "manual" });
+    return true;
+  }
+
+  return false;
+}
+
+async function handleCommand(command) {
+  if (command === "search-tabs") {
+    await openTabSearchOverlay();
+    return;
+  }
+  await handleLensCommand(command);
+}
+
 if (browser.commands && browser.commands.onCommand) {
   browser.commands.onCommand.addListener((command) => {
-    if (command === "search-tabs") {
-      openTabSearchOverlay().catch((error) => console.error("Tab search error:", error));
-    }
+    handleCommand(command).catch(console.error);
   });
 }
 

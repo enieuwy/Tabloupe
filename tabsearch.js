@@ -88,6 +88,32 @@ function filterTabs(tabs, query, limit = tabs.length) {
   return matches;
 }
 
+function computeDuplicateTabIds(tabs) {
+  const byUrl = new Map();
+  for (const tab of tabs) {
+    const group = byUrl.get(tab.url);
+    if (group) {
+      group.push(tab);
+    } else {
+      byUrl.set(tab.url, [tab]);
+    }
+  }
+
+  const duplicateIds = [];
+  for (const group of byUrl.values()) {
+    if (group.length <= 1) continue;
+    const keeper =
+      group.find((tab) => tab.active) ||
+      group.find((tab) => tab.pinned) ||
+      group[0];
+    for (const tab of group) {
+      if (tab === keeper || tab.active || tab.pinned) continue;
+      duplicateIds.push(tab.id);
+    }
+  }
+  return duplicateIds;
+}
+
 function scheduleHistoryFetch(query) {
   const trimmed = query.trim();
   if (trimmed === "") {
@@ -1037,10 +1063,21 @@ function clearMarks() {
   actionMessage = "";
 }
 
+function markDuplicateTabs() {
+  const duplicateTabIds = computeDuplicateTabIds(allTabs);
+  if (duplicateTabIds.length === 0) return;
+  for (const tabId of duplicateTabIds) marked.add(tabId);
+  anchorIndex = null;
+  groupDraftOpen = false;
+  actionMessage = "";
+  render(inputEl.value);
+}
+
 function renderFooter() {
   if (!footerEl) return;
   if (marked.size === 0) {
-    footerEl.className = "hint";
+    const duplicateTabIds = computeDuplicateTabIds(allTabs);
+    footerEl.className = duplicateTabIds.length > 0 ? "hint actions" : "hint";
     const sel = filtered[selectedIndex];
     const webRow = filtered.find((row) => row && row.kind === "web");
     const goVerb = webRow && webRow.url ? "open in new tab" : "search in new tab";
@@ -1052,6 +1089,9 @@ function renderFooter() {
           : "switch";
     const shiftVerb = webRow && sel && sel.kind !== "web" ? goVerb : null;
     replaceChildrenWithTrustedHTML(footerEl, hintHtml(verb, shiftVerb));
+    if (duplicateTabIds.length > 0) {
+      footerEl.appendChild(makeActionButton(`Select ${duplicateTabIds.length} duplicates`, markDuplicateTabs));
+    }
     return;
   }
 

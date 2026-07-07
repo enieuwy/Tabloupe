@@ -578,6 +578,109 @@ function nextLensColor() {
   return unused || LENS_COLOR_PALETTE[state.lenses.length % LENS_COLOR_PALETTE.length];
 }
 
+function generateLensId() {
+  return `lens_${Math.random().toString(36).slice(2, 10) || Date.now().toString(36)}`;
+}
+
+function uniqueLensId(lenses) {
+  const existingIds = new Set(lenses.map((lens) => lens.id));
+  let id = generateLensId();
+  while (existingIds.has(id)) {
+    id = generateLensId();
+  }
+  return id;
+}
+
+function sharePayloadForLens(lens) {
+  return {
+    tabloupeLens: 1,
+    lens: {
+      name: lens.name,
+      icon: lens.icon,
+      color: lens.color,
+      groupSelectors: normalizeSelectors(lens.groupSelectors),
+    },
+  };
+}
+
+function showLensShareFallback(code) {
+  try {
+    if (typeof window.prompt === "function") {
+      window.prompt("Copy this lens code:", code);
+      return;
+    }
+  } catch (error) {
+    console.error("Lens share prompt failed:", error);
+  }
+  const input = document.getElementById("lens-import-code");
+  if (input) {
+    input.value = code;
+    input.focus();
+    input.select();
+  }
+  showToast("Copy the lens code shown on this page.", "ok");
+}
+
+async function shareLens(lens) {
+  const code = JSON.stringify(sharePayloadForLens(lens));
+  try {
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+      throw new Error("Clipboard API unavailable");
+    }
+    await navigator.clipboard.writeText(code);
+    showToast("Lens copied to clipboard.", "ok");
+  } catch (error) {
+    showLensShareFallback(code);
+  }
+}
+
+function importedLensFromCode(code, existingLenses) {
+  let parsed;
+  try {
+    parsed = JSON.parse(code.trim());
+  } catch (error) {
+    return null;
+  }
+  if (!isRecord(parsed) || parsed.tabloupeLens !== 1 || !isRecord(parsed.lens)) {
+    return null;
+  }
+  const name = typeof parsed.lens.name === "string" ? parsed.lens.name.trim() : "";
+  if (!name) {
+    return null;
+  }
+  const now = Date.now();
+  return normalizeLens({
+    id: uniqueLensId(existingLenses),
+    name,
+    icon: parsed.lens.icon,
+    color: parsed.lens.color,
+    groupSelectors: parsed.lens.groupSelectors,
+    triggers: { appleFocusIds: [] },
+    createdAt: now,
+    updatedAt: now,
+  });
+}
+
+async function addLensFromCode() {
+  const input = document.getElementById("lens-import-code");
+  const code = input ? input.value : "";
+  const stored = await browser.storage.local.get("lenses");
+  const lenses = normalizeLenses(stored.lenses);
+  const lens = importedLensFromCode(code, lenses);
+  if (!lens) {
+    showToast("Not a valid lens code.", "error");
+    return;
+  }
+  const next = normalizeLenses([...lenses, lens]);
+  await browser.storage.local.set({ lenses: next });
+  state.lenses = next;
+  if (input) {
+    input.value = "";
+  }
+  render();
+  showToast("Lens added.", "ok");
+}
+
 function selectorKey(selector) {
   return `${selector.type}:${selector.value}`;
 }
@@ -1283,6 +1386,17 @@ function renderLensCard(lens, index) {
       setStatus("Switch failed. See extension console.", "error");
     });
   });
+  const shareButton = document.createElement("button");
+  shareButton.type = "button";
+  shareButton.className = "secondary lens-share-button";
+  shareButton.textContent = "Share";
+  shareButton.setAttribute("aria-label", `Share lens ${lens.name}`);
+  shareButton.addEventListener("click", () => {
+    shareLens(lens).catch((error) => {
+      console.error("Lens share failed:", error);
+      showLensShareFallback(JSON.stringify(sharePayloadForLens(lens)));
+    });
+  });
   const orderActions = document.createElement("span");
   orderActions.className = "row-order-actions";
   const moveUp = document.createElement("button");
@@ -1316,7 +1430,7 @@ function renderLensCard(lens, index) {
   remove.setAttribute("aria-label", `Delete lens ${lens.name}`);
   replaceChildrenWithTrustedHTML(remove, TRASH_ICON);
   remove.addEventListener("click", () => deleteLens(lens.id));
-  actions.append(showButton, orderActions, optionsBtn, remove);
+  actions.append(showButton, shareButton, orderActions, optionsBtn, remove);
   header.append(actions);
   card.append(header);
 
@@ -2248,6 +2362,13 @@ document.addEventListener("DOMContentLoaded", () => {
       setStatus("Create failed. See extension console for details.", "error");
     });
   });
+  document.getElementById("lens-import-add").addEventListener("click", () => {
+    addLensFromCode().catch((error) => {
+      console.error("Lens code import failed:", error);
+      showToast("Not a valid lens code.", "error");
+    });
+  });
+
 
   const shortcutRecord = document.getElementById("shortcut-record");
   if (shortcutRecord) {
