@@ -725,6 +725,42 @@ async function authenticatedBusSocket(harness) {
   return socket;
 }
 
+
+function createTabGroupPayload(overrides = {}) {
+  return {
+    requestId: "0123456789abcdef0123456789abcdef",
+    title: "Bus Group",
+    match: { urls: ["https://example.test/"] },
+    ...overrides,
+  };
+}
+
+async function authenticatedCreateTabGroupSocket(harness) {
+  const socket = await authenticatedBusSocket(harness);
+  await settle();
+  harness.sentMessages.length = 0;
+  return socket;
+}
+
+async function sendCreateTabGroupEnvelope(socket, payload) {
+  await sendSocketFrame(socket, {
+    type: "createTabGroup",
+    schemaVersion: 1,
+    payload,
+  });
+}
+
+function createTabGroupResultPayloads(harness) {
+  return harness.sentMessages
+    .filter((frame) => frame.type === "createTabGroupResult")
+    .map((frame) => frame.payload);
+}
+
+function lastCreateTabGroupResultPayload(harness) {
+  const payloads = createTabGroupResultPayloads(harness);
+  assert.ok(payloads.length > 0, "createTabGroupResult frame was sent");
+  return payloads[payloads.length - 1];
+}
 test("badge error indicator takes priority and clears back to focus badge", async () => {
   const harness = createHarness();
   await settle();
@@ -1278,6 +1314,231 @@ test("Malformed Calendar events are ignored without closing the bus", async () =
   assert.deepEqual(harness.consoleErrors, []);
 });
 
+test("createTabGroup ignores legacy sockets and processes authenticated frames", async () => {
+  const payload = createTabGroupPayload({
+    match: { urls: ["https://auth.test/"] },
+  });
+  const legacyHarness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [{ id: 10, windowId: 1, url: "https://auth.test/", groupId: -1 }],
+  });
+  await settle();
+  const legacySocket = legacyHarness.sockets[0];
+  legacySocket.onopen();
+  await settle();
+
+  await sendCreateTabGroupEnvelope(legacySocket, payload);
+
+  assert.equal(legacyHarness.groupCreations.length, 0);
+  assert.equal(createTabGroupResultPayloads(legacyHarness).length, 0);
+
+  const authenticatedHarness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [{ id: 10, windowId: 1, url: "https://auth.test/", groupId: -1 }],
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(authenticatedHarness);
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const result = lastCreateTabGroupResultPayload(authenticatedHarness);
+  assert.equal(result.requestId, payload.requestId);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.grouped, ["https://auth.test/"]);
+  assert.equal(authenticatedHarness.groupCreations.length, 1);
+});
+
+test("createTabGroup validation rejects invalid payloads before grouping", async () => {
+  const cases = [
+    {
+      name: "missing title",
+      payload: {
+        requestId: "11111111111111111111111111111111",
+        match: { urls: ["https://valid.test/"] },
+      },
+    },
+    {
+      name: "empty urls",
+      payload: createTabGroupPayload({
+        requestId: "22222222222222222222222222222222",
+        match: { urls: [] },
+      }),
+    },
+    {
+      name: "too many urls",
+      payload: createTabGroupPayload({
+        requestId: "33333333333333333333333333333333",
+        match: { urls: Array.from({ length: 65 }, (_, index) => `https://many.test/${index}`) },
+      }),
+    },
+    {
+      name: "non-string url",
+      payload: createTabGroupPayload({
+        requestId: "44444444444444444444444444444444",
+        match: { urls: ["https://valid.test/", 42] },
+      }),
+    },
+  ];
+
+  for (const { name, payload } of cases) {
+    const harness = createHarness({
+      storage: { busToken: BUS_TOKEN },
+      tabs: [{ id: 10, windowId: 1, url: "https://valid.test/", groupId: -1 }],
+    });
+    await settle();
+    const socket = await authenticatedCreateTabGroupSocket(harness);
+
+    await sendCreateTabGroupEnvelope(socket, payload);
+
+    const result = lastCreateTabGroupResultPayload(harness);
+    assert.equal(result.requestId, payload.requestId, name);
+    assert.equal(result.ok, false, name);
+    assert.equal(result.error, "invalid_payload", name);
+    assert.deepEqual(result.grouped, [], name);
+    assert.deepEqual(result.skipped, [], name);
+    assert.equal(harness.groupCreations.length, 0, name);
+  }
+});
+
+test("createTabGroup matches exact and fragmentless URLs and skips unsuitable tabs", async () => {
+  const harness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [
+      { id: 10, windowId: 1, url: "https://exact.test/", groupId: -1 },
+      { id: 11, windowId: 1, url: "https://fragment.test/path#open", groupId: -1 },
+      { id: 12, windowId: 1, url: "https://pinned.test/", groupId: -1, pinned: true },
+      { id: 13, windowId: 2, url: "https://other-window.test/", groupId: -1 },
+    ],
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(harness);
+  const payload = createTabGroupPayload({
+    requestId: "55555555555555555555555555555555",
+    match: {
+      urls: [
+        "https://exact.test/",
+        "https://fragment.test/path#request",
+        "https://missing.test/",
+        "https://pinned.test/",
+        "https://other-window.test/",
+      ],
+    },
+  });
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const result = lastCreateTabGroupResultPayload(harness);
+  assert.equal(result.requestId, payload.requestId);
+  assert.equal(result.ok, true);
+  assert.equal(result.windowId, 1);
+  assert.deepEqual(result.grouped, [
+    "https://exact.test/",
+    "https://fragment.test/path#open",
+  ]);
+  assert.deepEqual(result.skipped, [
+    { url: "https://missing.test/", reason: "not_found" },
+    { url: "https://pinned.test/", reason: "pinned" },
+    { url: "https://other-window.test/", reason: "cross_window" },
+  ]);
+  assert.deepEqual(harness.groupCreations, [{ id: result.groupId, tabIds: [10, 11] }]);
+});
+
+test("createTabGroup respects an explicit target window", async () => {
+  const harness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [
+      { id: 10, windowId: 1, url: "https://wrong-window.test/", groupId: -1 },
+      { id: 20, windowId: 2, url: "https://target-window.test/", groupId: -1 },
+    ],
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(harness);
+  const payload = createTabGroupPayload({
+    requestId: "66666666666666666666666666666666",
+    windowId: 2,
+    match: { urls: ["https://wrong-window.test/", "https://target-window.test/"] },
+  });
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const result = lastCreateTabGroupResultPayload(harness);
+  assert.equal(result.requestId, payload.requestId);
+  assert.equal(result.ok, true);
+  assert.equal(result.windowId, 2);
+  assert.deepEqual(result.grouped, ["https://target-window.test/"]);
+  assert.deepEqual(result.skipped, [
+    { url: "https://wrong-window.test/", reason: "cross_window" },
+  ]);
+  assert.deepEqual(harness.groupCreations, [{ id: result.groupId, tabIds: [20] }]);
+});
+
+test("createTabGroup merges same-title groups and is idempotent for tabs already in the target group", async () => {
+  const groupFailTabIds = [];
+  const harness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    groups: [{ id: 42, windowId: 1, title: "Bus Group", color: "red", collapsed: false }],
+    tabs: [
+      { id: 10, windowId: 1, url: "https://new.test/", groupId: -1 },
+      { id: 11, windowId: 1, url: "https://already.test/", groupId: 42 },
+    ],
+    groupFailTabIds,
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(harness);
+  const payload = createTabGroupPayload({
+    requestId: "77777777777777777777777777777777",
+    match: { urls: ["https://new.test/", "https://already.test/"] },
+  });
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const first = lastCreateTabGroupResultPayload(harness);
+  assert.equal(first.requestId, payload.requestId);
+  assert.equal(first.ok, true);
+  assert.equal(first.groupId, 42);
+  assert.deepEqual(first.grouped, ["https://already.test/", "https://new.test/"]);
+  assert.deepEqual(first.skipped, []);
+  assert.deepEqual(harness.groupCreations, [{ id: 42, tabIds: [10], merged: true }]);
+  assert.equal(harness.groupState.find((group) => group.id === 42).color, "red");
+
+  groupFailTabIds.push(10, 11);
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const second = lastCreateTabGroupResultPayload(harness);
+  assert.equal(second.requestId, payload.requestId);
+  assert.equal(second.ok, true);
+  assert.equal(second.groupId, 42);
+  assert.deepEqual(second.grouped, ["https://new.test/", "https://already.test/"]);
+  assert.deepEqual(second.skipped, []);
+  assert.equal(harness.groupCreations.length, 1);
+});
+
+test("createTabGroup reports no_tabs_matched with exact result arrays when every URL is absent", async () => {
+  const harness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [{ id: 10, windowId: 1, url: "https://other.test/", groupId: -1 }],
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(harness);
+  const payload = createTabGroupPayload({
+    requestId: "88888888888888888888888888888888",
+    match: { urls: ["https://missing.test/"] },
+  });
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  assert.deepEqual(lastCreateTabGroupResultPayload(harness), {
+    requestId: payload.requestId,
+    ok: false,
+    groupId: null,
+    windowId: null,
+    grouped: [],
+    skipped: [{ url: "https://missing.test/", reason: "not_found" }],
+    error: "no_tabs_matched",
+  });
+  assert.equal(harness.groupCreations.length, 0);
+});
+
 test("unbound Apple Focus leaves groups untouched and prompts to bind in options", async () => {
   const fixture = twoGroups();
   const harness = createHarness(fixture);
@@ -1617,6 +1878,10 @@ test("AI apply creates titled, colored groups via tabs.group", async () => {
   assert.equal(work.color, "blue");
   assert.equal(harness.tabState.find((tab) => tab.id === 10).groupId, work.id);
   assert.equal(harness.tabState.find((tab) => tab.id === 11).groupId, work.id);
+  const play = harness.groupState.find((group) => group.title === "Play");
+  assert.ok(play);
+  assert.equal(play.color, "green");
+  assert.equal(harness.tabState.find((tab) => tab.id === 12).groupId, play.id);
 });
 
 test("AI apply refuses when the feature is disabled", async () => {

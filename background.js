@@ -85,6 +85,7 @@ let socketAuthTimer = null;
 let socketAuthContext = null;
 let pairingStatus = null;
 let loggedLegacyActivateView = false;
+let loggedLegacyCreateTabGroup = false;
 // Per-window cache of the last preview so the ephemeral popup can show a result
 // instantly on reopen (and survive being closed mid-compute). Cleared on apply,
 // dismiss, window close, or TTL expiry.
@@ -385,6 +386,85 @@ async function handleActivateViewEnvelope(msg) {
     return;
   }
   await activateView(view, { trigger: "external", triggerId: "ws" });
+}
+
+function normalizeCreateTabGroupPayload(payload) {
+  const requestId = isRecord(payload) && typeof payload.requestId === "string" && /^[0-9a-f]{32}$/.test(payload.requestId)
+    ? payload.requestId
+    : null;
+  if (!requestId) {
+    return { requestId: null, ok: false };
+  }
+
+  const title = typeof payload.title === "string" ? payload.title.trim().slice(0, 128) : "";
+  const match = isRecord(payload.match) ? payload.match : null;
+  const urls = match && Array.isArray(match.urls) ? match.urls : null;
+  if (title === "" || !urls || urls.length < 1 || urls.length > 64 || urls.some((url) => typeof url !== "string")) {
+    return { requestId, ok: false };
+  }
+
+  let windowId = null;
+  if (hasOwn(payload, "windowId") && payload.windowId !== null && payload.windowId !== undefined) {
+    if (!Number.isInteger(payload.windowId)) {
+      return { requestId, ok: false };
+    }
+    windowId = payload.windowId;
+  }
+
+  return {
+    requestId,
+    ok: true,
+    request: {
+      requestId,
+      title,
+      color: TAB_GROUP_COLORS.includes(payload.color) ? payload.color : null,
+      urls: urls.slice(),
+      windowId,
+    },
+  };
+}
+
+function sendCreateTabGroupResult(requestId, result) {
+  sendBusEnvelope({
+    type: "createTabGroupResult",
+    schemaVersion: 1,
+    payload: {
+      requestId,
+      ok: result.ok === true,
+      groupId: typeof result.groupId === "number" ? result.groupId : null,
+      windowId: typeof result.windowId === "number" ? result.windowId : null,
+      grouped: Array.isArray(result.grouped) ? result.grouped : [],
+      skipped: Array.isArray(result.skipped) ? result.skipped : [],
+      error: typeof result.error === "string" ? result.error : null,
+    },
+  });
+}
+
+async function handleCreateTabGroupEnvelope(msg) {
+  if (socketAuthState !== BUS_AUTH_STATES.AUTHENTICATED) {
+    if (socketAuthState === BUS_AUTH_STATES.LEGACY && !loggedLegacyCreateTabGroup) {
+      loggedLegacyCreateTabGroup = true;
+      console.warn("Ignoring createTabGroup from unauthenticated legacy helper.");
+    }
+    return;
+  }
+
+  const payload = isRecord(msg.payload) ? msg.payload : {};
+  const normalized = normalizeCreateTabGroupPayload(payload);
+  if (!normalized.requestId) {
+    return;
+  }
+  if (!normalized.ok) {
+    sendCreateTabGroupResult(normalized.requestId, { ok: false, error: "invalid_payload" });
+    return;
+  }
+
+  try {
+    sendCreateTabGroupResult(normalized.requestId, await createTabGroupFromRequest(normalized.request));
+  } catch (error) {
+    console.error("createTabGroup failed:", error);
+    sendCreateTabGroupResult(normalized.requestId, { ok: false, error: "group_failed" });
+  }
 }
 
 async function recordSeen(rawId) {
@@ -1539,6 +1619,10 @@ async function handleMessage(event) {
   }
   if (msg.type === "activateView") {
     await handleActivateViewEnvelope(msg);
+    return;
+  }
+  if (msg.type === "createTabGroup") {
+    await handleCreateTabGroupEnvelope(msg);
     return;
   }
   if (msg.type === "focusCatalog") {
@@ -2980,11 +3064,14 @@ async function computeTabGrouping(windowId, explicitTabs) {
   return { ok: true, groups };
 }
 
-async function applyTabGrouping(groups, windowId) {
-  const applied = [];
-  const failures = [];
-  // Merge into an existing same-named group (manual or a prior AI run) instead
-  // of spawning a duplicate. Snapshot existing groups once, scoped to the window.
+function normalizeTabGroupColor(color, fallback = null) {
+  if (TAB_GROUP_COLORS.includes(color)) {
+    return color;
+  }
+  return TAB_GROUP_COLORS.includes(fallback) ? fallback : null;
+}
+
+async function tabGroupsByTitle(windowId) {
   const existingByTitle = new Map();
   if (browser.tabGroups && typeof browser.tabGroups.query === "function") {
     const query = typeof windowId === "number" ? { windowId } : {};
@@ -2995,21 +3082,185 @@ async function applyTabGrouping(groups, windowId) {
       }
     }
   }
+  return existingByTitle;
+}
+
+async function createOrMergeTabGroup({ title, color, tabIds, windowId, existingByTitle, defaultColor = null }) {
+  const existing = existingByTitle.get(title);
+  if (existing) {
+    // Append to the existing group; leave its title and color intact.
+    await browser.tabs.group({ groupId: existing.id, tabIds });
+    return existing;
+  }
+
+  const groupId = await browser.tabs.group({ tabIds });
+  const update = { title };
+  const normalizedColor = normalizeTabGroupColor(color, defaultColor);
+  if (normalizedColor) {
+    update.color = normalizedColor;
+  }
+  await browser.tabGroups.update(groupId, update);
+  return { id: groupId, windowId, title, color: normalizedColor };
+}
+
+function stripUrlFragment(url) {
+  const index = url.indexOf("#");
+  return index === -1 ? url : url.slice(0, index);
+}
+
+async function collectNormalWindowTabs() {
+  if (browser.windows && typeof browser.windows.getAll === "function") {
+    try {
+      const windows = await browser.windows.getAll({ populate: true, windowTypes: ["normal"] });
+      return windows
+        .filter((window) => !window.type || window.type === "normal")
+        .flatMap((window) => Array.isArray(window.tabs) ? window.tabs : [])
+        .filter((tab) => typeof tab.id === "number" && typeof tab.windowId === "number" && typeof tab.url === "string");
+    } catch (error) {
+      console.warn("Could not query normal windows for createTabGroup:", error);
+    }
+  }
+  const tabs = await browser.tabs.query({});
+  return tabs.filter((tab) => typeof tab.id === "number" && typeof tab.windowId === "number" && typeof tab.url === "string");
+}
+
+function matchCreateTabGroupTabs(urls, tabs) {
+  const exactByUrl = new Map();
+  const fragmentlessByUrl = new Map();
+  for (const tab of tabs) {
+    const exact = exactByUrl.get(tab.url);
+    if (exact) {
+      exact.push(tab);
+    } else {
+      exactByUrl.set(tab.url, [tab]);
+    }
+    const fragmentless = stripUrlFragment(tab.url);
+    const fragmentMatches = fragmentlessByUrl.get(fragmentless);
+    if (fragmentMatches) {
+      fragmentMatches.push(tab);
+    } else {
+      fragmentlessByUrl.set(fragmentless, [tab]);
+    }
+  }
+
+  const matchedTabs = [];
+  const matchedIds = new Set();
+  const skipped = [];
+  for (const url of urls) {
+    const exact = exactByUrl.get(url) || [];
+    const candidates = exact.length > 0
+      ? exact
+      : (fragmentlessByUrl.get(stripUrlFragment(url)) || []);
+    if (candidates.length === 0) {
+      skipped.push({ url, reason: "not_found" });
+      continue;
+    }
+    for (const tab of candidates) {
+      if (!matchedIds.has(tab.id)) {
+        matchedIds.add(tab.id);
+        matchedTabs.push(tab);
+      }
+    }
+  }
+  return { matchedTabs, skipped };
+}
+
+async function createTabGroupFromRequest(request) {
+  const tabs = await collectNormalWindowTabs();
+  const { matchedTabs, skipped } = matchCreateTabGroupTabs(request.urls, tabs);
+  if (matchedTabs.length === 0) {
+    return {
+      ok: false,
+      groupId: null,
+      windowId: request.windowId,
+      grouped: [],
+      skipped,
+      error: "no_tabs_matched",
+    };
+  }
+
+  const targetWindowId = request.windowId !== null ? request.windowId : matchedTabs[0].windowId;
+  const existingByTitle = await tabGroupsByTitle(targetWindowId);
+  const targetGroup = existingByTitle.get(request.title) || null;
+  const grouped = [];
+  const pendingGrouped = [];
+  const tabIds = [];
+  let groupId = targetGroup ? targetGroup.id : null;
+
+  for (const tab of matchedTabs) {
+    if (tab.windowId !== targetWindowId) {
+      skipped.push({ url: tab.url, reason: "cross_window" });
+      continue;
+    }
+    if (tab.pinned) {
+      skipped.push({ url: tab.url, reason: "pinned" });
+      continue;
+    }
+    if (typeof tab.groupId === "number" && tab.groupId !== -1) {
+      if (targetGroup && tab.groupId === targetGroup.id) {
+        grouped.push(tab.url);
+      } else {
+        skipped.push({ url: tab.url, reason: "already_grouped_elsewhere" });
+      }
+      continue;
+    }
+    tabIds.push(tab.id);
+    pendingGrouped.push(tab.url);
+  }
+
+  if (tabIds.length > 0) {
+    const group = await createOrMergeTabGroup({
+      title: request.title,
+      color: request.color,
+      tabIds,
+      windowId: targetWindowId,
+      existingByTitle,
+    });
+    groupId = group.id;
+    grouped.push(...pendingGrouped);
+  }
+
+  if (grouped.length === 0) {
+    return {
+      ok: false,
+      groupId,
+      windowId: targetWindowId,
+      grouped,
+      skipped,
+      error: "no_tabs_matched",
+    };
+  }
+
+  return {
+    ok: true,
+    groupId,
+    windowId: targetWindowId,
+    grouped,
+    skipped,
+    error: null,
+  };
+}
+
+async function applyTabGrouping(groups, windowId) {
+  const applied = [];
+  const failures = [];
+  // Merge into an existing same-named group (manual or a prior AI run) instead
+  // of spawning a duplicate. Snapshot existing groups once, scoped to the window.
+  const existingByTitle = await tabGroupsByTitle(windowId);
   for (const group of groups) {
     const tabIds = group.tabs.map((tab) => tab.id).filter((id) => typeof id === "number");
     if (tabIds.length === 0) {
       continue;
     }
-    const color = TAB_GROUP_COLORS.includes(group.color) ? group.color : TAB_GROUP_COLORS[0];
     try {
-      const existing = existingByTitle.get(group.topic);
-      if (existing) {
-        // Append to the existing group; leave its title and color intact.
-        await browser.tabs.group({ groupId: existing.id, tabIds });
-      } else {
-        const groupId = await browser.tabs.group({ tabIds });
-        await browser.tabGroups.update(groupId, { title: group.topic, color });
-      }
+      await createOrMergeTabGroup({
+        title: group.topic,
+        color: group.color,
+        tabIds,
+        windowId,
+        existingByTitle,
+        defaultColor: TAB_GROUP_COLORS[0],
+      });
       applied.push(group.topic);
     } catch (error) {
       console.error("AI tab group apply error:", group.topic, error);
