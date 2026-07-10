@@ -3912,3 +3912,33 @@ test("legacy bus frames still handle focus but ignore unauthenticated activateVi
   assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_focus" });
   assert.equal(harness.consoleWarnings.length, 1);
 });
+
+test("bus rejects a non-hello first frame once a busToken is configured, instead of downgrading to legacy", async () => {
+  const token = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+  const harness = createHarness({
+    storage: {
+      busToken: token,
+      lenses: [lens("lens_focus", "Focus", [{ type: "title", value: "Focus" }], ["com.apple.focus.work"])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Focus", collapsed: true },
+    ],
+    tabs: [{ id: 10, windowId: 1, groupId: 1, active: true, url: "https://focus.test" }],
+  });
+  await settle();
+  const socket = harness.sockets[0];
+  socket.onopen();
+
+  // Peer skips `hello`/`auth` entirely and goes straight for an
+  // automation-triggering frame -- the legacy-bus PoC.
+  await sendSocketFrame(socket, {
+    type: "focus",
+    schemaVersion: 1,
+    payload: { focus: { id: "com.apple.focus.work", name: "Work" } },
+  });
+
+  assert.equal(harness.storageData.busPairingStatus, "pairing_failed");
+  assert.equal(socket.readyState, harness.context.WebSocket.CLOSED);
+  assert.equal(harness.storageData.activeView, undefined);
+  assert.deepEqual(harness.sentMessages, []);
+});

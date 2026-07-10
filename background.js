@@ -1737,6 +1737,17 @@ async function handleSocketFrame(ws, event) {
       await sendAuthFrame(ws, msg);
       return;
     }
+    // Pairing is opt-in: once a busToken is configured, every connection MUST
+    // complete the HMAC handshake before sending anything else. Downgrading to
+    // LEGACY here would let any local peer skip auth entirely just by omitting
+    // `hello`, defeating the token. Only truly legacy daemons -- for a user who
+    // never configured a token -- get the unauthenticated fallback.
+    const token = await getBusToken();
+    if (token) {
+      await setPairingStatus(BUS_PAIRING_STATUSES.PAIRING_FAILED);
+      ws.close();
+      return;
+    }
     socketAuthState = BUS_AUTH_STATES.LEGACY;
     await setPairingStatus(BUS_PAIRING_STATUSES.LEGACY);
     publishLensStateSoon();

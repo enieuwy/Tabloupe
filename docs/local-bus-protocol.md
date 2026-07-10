@@ -121,7 +121,7 @@ Phase 4 consumers use daemon-published active calendar events. Tabloupe ignores 
 
 ## Legacy behavior
 
-Old daemons send no `hello` first frame. When Tabloupe sees any other first frame, it marks the connection `legacy (unpaired)`, processes existing `focus`, `focusCatalog`, and `groupTabsResult` frames unchanged, publishes `lensState`, and ignores inbound `activateView` and `createTabGroup`.
+Old daemons (or any peer) send no `hello` first frame. Tabloupe only downgrades to legacy when no `busToken` is stored: it marks the connection `legacy (unpaired)`, processes existing `focus`, `focusCatalog`, and `groupTabsResult` frames unchanged, publishes `lensState`, and ignores inbound `activateView` and `createTabGroup`. If a `busToken` *is* configured, skipping `hello` is a protocol violation — Tabloupe closes the socket and reports `pairing_failed` instead of downgrading, so a peer cannot bypass pairing by omitting the handshake.
 
 Old Tabloupe versions cannot authenticate to a new daemon. The daemon closes those sockets after its auth deadline; users must update and pair.
 
