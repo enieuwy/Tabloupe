@@ -1405,3 +1405,24 @@ test("a failed action send surfaces a visible failure message instead of swallow
   assert.ok(message, "a failure message is rendered rather than silently swallowed");
   assert.equal(message.textContent, "Action failed.");
 });
+
+test("a resolved ok:false action keeps the overlay open and surfaces the failure", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    // The backend now resolves with a structured failure rather than rejecting.
+    if (message.type === "tabsearch-activate") return { ok: false, error: "tab_not_found" };
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  pressKey(harness, "Enter"); // activate; backend resolves {ok:false}
+  await settle();
+
+  assert.ok(overlayRoot(harness), "overlay stays open when the action reports failure");
+  const message = overlayRoot(harness).querySelector(".message");
+  assert.ok(message, "a failure message is rendered rather than closing as success");
+  assert.equal(message.textContent, "Action failed.");
+});

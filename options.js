@@ -893,9 +893,22 @@ async function persistLensPatch(lensId, patch, statusMessage = "Saved") {
     return null;
   }
   render();
-  await browser.runtime.sendMessage({ type: "lens-update", lensId, patch });
+  const result = await browser.runtime.sendMessage({ type: "lens-update", lensId, patch });
+  if (!result || result.ok !== true) {
+    // The background rejected the edit; revert the optimistic UI to the
+    // authoritative stored state instead of falsely reporting success.
+    await reloadLensesFromStorage();
+    setStatus("Save failed. Please try again.", "error");
+    return null;
+  }
   setStatus(statusMessage, "ok");
   return next;
+}
+
+async function reloadLensesFromStorage() {
+  const stored = await browser.storage.local.get("lenses");
+  state.lenses = normalizeLenses(stored.lenses);
+  render();
 }
 
 function selectorFromText(value) {
@@ -1284,9 +1297,19 @@ async function linkFocusToLens(lensId, focusId) {
   if (lensId) {
     message.lensId = lensId;
   }
-  await browser.runtime.sendMessage(message);
+  const linkResult = await browser.runtime.sendMessage(message);
+  if (!linkResult || linkResult.ok !== true) {
+    await reloadLensesFromStorage();
+    setStatus("Save failed. Please try again.", "error");
+    return;
+  }
   if (lensId && namePatch.name) {
-    await browser.runtime.sendMessage({ type: "lens-update", lensId, patch: namePatch });
+    const nameResult = await browser.runtime.sendMessage({ type: "lens-update", lensId, patch: namePatch });
+    if (!nameResult || nameResult.ok !== true) {
+      await reloadLensesFromStorage();
+      setStatus("Save failed. Please try again.", "error");
+      return;
+    }
   }
   setStatus(lensId ? "Focus link saved." : "Focus link removed.", "ok");
 }

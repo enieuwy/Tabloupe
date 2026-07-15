@@ -1404,3 +1404,28 @@ test("pairing token field saves lowercase hex, rejects invalid input, and clears
   assert.equal(Object.prototype.hasOwnProperty.call(harness.storageData, "busToken"), false);
   assert.equal(harness.document.querySelector("#toast-host .toast").textContent, "Pairing token cleared.");
 });
+
+test("a rejected lens edit reverts the optimistic UI instead of reporting success", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lensFixture({ groupSelectors: [] })] },
+    groups: [{ id: 1, title: "Deep Work" }],
+  });
+  const { document, browser } = harness;
+  await settle();
+
+  // Force the background to reject the edit without persisting it.
+  const realSend = browser.runtime.sendMessage;
+  browser.runtime.sendMessage = async (msg) => {
+    if (msg.type === "lens-update") return { ok: false, error: "missing_lens" };
+    return realSend(msg);
+  };
+
+  const input = lensCard(document).querySelector(".group-chip-input");
+  input.value = "Deep Work";
+  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await settle();
+
+  const chipLabels = [...lensCard(document).querySelectorAll(".group-chip-label")].map((el) => el.textContent);
+  assert.ok(!chipLabels.includes("Deep Work"), "optimistic selector reverted after backend rejection");
+  assert.match(document.getElementById("status").textContent, /failed/i);
+});

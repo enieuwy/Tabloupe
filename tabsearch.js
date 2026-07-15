@@ -1468,7 +1468,17 @@ function activate(item) {
     message = { type: "tabsearch-activate", tabId: item.id, windowId: item.windowId };
   }
   browser.runtime.sendMessage(message).then(
-    () => closeOverlay(),
+    (result) => {
+      // A resolved {ok:false} is a real backend failure (e.g. the tab was
+      // closed, or the URL/search could not open). Surface it and keep the
+      // overlay open instead of closing as if the action succeeded.
+      if (result && result.ok === false) {
+        actionMessage = "Action failed.";
+        if (isOpen()) render(inputEl.value);
+        return;
+      }
+      closeOverlay();
+    },
     () => {
       actionMessage = "Action failed.";
       if (isOpen()) render(inputEl.value);
