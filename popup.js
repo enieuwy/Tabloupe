@@ -56,7 +56,11 @@ async function initConnectionStatus() {
     lastError: stored.lastError || null,
   };
   renderConnectionStatus();
-  if (connectionStatus.lastError) {
+  const errorSurfaced =
+    connectionStatus.connectionState === "connected" &&
+    connectionStatus.lastError &&
+    connectionStatus.lastError.message;
+  if (errorSurfaced) {
     await browser.storage.local.set({ lastError: null });
     connectionStatus.lastError = null;
   }
@@ -197,8 +201,15 @@ function renderTriggerLine(state) {
     trigger.hidden = false;
     return;
   }
-  if (lastActivation.trigger && lastActivation.trigger !== "manual") {
-    trigger.textContent = "Switched by Apple Focus";
+  const AUTOMATION_TRIGGER_LABELS = {
+    appleFocus: "Switched by Apple Focus",
+    schedule: "Switched by schedule",
+    calendar: "Switched by calendar event",
+    external: "Switched by automation",
+  };
+  const label = AUTOMATION_TRIGGER_LABELS[lastActivation.trigger];
+  if (label) {
+    trigger.textContent = label;
     trigger.hidden = false;
     return;
   }

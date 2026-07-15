@@ -78,6 +78,13 @@ let socket = null;
 let reconnectDelay = MIN_RECONNECT_MS;
 let reconnectTimer = null;
 let messageQueue = Promise.resolve();
+// Resolves once the one-time legacy->v2 lens migration has finished (or been
+// determined unnecessary). Every lens read/write awaits it so a lens mutation
+// racing startup can't be silently overwritten by migration's full replace.
+let resolveLensMigrationReady;
+let lensMigrationReady = new Promise((resolve) => {
+  resolveLensMigrationReady = resolve;
+});
 let groupingRequestSeq = 0;
 const pendingGroupingRequests = new Map();
 let socketAuthState = BUS_AUTH_STATES.UNAUTHENTICATED;
@@ -105,6 +112,7 @@ const autoGroupCooldown = new Set();
 const autoGroupInflight = new Set();
 const windowProfileOverrides = new Map();
 let containersCache = null;
+let containersCacheGen = 0;
 let lensSyncEnabled = false;
 let applyingInboundLensSync = false;
 let lensSyncPushTimer = null;
@@ -113,6 +121,19 @@ let pendingLensSyncPrefs = false;
 let pendingLensSyncOrder = false;
 const pendingLensSyncIds = new Set();
 const pendingLensSyncRemovedIds = new Set();
+// Serializes lens-sync side effects (timestamp records, pushes, pulls) so their
+// read-modify-writes can't clobber each other. Kept separate from the
+// user-facing messageQueue so a slow Firefox Sync round-trip never blocks lens
+// activation. `lensSyncMutationSeq` bumps on every local change queued for push,
+// letting a push detect edits that landed while it was in flight.
+let lensSyncQueue = Promise.resolve();
+let lensSyncMutationSeq = 0;
+
+function enqueueLensSync(task) {
+  const queued = lensSyncQueue.then(task, task);
+  lensSyncQueue = queued.catch(() => {});
+  return queued;
+}
 
 // Per-window ephemeral view state (transient views, automation overrides).
 // windowIds are only stable within one browser session, so this is mirrored
@@ -150,10 +171,16 @@ async function loadSessionWindowState() {
   }
 }
 
+let sessionPersistQueue = Promise.resolve();
+
 function persistSessionWindowState() {
   if (!sessionStore) {
-    return;
+    return sessionPersistQueue;
   }
+  // Snapshot the in-memory maps synchronously at call time, then serialize the
+  // async writes: without a queue two fire-and-forget writes can complete in
+  // reverse order, persisting an older snapshot that resurrects a cleared
+  // transient view or a stale window profile after event-page suspension.
   const state = { transientViews: {}, windowProfiles: {} };
   for (const [windowId, view] of transientViewsByWindow) {
     state.transientViews[windowId] = view;
@@ -161,9 +188,12 @@ function persistSessionWindowState() {
   for (const [windowId, profile] of windowProfileOverrides) {
     state.windowProfiles[windowId] = profile;
   }
-  sessionStore.set({ [SESSION_WINDOW_STATE_KEY]: state }).catch((error) => {
-    console.error("Session window state save error:", error);
-  });
+  sessionPersistQueue = sessionPersistQueue
+    .then(() => sessionStore.set({ [SESSION_WINDOW_STATE_KEY]: state }))
+    .catch((error) => {
+      console.error("Session window state save error:", error);
+    });
+  return sessionPersistQueue;
 }
 
 const sessionStateReady = loadSessionWindowState();
@@ -205,6 +235,40 @@ function enqueueFocusWork(task) {
   const queued = messageQueue.then(task, task);
   messageQueue = queued.catch(() => {});
   return queued;
+}
+
+// Per-window serialization for tab-group create/merge transactions. Manual Tab
+// Search grouping, AI manual/auto apply, and the bus createTabGroup frame all
+// snapshot existing groups by title then create-or-merge; without a shared lock
+// two entry points can both observe no group named X and both create it,
+// producing duplicate same-title groups. Each holder re-queries titles inside
+// the lock so the snapshot is fresh.
+const groupingLocks = new Map();
+const groupingActiveWindows = new Set();
+
+function groupingLockKey(windowId) {
+  return typeof windowId === "number" ? windowId : "current";
+}
+
+function isGroupingLocked(windowId) {
+  return groupingActiveWindows.has(groupingLockKey(windowId));
+}
+
+function withGroupingLock(windowId, task) {
+  const key = groupingLockKey(windowId);
+  const previous = groupingLocks.get(key) || Promise.resolve();
+  const run = previous.then(() => {
+    groupingActiveWindows.add(key);
+    return task();
+  });
+  const released = run.finally(() => {
+    groupingActiveWindows.delete(key);
+    if (groupingLocks.get(key) === released) {
+      groupingLocks.delete(key);
+    }
+  });
+  groupingLocks.set(key, released.catch(() => {}));
+  return run;
 }
 
 
@@ -331,14 +395,25 @@ async function lensStatePayload() {
   };
 }
 
+let lensStatePublishSeq = 0;
+
 async function publishLensState() {
   if (!canUseBusSocket()) {
+    return;
+  }
+  // Serialize publications by revision: two activations (A then B) each read
+  // their snapshot asynchronously, so B's payload can be built and sent before
+  // A's. Stamp each publish and drop any snapshot that a newer publish has
+  // superseded, so the peer never observes an out-of-order lensState.
+  const seq = ++lensStatePublishSeq;
+  const payload = await lensStatePayload();
+  if (seq !== lensStatePublishSeq || !canUseBusSocket()) {
     return;
   }
   sendBusEnvelope({
     type: "lensState",
     schemaVersion: 1,
-    payload: await lensStatePayload(),
+    payload,
   });
 }
 
@@ -553,6 +628,7 @@ function normalizeContainer(identity) {
 
 function invalidateContainersCache() {
   containersCache = null;
+  containersCacheGen += 1;
 }
 
 async function getContainers() {
@@ -564,15 +640,24 @@ async function getContainers() {
     containersCache = [];
     return containersCache;
   }
+  // Capture the generation before the async query. If an onCreated/onRemoved/
+  // onUpdated invalidation fires while the query is in flight, the result is
+  // already stale: return it to this caller but don't cache it, so the next
+  // call re-queries fresh state instead of serving a repopulated stale cache.
+  const gen = containersCacheGen;
+  let result;
   try {
     const identities = await api.query({});
-    containersCache = (Array.isArray(identities) ? identities : [])
+    result = (Array.isArray(identities) ? identities : [])
       .map(normalizeContainer)
       .filter(Boolean);
   } catch (error) {
-    containersCache = [];
+    result = [];
   }
-  return containersCache;
+  if (gen === containersCacheGen) {
+    containersCache = result;
+  }
+  return result;
 }
 
 function containersByCookieStore(containers) {
@@ -608,11 +693,13 @@ function normalizeLens(lens) {
 }
 
 async function getLenses() {
+  await lensMigrationReady;
   const stored = await browser.storage.local.get("lenses");
   return Array.isArray(stored.lenses) ? stored.lenses.map(normalizeLens).filter(Boolean) : [];
 }
 
 async function saveLenses(arr) {
+  await lensMigrationReady;
   await browser.storage.local.set({ lenses: Array.isArray(arr) ? arr.map(normalizeLens).filter(Boolean) : [] });
 }
 
@@ -702,7 +789,7 @@ async function handleWindowProfileSet(message) {
   } else {
     windowProfileOverrides.set(message.windowId, profile);
   }
-  persistSessionWindowState();
+  await persistSessionWindowState();
   return { ok: true, profile: getWindowProfile(message.windowId) };
 }
 
@@ -884,6 +971,7 @@ function normalizeSyncPrefs(value) {
 }
 
 function queueLensSyncPushFromLocalChange(changes) {
+  lensSyncMutationSeq += 1;
   if (changes.lenses) {
     pendingLensSyncOrder = true;
     const oldIds = new Set(normalizeLensesFromStorageChange(changes.lenses.oldValue).map((lens) => lens.id));
@@ -919,19 +1007,24 @@ async function recordLocalLensSyncTimestamps(changes) {
   if (applyingInboundLensSync || (!changes.lenses && !changes.aiGroupingPrompt && !changes.tabSearchShortcut)) {
     return;
   }
-  const stored = await browser.storage.local.get(LENS_SYNC_META_KEY);
-  const meta = normalizeLensSyncMeta(stored[LENS_SYNC_META_KEY]);
-  const now = Date.now();
-  const next = { ...meta };
-  if (changes.lenses) {
-    next.lensOrderUpdatedAt = now;
-  }
-  if (changes.aiGroupingPrompt || changes.tabSearchShortcut) {
-    next.prefsUpdatedAt = now;
-  }
-  if (next.lensOrderUpdatedAt !== meta.lensOrderUpdatedAt || next.prefsUpdatedAt !== meta.prefsUpdatedAt) {
-    await browser.storage.local.set({ [LENS_SYNC_META_KEY]: next });
-  }
+  // Serialize the read-modify-write on lensSyncMeta: two concurrent local
+  // changes would otherwise both read the old meta and the later write would
+  // roll back the earlier field's timestamp.
+  return enqueueLensSync(async () => {
+    const stored = await browser.storage.local.get(LENS_SYNC_META_KEY);
+    const meta = normalizeLensSyncMeta(stored[LENS_SYNC_META_KEY]);
+    const now = Date.now();
+    const next = { ...meta };
+    if (changes.lenses) {
+      next.lensOrderUpdatedAt = now;
+    }
+    if (changes.aiGroupingPrompt || changes.tabSearchShortcut) {
+      next.prefsUpdatedAt = now;
+    }
+    if (next.lensOrderUpdatedAt !== meta.lensOrderUpdatedAt || next.prefsUpdatedAt !== meta.prefsUpdatedAt) {
+      await browser.storage.local.set({ [LENS_SYNC_META_KEY]: next });
+    }
+  });
 }
 
 function scheduleLensSyncPush(options = {}) {
@@ -956,94 +1049,107 @@ function cancelLensSyncPush() {
 }
 
 async function pushLensSync() {
-  if (!lensSyncEnabled || applyingInboundLensSync || !syncStorageArea()) {
-    return;
-  }
-  const all = pendingLensSyncAll;
-  const idsToPush = all ? null : new Set(pendingLensSyncIds);
-  const removedIds = all ? new Set() : new Set(pendingLensSyncRemovedIds);
-  const pushPrefs = all || pendingLensSyncPrefs;
-  const pushOrder = all || pendingLensSyncOrder || pendingLensSyncIds.size > 0 || pendingLensSyncRemovedIds.size > 0;
-  const stored = await browser.storage.local.get([
-    "lenses",
-    "lensSchedules",
-    AI_GROUPING_PROMPT_KEY,
-    "tabSearchShortcut",
-    LENS_SYNC_META_KEY,
-  ]);
-  const lenses = normalizeLensesFromStorageChange(stored.lenses);
-  const lensById = new Map(lenses.map((lens) => [lens.id, lens]));
-  const schedules = scheduleByLensId(stored.lensSchedules);
-  const meta = normalizeLensSyncMeta(stored[LENS_SYNC_META_KEY]);
-  const now = Date.now();
-  const values = {};
-  const removeKeys = [];
-  const errors = [];
-
-  if (pushOrder) {
-    values.lensOrder = {
-      ids: lenses.map((lens) => lens.id),
-      updatedAt: meta.lensOrderUpdatedAt || maxLensUpdatedAt(lenses) || now,
-    };
-  }
-
-  const lensIds = all ? lenses.map((lens) => lens.id) : [...idsToPush].filter((id) => lensById.has(id));
-  for (const id of lensIds) {
-    const lens = lensById.get(id);
-    const item = { lens, schedule: schedules.get(id) || null };
-    const key = `lens/${id}`;
-    if (lensSyncJsonSize(item) > MAX_SYNC_LENS_ITEM_BYTES) {
-      removeKeys.push(key);
-      errors.push(`Lens "${lens.name}" is too large for Firefox Sync and was skipped.`);
-      continue;
+  return enqueueLensSync(async () => {
+    if (!lensSyncEnabled || applyingInboundLensSync || !syncStorageArea()) {
+      return;
     }
-    values[key] = item;
-  }
+    // Snapshot the pending state and the mutation counter together so we can
+    // detect edits that arrive while the sync round-trip below is in flight.
+    const startSeq = lensSyncMutationSeq;
+    const all = pendingLensSyncAll;
+    const idsToPush = all ? null : new Set(pendingLensSyncIds);
+    const removedIds = all ? new Set() : new Set(pendingLensSyncRemovedIds);
+    const pushPrefs = all || pendingLensSyncPrefs;
+    const pushOrder = all || pendingLensSyncOrder || pendingLensSyncIds.size > 0 || pendingLensSyncRemovedIds.size > 0;
+    const stored = await browser.storage.local.get([
+      "lenses",
+      "lensSchedules",
+      AI_GROUPING_PROMPT_KEY,
+      "tabSearchShortcut",
+      LENS_SYNC_META_KEY,
+    ]);
+    const lenses = normalizeLensesFromStorageChange(stored.lenses);
+    const lensById = new Map(lenses.map((lens) => [lens.id, lens]));
+    const schedules = scheduleByLensId(stored.lensSchedules);
+    const meta = normalizeLensSyncMeta(stored[LENS_SYNC_META_KEY]);
+    const now = Date.now();
+    const values = {};
+    const removeKeys = [];
+    const errors = [];
 
-  for (const id of removedIds) {
-    removeKeys.push(`lens/${id}`);
-  }
+    if (pushOrder) {
+      values.lensOrder = {
+        ids: lenses.map((lens) => lens.id),
+        updatedAt: meta.lensOrderUpdatedAt || maxLensUpdatedAt(lenses) || now,
+      };
+    }
 
-  if (all) {
-    const remote = await safeSyncGet(null);
-    if (remote) {
-      const localIds = new Set(lenses.map((lens) => lens.id));
-      for (const key of Object.keys(remote)) {
-        if (key.startsWith("lens/") && !localIds.has(key.slice(5))) {
-          removeKeys.push(key);
+    const lensIds = all ? lenses.map((lens) => lens.id) : [...idsToPush].filter((id) => lensById.has(id));
+    for (const id of lensIds) {
+      const lens = lensById.get(id);
+      const item = { lens, schedule: schedules.get(id) || null };
+      const key = `lens/${id}`;
+      if (lensSyncJsonSize(item) > MAX_SYNC_LENS_ITEM_BYTES) {
+        removeKeys.push(key);
+        errors.push(`Lens "${lens.name}" is too large for Firefox Sync and was skipped.`);
+        continue;
+      }
+      values[key] = item;
+    }
+
+    for (const id of removedIds) {
+      removeKeys.push(`lens/${id}`);
+    }
+
+    if (all) {
+      const remote = await safeSyncGet(null);
+      if (remote) {
+        const localIds = new Set(lenses.map((lens) => lens.id));
+        for (const key of Object.keys(remote)) {
+          if (key.startsWith("lens/") && !localIds.has(key.slice(5))) {
+            removeKeys.push(key);
+          }
         }
       }
     }
-  }
 
-  if (pushPrefs) {
-    values.prefs = {
-      aiGroupingPrompt: typeof stored[AI_GROUPING_PROMPT_KEY] === "string" ? stored[AI_GROUPING_PROMPT_KEY] : "",
-      tabSearchShortcut: normalizeTabSearchShortcut(stored.tabSearchShortcut),
-      updatedAt: meta.prefsUpdatedAt || now,
-    };
-  }
+    if (pushPrefs) {
+      values.prefs = {
+        aiGroupingPrompt: typeof stored[AI_GROUPING_PROMPT_KEY] === "string" ? stored[AI_GROUPING_PROMPT_KEY] : "",
+        tabSearchShortcut: normalizeTabSearchShortcut(stored.tabSearchShortcut),
+        updatedAt: meta.prefsUpdatedAt || now,
+      };
+    }
 
-  const setOk = await safeSyncSet(values);
-  const removeOk = await safeSyncRemove([...new Set(removeKeys)]);
-  if (errors.length > 0) {
-    await setLensSyncLastError(errors.join(" "));
-  } else if (setOk !== false && removeOk !== false && (setOk === true || removeOk === true)) {
-    await setLensSyncLastError("");
-  }
+    const setOk = await safeSyncSet(values);
+    const removeOk = await safeSyncRemove([...new Set(removeKeys)]);
+    if (errors.length > 0) {
+      await setLensSyncLastError(errors.join(" "));
+    } else if (setOk !== false && removeOk !== false && (setOk === true || removeOk === true)) {
+      await setLensSyncLastError("");
+    }
 
-  if (all) {
-    pendingLensSyncAll = false;
-    pendingLensSyncIds.clear();
-    pendingLensSyncRemovedIds.clear();
-    pendingLensSyncOrder = false;
-    pendingLensSyncPrefs = false;
-  } else {
-    for (const id of idsToPush) pendingLensSyncIds.delete(id);
-    for (const id of removedIds) pendingLensSyncRemovedIds.delete(id);
-    if (pushOrder) pendingLensSyncOrder = false;
-    if (pushPrefs) pendingLensSyncPrefs = false;
-  }
+    if (all) {
+      pendingLensSyncAll = false;
+      pendingLensSyncIds.clear();
+      pendingLensSyncRemovedIds.clear();
+      pendingLensSyncOrder = false;
+      pendingLensSyncPrefs = false;
+    } else {
+      for (const id of idsToPush) pendingLensSyncIds.delete(id);
+      for (const id of removedIds) pendingLensSyncRemovedIds.delete(id);
+      if (pushOrder) pendingLensSyncOrder = false;
+      if (pushPrefs) pendingLensSyncPrefs = false;
+    }
+
+    // A local edit landed while we were pushing; the cleanup above may have
+    // cleared a flag for an id that was re-queued mid-push. Force a full
+    // follow-up push so that edit is never dropped.
+    if (lensSyncMutationSeq !== startSeq) {
+      pendingLensSyncAll = true;
+      scheduleLensSyncPush();
+    }
+  });
 }
 
 function syncSnapshotsEqual(a, b) {
@@ -1177,6 +1283,25 @@ async function pullLensSync() {
     values[LENS_SYNC_META_KEY] = nextMeta;
   }
   if (Object.keys(values).length === 0) {
+    return false;
+  }
+  // Compare-and-swap: a local lens/schedule/pref edit may have landed while we
+  // built this merge from a now-stale snapshot. Re-read the user-editable keys
+  // and bail rather than clobber the fresh edit; that edit's own push re-syncs
+  // and re-triggers a pull that merges cleanly. No await sits between this read
+  // and the set below, so the check and apply are atomic.
+  const current = await browser.storage.local.get([
+    "lenses",
+    "lensSchedules",
+    AI_GROUPING_PROMPT_KEY,
+    "tabSearchShortcut",
+  ]);
+  if (
+    !syncSnapshotsEqual(current.lenses, stored.lenses) ||
+    !syncSnapshotsEqual(current.lensSchedules, stored.lensSchedules) ||
+    !syncSnapshotsEqual(current[AI_GROUPING_PROMPT_KEY], stored[AI_GROUPING_PROMPT_KEY]) ||
+    !syncSnapshotsEqual(current.tabSearchShortcut, stored.tabSearchShortcut)
+  ) {
     return false;
   }
   applyingInboundLensSync = true;
@@ -1984,6 +2109,41 @@ async function handleLensReorder(msg) {
   return { ok: true };
 }
 
+async function handleLensImport(msg) {
+  const code = msg && typeof msg.code === "string" ? msg.code : "";
+  let parsed;
+  try {
+    parsed = JSON.parse(code.trim());
+  } catch (error) {
+    return { ok: false, error: "invalid_code" };
+  }
+  if (!isRecord(parsed) || parsed.tabloupeLens !== 1 || !isRecord(parsed.lens)) {
+    return { ok: false, error: "invalid_code" };
+  }
+  const name = typeof parsed.lens.name === "string" ? parsed.lens.name.trim() : "";
+  if (!name) {
+    return { ok: false, error: "invalid_code" };
+  }
+  const now = Date.now();
+  const lens = normalizeLens({
+    id: generateLensId(),
+    name,
+    icon: parsed.lens.icon,
+    color: parsed.lens.color,
+    groupSelectors: parsed.lens.groupSelectors,
+    triggers: { appleFocusIds: [], calendarPatterns: [] },
+    createdAt: now,
+    updatedAt: now,
+  });
+  if (!lens) {
+    return { ok: false, error: "invalid_code" };
+  }
+  const lenses = await getLenses();
+  lenses.push(lens);
+  await saveLenses(lenses);
+  return { ok: true, lens };
+}
+
 function start() {
   setConnectionState("reconnecting").catch((error) => {
     console.error("Connection state error:", error);
@@ -2008,6 +2168,9 @@ function start() {
       console.error("Lens migration error:", error);
     })
     .finally(() => {
+      // Unblock all lens reads/writes now that migration has settled; must run
+      // before reconcileLensSync (which reads lenses through getLenses).
+      resolveLensMigrationReady();
       connect();
       lensSyncInit
         .then(() => {
@@ -2046,6 +2209,9 @@ browser.runtime.onMessage.addListener((message) => {
   if (message && message.type === "lens-reorder") {
     return enqueueFocusWork(() => handleLensReorder(message));
   }
+  if (message && message.type === "lens-import") {
+    return enqueueFocusWork(() => handleLensImport(message));
+  }
   if (message && message.type === "window-profile-set") {
     return enqueueFocusWork(() => handleWindowProfileSet(message));
   }
@@ -2062,8 +2228,10 @@ browser.runtime.onMessage.addListener((message) => {
     return Promise.resolve(handleGroupClear(message.windowId));
   }
   if (message && message.type === "open-tab-search") {
-    openTabSearchOverlay().catch((error) => console.error("Tab search error:", error));
-    return { ok: true };
+    return openTabSearchOverlay().catch((error) => {
+      console.error("Tab search error:", error);
+      return { ok: false, error: "open_failed" };
+    });
   }
   if (message && message.type === "tabsearch-list") {
     return listTabsForSearch();
@@ -2347,15 +2515,17 @@ async function setGroupsCollapsed(groups, collapsed) {
   return failures.filter((failure) => failure !== null);
 }
 
-async function activateMatchingGroups(groups) {
+async function activateMatchingGroups(matching, others = []) {
   let activated = false;
   const failures = [];
+  const keepExpanded = new Set();
 
-  // One tabs.query instead of N+1: bucket every tab by group and remember each
-  // window's active tab in memory, so a focus mapped to many groups doesn't fan
-  // out a query per group plus a per-group active-tab lookup.
+  // One tabs.query instead of N+1: bucket every tab by group, track each
+  // window's active tab and first ungrouped tab, so a focus mapped to many
+  // groups doesn't fan out a query per group plus a per-group active-tab lookup.
   const allTabs = await browser.tabs.query({});
   const tabsByGroup = new Map();
+  const ungroupedByWindow = new Map();
   const activeByWindow = new Map();
   let firstActiveTab = null;
   for (const tab of allTabs) {
@@ -2366,6 +2536,8 @@ async function activateMatchingGroups(groups) {
       } else {
         tabsByGroup.set(tab.groupId, [tab]);
       }
+    } else if (isUngroupedTab(tab) && typeof tab.windowId === "number" && !ungroupedByWindow.has(tab.windowId)) {
+      ungroupedByWindow.set(tab.windowId, tab);
     }
     if (tab.active) {
       if (firstActiveTab === null) {
@@ -2377,35 +2549,67 @@ async function activateMatchingGroups(groups) {
     }
   }
 
-  for (const group of groups) {
+  const matchingGroupIds = new Set(matching.map((group) => group.id));
+  const othersGroupIds = new Set(others.map((group) => group.id));
+
+  // Handoff into a matching group: at most one per window, and only when the
+  // window's active tab must move. An active tab that is ungrouped or already
+  // inside a matching (soon-to-be-expanded) group is safe, so re-activating a
+  // tab there is unnecessary and would yank focus into a different group.
+  const handledWindows = new Set();
+  for (const group of matching) {
     const tabs = tabsByGroup.get(group.id) || [];
     if (tabs.length === 0) {
       continue;
     }
-
-    // Don't pull focus away from an ungrouped active tab — the options page, a
-    // pinned tab, or an about: page. Ungrouped tabs never block collapsing other
-    // groups, so activating a matching tab here is unnecessary and would yank the
-    // user off whatever they were deliberately viewing.
+    activated = true;
+    const windowKey = typeof group.windowId === "number" ? group.windowId : "__nowin__";
+    if (handledWindows.has(windowKey)) {
+      continue;
+    }
     const activeTab = typeof group.windowId === "number"
       ? activeByWindow.get(group.windowId) || null
       : firstActiveTab;
-    if (activeTab && isUngroupedTab(activeTab)) {
-      activated = true;
+    if (!activeTab || isUngroupedTab(activeTab) ||
+        (typeof activeTab.groupId === "number" && matchingGroupIds.has(activeTab.groupId))) {
+      handledWindows.add(windowKey);
       continue;
     }
-
     const target = tabs.find((tab) => tab.active) || tabs[0];
     try {
       await browser.tabs.update(target.id, { active: true });
-      activated = true;
+      handledWindows.add(windowKey);
     } catch (error) {
       console.error("Tab activation error:", group.id, group.title, error);
       failures.push(groupLabel(group));
     }
   }
 
-  return { activated, failures };
+  // Collapse safety for windows with no matching group: Firefox refuses to
+  // collapse a group that holds the active tab. Move focus to an ungrouped tab
+  // where one exists; otherwise leave that window's active group expanded
+  // (reported via keepExpanded) rather than surfacing a preventable failure.
+  for (const [windowId, activeTab] of activeByWindow) {
+    if (handledWindows.has(windowId)) {
+      continue;
+    }
+    if (!activeTab || typeof activeTab.groupId !== "number" || !othersGroupIds.has(activeTab.groupId)) {
+      continue;
+    }
+    const ungrouped = ungroupedByWindow.get(windowId);
+    if (ungrouped) {
+      try {
+        await browser.tabs.update(ungrouped.id, { active: true });
+      } catch (error) {
+        console.error("Ungrouped handoff error:", windowId, error);
+        keepExpanded.add(activeTab.groupId);
+      }
+    } else {
+      keepExpanded.add(activeTab.groupId);
+    }
+  }
+
+  return { activated, failures, keepExpanded };
 }
 
 async function resolveActivation(view, windowId) {
@@ -2448,7 +2652,7 @@ async function rememberActivatedView(resolvedView, activation) {
   if (resolvedView.kind === "transient") {
     if (typeof resolvedView.windowId === "number") {
       transientViewsByWindow.set(resolvedView.windowId, resolvedView);
-      persistSessionWindowState();
+      await persistSessionWindowState();
     }
     return;
   }
@@ -2456,7 +2660,7 @@ async function rememberActivatedView(resolvedView, activation) {
   // genuinely overridden everywhere — drop them all.
   if (transientViewsByWindow.size > 0) {
     transientViewsByWindow.clear();
-    persistSessionWindowState();
+    await persistSessionWindowState();
   }
   await setActiveView(resolvedView, activation);
   publishLensStateSoon();
@@ -2551,7 +2755,7 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
     return { ok: true, expandedGroups: allGroups.map((group) => group.title), collapsedGroups: [], updateFailures };
   }
 
-  const handoff = await activateMatchingGroups(matching);
+  const handoff = await activateMatchingGroups(matching, others);
   if (handoff.failures.length > 0) {
     await browser.storage.local.set({
       ...CLEAR_ACTION_DIAGNOSTICS,
@@ -2571,17 +2775,20 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
     return { ok: true, expandedGroups: [], collapsedGroups: [], updateFailures: [] };
   }
 
-  const groupsToCollapse = others.filter((group) => group.collapsed !== true);
+  // Groups the handoff could not make collapsible (active tab trapped inside,
+  // no ungrouped tab to fall back to) stay expanded instead of failing.
+  const collapsible = others.filter((group) => !handoff.keepExpanded.has(group.id));
+  const groupsToCollapse = collapsible.filter((group) => group.collapsed !== true);
   const [expandFailures, collapseFailures] = await Promise.all([
     setGroupsCollapsed(matching, false),
-    setGroupsCollapsed(others, true),
+    setGroupsCollapsed(collapsible, true),
   ]);
   const updateFailures = expandFailures.concat(collapseFailures);
   await browser.storage.local.set({
     ...CLEAR_ACTION_DIAGNOSTICS,
     lastAction: updateFailures.length === 0 ? "applied" : "applied_with_errors",
     expandedGroups: matching.map((group) => group.title),
-    collapsedGroups: others.map((group) => group.title),
+    collapsedGroups: collapsible.map((group) => group.title),
     updateFailures,
   });
   if (persist) {
@@ -2595,7 +2802,7 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
   const result = {
     ok: true,
     expandedGroups: matching.map((group) => group.title),
-    collapsedGroups: others.map((group) => group.title),
+    collapsedGroups: collapsible.map((group) => group.title),
     updateFailures,
   };
   const collapsedNow = groupsToCollapse.filter((group) => group.collapsed === true);
@@ -2728,20 +2935,30 @@ function groupingUnavailableCode() {
   return "daemon_disconnected";
 }
 
-function promoteOpenSocketToLegacy() {
-  if (socket && socket.readyState === WebSocket.OPEN && socketAuthState === BUS_AUTH_STATES.UNAUTHENTICATED) {
-    socketAuthState = BUS_AUTH_STATES.LEGACY;
-    setPairingStatus(BUS_PAIRING_STATUSES.LEGACY).catch((error) => {
-      console.error("Pairing status error:", error);
-    });
-    publishLensStateSoon();
+async function promoteOpenSocketToLegacy() {
+  if (!socket || socket.readyState !== WebSocket.OPEN || socketAuthState !== BUS_AUTH_STATES.UNAUTHENTICATED) {
+    return;
   }
+  // Never downgrade a token-configured connection to LEGACY: pairing is
+  // mandatory once a busToken exists, and an AI request racing the daemon's
+  // `hello` must not bypass the HMAC handshake. Leave the socket unauthenticated
+  // (pairing pending) so `hello` can still start auth.
+  const token = await getBusToken();
+  // A `hello`/auth frame may have arrived while awaiting the token read.
+  if (token || socketAuthState !== BUS_AUTH_STATES.UNAUTHENTICATED) {
+    return;
+  }
+  socketAuthState = BUS_AUTH_STATES.LEGACY;
+  setPairingStatus(BUS_PAIRING_STATUSES.LEGACY).catch((error) => {
+    console.error("Pairing status error:", error);
+  });
+  publishLensStateSoon();
 }
 
-function requestTabGrouping(tabsPayload, promptOverride) {
-  promoteOpenSocketToLegacy();
+async function requestTabGrouping(tabsPayload, promptOverride) {
+  await promoteOpenSocketToLegacy();
   if (!canUseBusSocket()) {
-    return Promise.reject(new Error(groupingUnavailableCode()));
+    throw new Error(groupingUnavailableCode());
   }
   const id = nextGroupingRequestId();
   return new Promise((resolve, reject) => {
@@ -3191,94 +3408,105 @@ async function createTabGroupFromRequest(request) {
   }
 
   const targetWindowId = request.windowId !== null ? request.windowId : matchedTabs[0].windowId;
-  const existingByTitle = await tabGroupsByTitle(targetWindowId);
-  const targetGroup = existingByTitle.get(request.title) || null;
-  const grouped = [];
-  const pendingGrouped = [];
-  const tabIds = [];
-  let groupId = targetGroup ? targetGroup.id : null;
+  return withGroupingLock(targetWindowId, async () => {
+    const existingByTitle = await tabGroupsByTitle(targetWindowId);
+    const targetGroup = existingByTitle.get(request.title) || null;
+    const grouped = [];
+    const pendingGrouped = [];
+    const tabIds = [];
+    let groupId = targetGroup ? targetGroup.id : null;
 
-  for (const tab of matchedTabs) {
-    if (tab.windowId !== targetWindowId) {
-      skipped.push({ url: tab.url, reason: "cross_window" });
-      continue;
-    }
-    if (tab.pinned) {
-      skipped.push({ url: tab.url, reason: "pinned" });
-      continue;
-    }
-    if (typeof tab.groupId === "number" && tab.groupId !== -1) {
-      if (targetGroup && tab.groupId === targetGroup.id) {
-        grouped.push(tab.url);
-      } else {
-        skipped.push({ url: tab.url, reason: "already_grouped_elsewhere" });
+    for (const tab of matchedTabs) {
+      if (tab.windowId !== targetWindowId) {
+        skipped.push({ url: tab.url, reason: "cross_window" });
+        continue;
       }
-      continue;
+      if (tab.pinned) {
+        skipped.push({ url: tab.url, reason: "pinned" });
+        continue;
+      }
+      if (typeof tab.groupId === "number" && tab.groupId !== -1) {
+        if (targetGroup && tab.groupId === targetGroup.id) {
+          grouped.push(tab.url);
+        } else {
+          skipped.push({ url: tab.url, reason: "already_grouped_elsewhere" });
+        }
+        continue;
+      }
+      tabIds.push(tab.id);
+      pendingGrouped.push(tab.url);
     }
-    tabIds.push(tab.id);
-    pendingGrouped.push(tab.url);
-  }
 
-  if (tabIds.length > 0) {
-    const group = await createOrMergeTabGroup({
-      title: request.title,
-      color: request.color,
-      tabIds,
-      windowId: targetWindowId,
-      existingByTitle,
-    });
-    groupId = group.id;
-    grouped.push(...pendingGrouped);
-  }
+    if (tabIds.length > 0) {
+      const group = await createOrMergeTabGroup({
+        title: request.title,
+        color: request.color,
+        tabIds,
+        windowId: targetWindowId,
+        existingByTitle,
+      });
+      groupId = group.id;
+      grouped.push(...pendingGrouped);
+    }
 
-  if (grouped.length === 0) {
+    if (grouped.length === 0) {
+      return {
+        ok: false,
+        groupId,
+        windowId: targetWindowId,
+        grouped,
+        skipped,
+        error: "no_tabs_matched",
+      };
+    }
+
     return {
-      ok: false,
+      ok: true,
       groupId,
       windowId: targetWindowId,
       grouped,
       skipped,
-      error: "no_tabs_matched",
+      error: null,
     };
-  }
-
-  return {
-    ok: true,
-    groupId,
-    windowId: targetWindowId,
-    grouped,
-    skipped,
-    error: null,
-  };
+  });
 }
 
 async function applyTabGrouping(groups, windowId) {
-  const applied = [];
-  const failures = [];
-  // Merge into an existing same-named group (manual or a prior AI run) instead
-  // of spawning a duplicate. Snapshot existing groups once, scoped to the window.
-  const existingByTitle = await tabGroupsByTitle(windowId);
-  for (const group of groups) {
-    const tabIds = group.tabs.map((tab) => tab.id).filter((id) => typeof id === "number");
-    if (tabIds.length === 0) {
-      continue;
+  return withGroupingLock(windowId, async () => {
+    const applied = [];
+    const failures = [];
+    // Merge into an existing same-named group (manual or a prior AI run) instead
+    // of spawning a duplicate. Snapshot inside the per-window lock so a
+    // concurrent grouping entry point can't have created the same title between
+    // our query and create.
+    const existingByTitle = await tabGroupsByTitle(windowId);
+    for (const group of groups) {
+      const tabIds = group.tabs.map((tab) => tab.id).filter((id) => typeof id === "number");
+      if (tabIds.length === 0) {
+        continue;
+      }
+      try {
+        const created = await createOrMergeTabGroup({
+          title: group.topic,
+          color: group.color,
+          tabIds,
+          windowId,
+          existingByTitle,
+          defaultColor: TAB_GROUP_COLORS[0],
+        });
+        // Keep the snapshot current so a later proposal with the same title
+        // merges into this group instead of creating a duplicate.
+        if (created && typeof group.topic === "string" && !existingByTitle.has(group.topic)) {
+          existingByTitle.set(group.topic, created);
+        }
+        applied.push(group.topic);
+      } catch (error) {
+        console.error("AI tab group apply error:", group.topic, error);
+        failures.push(group.topic);
+      }
     }
-    try {
-      await createOrMergeTabGroup({
-        title: group.topic,
-        color: group.color,
-        tabIds,
-        windowId,
-        existingByTitle,
-        defaultColor: TAB_GROUP_COLORS[0],
-      });
-      applied.push(group.topic);
-    } catch (error) {
-      console.error("AI tab group apply error:", group.topic, error);
-      failures.push(group.topic);
-    }
-  }
-  return { applied, failures };
+    return { applied, failures };
+  });
 }
 
 async function aiGroupingEnabled() {
@@ -3387,6 +3615,17 @@ async function handleGroupPreview(windowId) {
   if (!(await aiGroupingEnabled())) {
     return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
   }
+  // Resolve an absent windowId to a concrete id up front so this preview and a
+  // concurrent auto-group run for the same physical window key the shared
+  // inflightPreviews map identically — otherwise a popup preview stored under
+  // "current" would not de-duplicate against a numeric-id auto-group run, and
+  // both would cluster the same tabs at once.
+  if (typeof windowId !== "number" && browser.windows && typeof browser.windows.getCurrent === "function") {
+    const currentWindow = await browser.windows.getCurrent().catch(() => null);
+    if (currentWindow && typeof currentWindow.id === "number") {
+      windowId = currentWindow.id;
+    }
+  }
   // Collapse concurrent previews for the same window onto one in-flight request
   // so re-opening the popup or clicking Regroup mid-compute can't fan out
   // duplicate daemon/LLM calls. The cache key tolerates an absent windowId.
@@ -3450,8 +3689,8 @@ async function commitTabGroups(windowId, groups, { notify: doNotify = true, surf
     }
   }
   const message = ok
-    ? `Created ${outcome.applied.length} group(s): ${outcome.applied.join(", ")}`
-    : `Created ${outcome.applied.length}; failed: ${outcome.failures.join(", ")}`;
+    ? `Created ${outcome.applied.length} group(s): ${truncateList(outcome.applied)}`
+    : `Created ${outcome.applied.length}; failed: ${truncateList(outcome.failures)}`;
   const result = ok
     ? { ok, applied: outcome.applied, failures: outcome.failures }
     : { ok, error: "apply_failed", message, applied: outcome.applied, failures: outcome.failures };
@@ -3500,10 +3739,16 @@ async function runAutoGroup(windowId) {
   if (typeof windowId !== "number" || !autoGroupEnabled) {
     return;
   }
-  // Skip if a run is already in progress, cooling down, or a manual popup
-  // preview is computing for this window — all three would otherwise let two
+  // Skip if a run is already in progress, cooling down, a manual popup preview
+  // is computing, or a manual grouping transaction (Apply / Tab Search group)
+  // currently holds the window's grouping lock — all would otherwise let two
   // clustering passes race over the same tabs.
-  if (autoGroupCooldown.has(windowId) || autoGroupInflight.has(windowId) || inflightPreviews.has(windowId)) {
+  if (
+    autoGroupCooldown.has(windowId) ||
+    autoGroupInflight.has(windowId) ||
+    inflightPreviews.has(windowId) ||
+    isGroupingLocked(windowId)
+  ) {
     return;
   }
   autoGroupInflight.add(windowId);
@@ -3589,7 +3834,13 @@ async function activateTabFromSearch(tabId, windowId) {
   if (browser.windows && typeof windowId === "number") {
     await browser.windows.update(windowId, { focused: true }).catch(() => {});
   }
-  await browser.tabs.update(tabId, { active: true });
+  try {
+    await browser.tabs.update(tabId, { active: true });
+  } catch (error) {
+    // The tab was closed between listing and activation; return a structured
+    // failure instead of rejecting the message so the overlay can react.
+    return { ok: false, error: "tab_not_found" };
+  }
   return { ok: true };
 }
 
@@ -3895,9 +4146,12 @@ function isNewTabPage(tab) {
 
 async function openTabSearchOverlay() {
   const [active] = await browser.tabs.query({ active: true, currentWindow: true });
-  if (!active || typeof active.id !== "number") return;
+  if (!active || typeof active.id !== "number") {
+    return { ok: false, error: "no_active_tab" };
+  }
   try {
     await browser.tabs.sendMessage(active.id, { type: "tabsearch-open" });
+    return { ok: true };
   } catch (error) {
     if (isNewTabPage(active)) {
       // Navigating the new-tab page in place (tabs.update) leaves keyboard focus
@@ -3910,7 +4164,7 @@ async function openTabSearchOverlay() {
       } catch (removeError) {
         // Leaving the blank tab is harmless if it can't be removed.
       }
-      return;
+      return { ok: true };
     }
     // No content script on this page (e.g. about:, addons, PDF viewer).
     await notify({
@@ -3918,6 +4172,7 @@ async function openTabSearchOverlay() {
       title: "Tab Search",
       message: "Tab search can't open on this page. Switch to a normal web page and try again.",
     });
+    return { ok: false, error: "unsupported_page" };
   }
 }
 
@@ -3959,7 +4214,7 @@ async function handleCommand(command) {
     await openTabSearchOverlay();
     return;
   }
-  await handleLensCommand(command);
+  await enqueueFocusWork(() => handleLensCommand(command));
 }
 
 if (browser.commands && browser.commands.onCommand) {

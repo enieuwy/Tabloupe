@@ -509,8 +509,10 @@ function mergeLensStateSummaries(lensSummaries) {
     }
   }
 }
+let loadChangedKeys = null;
 
 async function loadAll() {
+  loadChangedKeys = new Set();
   const windowId = await currentWindowId();
   state.windowId = windowId;
   const [stored, firefoxSnapshot, lensState, containers] = await Promise.all([
@@ -520,42 +522,45 @@ async function loadAll() {
     requestContainers(),
   ]);
 
-  state.lenses = normalizeLenses(stored.lenses);
-  state.activeView = isRecord(stored.activeView) ? stored.activeView : { kind: "all" };
-  state.lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : null;
-  state.legacyFocusMappingsBackup = isRecord(stored.legacyFocusMappingsBackup) ? stored.legacyFocusMappingsBackup : null;
-  state.seenFocusIds = normalizeSeen(stored.seenFocusIds);
-  state.lastFocusSeen = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
-  state.lastAction = typeof stored.lastAction === "string" ? stored.lastAction : null;
-  state.groupTitles = normalizeStringArray(stored.groupTitles);
+  const applyStored = (key, value) => {
+    if (!loadChangedKeys.has(key)) {
+      state[key] = value;
+    }
+  };
+  applyStored("lenses", normalizeLenses(stored.lenses));
+  applyStored("activeView", isRecord(stored.activeView) ? stored.activeView : { kind: "all" });
+  applyStored("lastActivation", isRecord(stored.lastActivation) ? stored.lastActivation : null);
+  applyStored("legacyFocusMappingsBackup", isRecord(stored.legacyFocusMappingsBackup) ? stored.legacyFocusMappingsBackup : null);
+  applyStored("seenFocusIds", normalizeSeen(stored.seenFocusIds));
+  applyStored("lastFocusSeen", typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null);
+  applyStored("lastAction", typeof stored.lastAction === "string" ? stored.lastAction : null);
+  applyStored("groupTitles", normalizeStringArray(stored.groupTitles));
   state.firefoxGroupTitles = firefoxSnapshot.titles;
   state.firefoxGroupTitleCounts = firefoxSnapshot.counts;
   state.currentGroups = firefoxSnapshot.currentGroups;
   state.containers = containers;
   state.containerNames = uniqueSortedTitlesFromValues(containers.map((container) => container.name));
-  state.unmappedFocusId = typeof stored.unmappedFocusId === "string" ? stored.unmappedFocusId : null;
-  state.missingGroup = typeof stored.missingGroup === "string" ? stored.missingGroup : null;
-  state.emptyGroup = typeof stored.emptyGroup === "string" ? stored.emptyGroup : null;
-  state.expandedGroups = normalizeStringArray(stored.expandedGroups);
-  state.collapsedGroups = normalizeStringArray(stored.collapsedGroups);
-  state.updateFailures = normalizeStringArray(stored.updateFailures);
-  state.connectionState = normalizeConnectionState(stored.connectionState);
-  state.lastError = normalizeLastError(stored.lastError);
-  state.tabSearchShortcut = "tabSearchShortcut" in stored
-    ? normalizeShortcut(stored.tabSearchShortcut)
-    : { ...DEFAULT_TAB_SEARCH_SHORTCUT };
-  state.aiProvider = normalizeProvider(stored.aiProvider);
-  state.aiGroupingPrompt = normalizeGroupingPrompt(stored.aiGroupingPrompt);
-  state.syncLenses = stored.syncLenses === true;
-  state.syncLastError = typeof stored.syncLastError === "string" ? stored.syncLastError : "";
-  state.lastProviderCheck = normalizeProviderCheck(stored.lastProviderCheck);
-  state.discardCollapsedTabs = stored.discardCollapsedTabs === true;
-  state.focusCatalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
-  state.lensSchedules = normalizeLensSchedules(stored.lensSchedules);
-  state.focusSessionHistory = normalizeFocusSessionHistory(stored.focusSessionHistory);
-  state.automationFallback = isRecord(stored.automationFallback) ? stored.automationFallback : { kind: "all" };
-  state.busToken = normalizeBusToken(stored.busToken);
-  state.busPairingStatus = normalizeBusPairingStatus(stored.busPairingStatus);
+  applyStored("unmappedFocusId", typeof stored.unmappedFocusId === "string" ? stored.unmappedFocusId : null);
+  applyStored("missingGroup", typeof stored.missingGroup === "string" ? stored.missingGroup : null);
+  applyStored("emptyGroup", typeof stored.emptyGroup === "string" ? stored.emptyGroup : null);
+  applyStored("expandedGroups", normalizeStringArray(stored.expandedGroups));
+  applyStored("collapsedGroups", normalizeStringArray(stored.collapsedGroups));
+  applyStored("updateFailures", normalizeStringArray(stored.updateFailures));
+  applyStored("connectionState", normalizeConnectionState(stored.connectionState));
+  applyStored("lastError", normalizeLastError(stored.lastError));
+  applyStored("tabSearchShortcut", "tabSearchShortcut" in stored ? normalizeShortcut(stored.tabSearchShortcut) : { ...DEFAULT_TAB_SEARCH_SHORTCUT });
+  applyStored("aiProvider", normalizeProvider(stored.aiProvider));
+  applyStored("aiGroupingPrompt", normalizeGroupingPrompt(stored.aiGroupingPrompt));
+  applyStored("syncLenses", stored.syncLenses === true);
+  applyStored("syncLastError", typeof stored.syncLastError === "string" ? stored.syncLastError : "");
+  applyStored("lastProviderCheck", normalizeProviderCheck(stored.lastProviderCheck));
+  applyStored("discardCollapsedTabs", stored.discardCollapsedTabs === true);
+  applyStored("focusCatalog", isRecord(stored.focusCatalog) ? stored.focusCatalog : {});
+  applyStored("lensSchedules", normalizeLensSchedules(stored.lensSchedules));
+  applyStored("focusSessionHistory", normalizeFocusSessionHistory(stored.focusSessionHistory));
+  applyStored("automationFallback", isRecord(stored.automationFallback) ? stored.automationFallback : { kind: "all" });
+  applyStored("busToken", normalizeBusToken(stored.busToken));
+  applyStored("busPairingStatus", normalizeBusPairingStatus(stored.busPairingStatus));
   if (isRecord(lensState)) {
     if (isRecord(lensState.activeView)) {
       state.activeView = lensState.activeView;
@@ -584,6 +589,7 @@ async function loadAll() {
   renderProvider();
   renderGroupingPrompt();
   refreshCommandShortcuts();
+  loadChangedKeys = null;
 }
 
 function clearStatusUndoTimer() {
@@ -740,19 +746,6 @@ function nextLensColor() {
   return unused || LENS_COLOR_PALETTE[state.lenses.length % LENS_COLOR_PALETTE.length];
 }
 
-function generateLensId() {
-  return `lens_${Math.random().toString(36).slice(2, 10) || Date.now().toString(36)}`;
-}
-
-function uniqueLensId(lenses) {
-  const existingIds = new Set(lenses.map((lens) => lens.id));
-  let id = generateLensId();
-  while (existingIds.has(id)) {
-    id = generateLensId();
-  }
-  return id;
-}
-
 function sharePayloadForLens(lens) {
   return {
     tabloupeLens: 1,
@@ -796,33 +789,6 @@ async function shareLens(lens) {
   }
 }
 
-function importedLensFromCode(code, existingLenses) {
-  let parsed;
-  try {
-    parsed = JSON.parse(code.trim());
-  } catch (error) {
-    return null;
-  }
-  if (!isRecord(parsed) || parsed.tabloupeLens !== 1 || !isRecord(parsed.lens)) {
-    return null;
-  }
-  const name = typeof parsed.lens.name === "string" ? parsed.lens.name.trim() : "";
-  if (!name) {
-    return null;
-  }
-  const now = Date.now();
-  return normalizeLens({
-    id: uniqueLensId(existingLenses),
-    name,
-    icon: parsed.lens.icon,
-    color: parsed.lens.color,
-    groupSelectors: parsed.lens.groupSelectors,
-    triggers: { appleFocusIds: [], calendarPatterns: [] },
-    createdAt: now,
-    updatedAt: now,
-  });
-}
-
 function setLensImportVisible(visible) {
   const row = document.getElementById("lens-import-row");
   const toggle = document.getElementById("import-lens-toggle");
@@ -848,20 +814,18 @@ function closeLensImport() {
 async function addLensFromCode() {
   const input = document.getElementById("lens-import-code");
   const code = input ? input.value : "";
-  const stored = await browser.storage.local.get("lenses");
-  const lenses = normalizeLenses(stored.lenses);
-  const lens = importedLensFromCode(code, lenses);
-  if (!lens) {
+  const result = await browser.runtime.sendMessage({ type: "lens-import", code });
+  if (!result || result.ok !== true) {
     showToast("Not a valid lens code.", "error");
     return;
   }
-  const next = normalizeLenses([...lenses, lens]);
-  await browser.storage.local.set({ lenses: next });
-  state.lenses = next;
   if (input) {
     input.value = "";
   }
   setLensImportVisible(false);
+  const merged = state.lenses.filter((lens) => lens.id !== result.lens.id);
+  merged.push(result.lens);
+  state.lenses = normalizeLenses(merged);
   render();
   showToast("Lens added.", "ok");
 }
@@ -2773,6 +2737,11 @@ function setupAnchorNav() {
 
 
 function applyStorageChange(changes) {
+  if (loadChangedKeys) {
+    for (const key of Object.keys(changes)) {
+      loadChangedKeys.add(key);
+    }
+  }
   if (changes.lenses) {
     state.lenses = normalizeLenses(changes.lenses.newValue);
     syncUntouchedDefaultLenses();

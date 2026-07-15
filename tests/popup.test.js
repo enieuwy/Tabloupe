@@ -381,6 +381,28 @@ test("persisted last error renders once and clears when AI subview opens", async
   assert.equal(harness.storageData.lastError, null);
 });
 
+test("persisted last error is preserved when reconnect banner is shown", async () => {
+  const message = "Provider returned HTTP 401. Check your API key.";
+  const storedError = { code: "provider-http", message, at: Date.now(), source: "ai" };
+  const harness = createHarness({
+    storage: {
+      connectionState: "reconnecting",
+      lastError: storedError,
+    },
+    respond: (msg) => {
+      if (msg.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (msg.type === "ai-group-state") return { enabled: false, groupableCount: 0, proposal: null };
+      return {};
+    },
+  });
+  await settle();
+  await openAi(harness);
+
+  const connection = harness.document.getElementById("popup-connection");
+  assert.equal(connection.textContent, "⚠ Not connected to mac-command-centre");
+  assert.deepEqual(harness.storageData.lastError, storedError);
+});
+
 test("disabled AI state renders toggle off and does not preview", async () => {
   const harness = createHarness({
     respond: (message) => {
@@ -594,4 +616,46 @@ test("AI pin row disables with a hint when no lens is active", async () => {
   const label = harness.document.getElementById("ai-pin-label");
   assert.equal(label.textContent, "Add new groups to current lens (none active)");
   assert.equal(harness.document.getElementById("ai-pin").disabled, true);
+});
+
+// ── Regression: stranded focus-tab-groups findings ────────────────────
+
+test("popup labels a scheduled activation as schedule, not Apple Focus", async () => {
+  const harness = createHarness({
+    respond: (message) =>
+      message.type === "lens-state"
+        ? defaultLensState({
+            activeView: { kind: "lens", lensId: "lens_work" },
+            lastActivation: { trigger: "schedule" },
+            lenses: [{ id: "lens_work", name: "Work", icon: "briefcase", color: "blue", active: true }],
+            hasGroups: true,
+            hasAppleBinding: true,
+          })
+        : {},
+  });
+  await settle();
+
+  const trigger = harness.document.getElementById("lens-trigger");
+  assert.equal(trigger.hidden, false);
+  assert.equal(trigger.textContent, "Switched by schedule");
+});
+
+test("popup still labels an Apple Focus activation as Apple Focus", async () => {
+  const harness = createHarness({
+    respond: (message) =>
+      message.type === "lens-state"
+        ? defaultLensState({
+            activeView: { kind: "lens", lensId: "lens_work" },
+            lastActivation: { trigger: "appleFocus" },
+            lenses: [{ id: "lens_work", name: "Work", icon: "briefcase", color: "blue", active: true }],
+            hasGroups: true,
+            hasAppleBinding: true,
+          })
+        : {},
+  });
+  await settle();
+
+  const trigger = harness.document.getElementById("lens-trigger");
+  assert.equal(trigger.hidden, false);
+  assert.equal(trigger.textContent, "Switched by Apple Focus");
 });

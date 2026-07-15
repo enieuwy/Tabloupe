@@ -139,7 +139,7 @@ preflight_checks() {
 
   # web-ext available via npx
   if ! npx --no-install web-ext --version &>/dev/null; then
-    die "web-ext is not available — run 'npm ci' first to install pinned devDependencies"
+    die "web-ext is not available — run 'npm ci --ignore-scripts' first to install pinned devDependencies"
   fi
   success "  ✓ web-ext available"
 

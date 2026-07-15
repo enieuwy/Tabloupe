@@ -33,17 +33,30 @@ if [[ -z "${WEB_EXT_API_KEY:-}" || -z "${WEB_EXT_API_SECRET:-}" ]]; then
   exit 1
 fi
 
-ORIGINAL_MANIFEST="$(mktemp)"
-cp manifest.json "$ORIGINAL_MANIFEST"
+# Acquire an exclusive repo-scoped lock around the whole
+# snapshot -> bump -> sign -> cleanup transaction. mkdir is atomic and
+# portable (macOS has no flock by default), so only one build runs at a time.
+LOCK_DIR=".build.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "Error: another build is already running (lock '$LOCK_DIR' is held)." >&2
+  echo "If no build is running, this lock is stale — remove it with: rmdir '$LOCK_DIR'" >&2
+  exit 1
+fi
+
 SIGN_SUCCEEDED=false
+ORIGINAL_MANIFEST=""
 
 cleanup() {
-  if [[ "$SIGN_SUCCEEDED" != true ]]; then
+  if [[ "$SIGN_SUCCEEDED" != true && -n "$ORIGINAL_MANIFEST" ]]; then
     cp "$ORIGINAL_MANIFEST" manifest.json
   fi
-  rm -f "$ORIGINAL_MANIFEST"
+  [[ -n "$ORIGINAL_MANIFEST" ]] && rm -f "$ORIGINAL_MANIFEST"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+ORIGINAL_MANIFEST="$(mktemp)"
+cp manifest.json "$ORIGINAL_MANIFEST"
 
 echo "Bump version in manifest.json..."
 python3 - <<'PY'

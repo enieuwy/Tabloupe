@@ -38,10 +38,26 @@ let historyResults = [];
 let historyQuery = "";
 let historyDebounceTimer = null;
 let tabContainers = [];
+// Guards against stale async work repainting a reopened overlay: bumped on every
+// open (buildOverlay) and every close (closeOverlay). In-flight open/refresh work
+// captures the value and bails when it no longer matches.
+let overlayGen = 0;
+// Monotonic token for list-refreshing actions; only the latest-issued result is
+// allowed to apply, so out-of-order responses are discarded.
+let latestActionSeq = 0;
 const MAX_RENDERED_RESULTS = 50;
 
 const DEFAULT_TAB_SEARCH_SHORTCUT = { ctrl: true, alt: false, shift: false, meta: false, key: "s" };
 let shortcut = { ...DEFAULT_TAB_SEARCH_SHORTCUT };
+// The in-page keydown and the WebExtension `search-tabs` command both resolve to
+// Ctrl+S on Windows/Linux; a page's preventDefault does not reliably suppress a
+// registered command, so both fire for one keypress. When the content-script
+// keydown handles the shortcut it stamps this timestamp; the command's relayed
+// `tabsearch-open` message ignores itself within the echo window so the overlay
+// isn't opened-then-closed. The keydown path itself is never debounced, so
+// pressing Ctrl+S again to toggle the overlay closed always works.
+const COMMAND_ECHO_WINDOW_MS = 400;
+let lastShortcutToggleAt = 0;
 
 const ICON_SEARCH =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>';
@@ -165,6 +181,7 @@ function isOpen() {
 }
 
 function buildOverlay() {
+  overlayGen += 1;
   host = document.createElement("div");
   host.id = TABSEARCH_HOST_ID;
   // Keep the host itself inert to page styles; the real UI lives in the shadow.
@@ -1128,6 +1145,12 @@ function renderFooter() {
     if (duplicateTabIds.length > 0) {
       footerEl.appendChild(makeActionButton(`Select ${duplicateTabIds.length} duplicates`, markDuplicateTabs));
     }
+    if (actionMessage) {
+      const message = document.createElement("span");
+      message.className = "message";
+      message.textContent = actionMessage;
+      footerEl.appendChild(message);
+    }
     return;
   }
 
@@ -1379,6 +1402,7 @@ async function openOverlay() {
     return;
   }
   buildOverlay();
+  const gen = overlayGen;
   selectedIndex = 0;
   focusInput();
   try {
@@ -1386,19 +1410,22 @@ async function openOverlay() {
       browser.runtime.sendMessage({ type: "tabsearch-list" }),
       browser.runtime.sendMessage({ type: "tabsearch-containers" }).catch(() => ({ ok: false, containers: [] })),
     ]);
+    if (gen !== overlayGen || !isOpen()) return; // closed or reopened while awaiting
     allTabs = prepareTabsForSearch(tabs || []);
     tabContainers = containersResult && containersResult.ok && Array.isArray(containersResult.containers)
       ? containersResult.containers
       : [];
   } catch (error) {
+    if (gen !== overlayGen || !isOpen()) return;
     allTabs = [];
     tabContainers = [];
   }
-  if (!isOpen()) return; // closed while awaiting
+  if (gen !== overlayGen || !isOpen()) return; // closed or reopened while awaiting
   render(inputEl.value);
 }
 
 function closeOverlay() {
+  overlayGen += 1;
   if (host && host.parentNode) host.parentNode.removeChild(host);
   host = null;
   shadow = null;
@@ -1425,27 +1452,28 @@ function closeOverlay() {
   }
 }
 
+// Fire an action send that closes the overlay on success. A runtime rejection is
+// surfaced as a visible failure message with the overlay kept open, instead of
+// being swallowed by a bare empty catch.
 function activate(item) {
+  let message;
   if (item.kind === "web") {
     // A URL-shaped query opens directly; anything else is a web search.
-    const message = item.url
+    message = item.url
       ? { type: "tabsearch-open-url", url: item.url }
       : { type: "tabsearch-web-search", query: item.query };
-    browser.runtime.sendMessage(message).catch(() => {});
-    closeOverlay();
-    return;
+  } else if (item.kind === "history") {
+    message = { type: "tabsearch-open-url", url: item.url };
+  } else {
+    message = { type: "tabsearch-activate", tabId: item.id, windowId: item.windowId };
   }
-  if (item.kind === "history") {
-    browser.runtime
-      .sendMessage({ type: "tabsearch-open-url", url: item.url })
-      .catch(() => {});
-    closeOverlay();
-    return;
-  }
-  browser.runtime
-    .sendMessage({ type: "tabsearch-activate", tabId: item.id, windowId: item.windowId })
-    .catch(() => {});
-  closeOverlay();
+  browser.runtime.sendMessage(message).then(
+    () => closeOverlay(),
+    () => {
+      actionMessage = "Action failed.";
+      if (isOpen()) render(inputEl.value);
+    }
+  );
 }
 
 async function closeTab(tab) {
@@ -1459,14 +1487,19 @@ async function closeTab(tab) {
 }
 
 async function runBulkListAction(type, payload) {
+  const gen = overlayGen;
+  const seq = (latestActionSeq += 1);
   try {
     const refreshed = await browser.runtime.sendMessage({ type, ...payload });
+    // A newer action or a reopen superseded this one; drop the stale result.
+    if (gen !== overlayGen || seq !== latestActionSeq) return;
     if (Array.isArray(refreshed)) {
       allTabs = prepareTabsForSearch(refreshed);
       clearMarks();
       pruneMarked();
     }
   } catch (error) {
+    if (gen !== overlayGen || seq !== latestActionSeq) return;
     actionMessage = "Action failed.";
   }
   if (isOpen()) render(inputEl.value);
@@ -1562,6 +1595,7 @@ function onGlobalKeydown(event) {
   if (matchesShortcut(event, shortcut)) {
     event.preventDefault();
     event.stopPropagation();
+    lastShortcutToggleAt = Date.now();
     openOverlay();
   }
 }
@@ -1616,6 +1650,13 @@ if (!window.__focusTabSearchInit) {
   if (browser.runtime && browser.runtime.onMessage) {
     browser.runtime.onMessage.addListener((message) => {
       if (message && message.type === "tabsearch-open") {
+        // Ignore the browser command's relayed open when the in-page keydown just
+        // handled the same Ctrl+S; otherwise the two entry points toggle the
+        // overlay open then closed. A deliberate open (popup button, new-tab
+        // route) arrives with no recent keydown and still opens.
+        if (Date.now() - lastShortcutToggleAt < COMMAND_ECHO_WINDOW_MS) {
+          return;
+        }
         openOverlay();
       }
     });

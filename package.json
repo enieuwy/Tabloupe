@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "lint:web-ext": "web-ext lint --source-dir . --ignore-files node_modules package-lock.json .github web-ext-artifacts build.sh deploy.sh --warnings-as-errors",
+    "lint:web-ext": "web-ext lint --source-dir . --ignore-files node_modules package-lock.json .github web-ext-artifacts build.sh deploy.sh .npmrc .build.lock --warnings-as-errors",
     "audit": "npm audit --audit-level=high",
     "secrets": "betterleaks git . --no-banner --redact",
     "verify": "npm run lint:web-ext && npm test && npm run audit"

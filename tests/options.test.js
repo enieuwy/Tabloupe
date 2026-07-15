@@ -150,6 +150,37 @@ function createHarness({ storage = {}, groups = [], grantPermission = true, plat
           storageData.lenses = msg.orderedIds.map((id) => byId.get(id)).filter(Boolean);
           return { ok: true };
         }
+        if (msg.type === "lens-import") {
+          let parsed;
+          try {
+            parsed = JSON.parse(String(msg.code).trim());
+          } catch (error) {
+            return { ok: false, error: "invalid_code" };
+          }
+          if (!parsed || typeof parsed !== "object" || parsed.tabloupeLens !== 1 || !parsed.lens || typeof parsed.lens !== "object") {
+            return { ok: false, error: "invalid_code" };
+          }
+          const name = typeof parsed.lens.name === "string" ? parsed.lens.name.trim() : "";
+          if (!name) {
+            return { ok: false, error: "invalid_code" };
+          }
+          const now = Date.now();
+          const existingIds = new Set((storageData.lenses || []).map((lens) => lens.id));
+          let id = "lens_import_" + ((storageData.lenses || []).length + 1);
+          while (existingIds.has(id)) id += "x";
+          const lens = {
+            id,
+            name,
+            icon: typeof parsed.lens.icon === "string" ? parsed.lens.icon : "circle",
+            color: typeof parsed.lens.color === "string" ? parsed.lens.color : null,
+            groupSelectors: Array.isArray(parsed.lens.groupSelectors) ? clone(parsed.lens.groupSelectors) : [],
+            triggers: { appleFocusIds: [], calendarPatterns: [] },
+            createdAt: now,
+            updatedAt: now,
+          };
+          storageData.lenses = [...(storageData.lenses || []), clone(lens)];
+          return { ok: true, lens: clone(lens) };
+        }
       }
     },
     permissions: {
@@ -1191,6 +1222,13 @@ test("lens import appends a fresh lens and rejects malformed codes without writi
   const harness = createHarness({ storage: { lenses: [existing] } });
   await settle();
 
+  const setKeys = [];
+  const originalSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    setKeys.push(...Object.keys(values));
+    return originalSet(values);
+  };
+
   const importedCode = JSON.stringify({
     tabloupeLens: 1,
     lens: {
@@ -1207,8 +1245,13 @@ test("lens import appends a fresh lens and rejects malformed codes without writi
   harness.document.getElementById("lens-import-add").click();
   await settle();
 
+  const importMessage = lastMessageOfType(harness.messages, "lens-import");
+  assert.ok(importMessage, "sent a lens-import message");
+  assert.equal(importMessage.code, importedCode);
+  assert.ok(!setKeys.includes("lenses"), "did not write lenses via storage.local.set");
+
   assert.equal(harness.storageData.lenses.length, 2);
-  const imported = harness.storageData.lenses[1];
+  const imported = harness.state ? harness.state.lenses[1] : harness.storageData.lenses[1];
   assert.ok(imported.id.startsWith("lens_"));
   assert.notEqual(imported.id, "lens_stolen");
   assert.equal(imported.name, "Imported");
@@ -1217,14 +1260,47 @@ test("lens import appends a fresh lens and rejects malformed codes without writi
   assert.deepEqual(imported.groupSelectors, [{ type: "glob", value: "Client*" }]);
   assert.deepEqual(imported.triggers.appleFocusIds, []);
   assert.deepEqual(imported.triggers.calendarPatterns, []);
+  assert.equal(harness.document.getElementById("lens-import-code").value, "");
 
+  harness.messages.length = 0;
   const before = JSON.stringify(harness.storageData.lenses);
   harness.document.getElementById("lens-import-code").value = "{not json";
   harness.document.getElementById("lens-import-add").click();
   await settle();
 
   assert.equal(JSON.stringify(harness.storageData.lenses), before);
+  assert.equal(harness.document.getElementById("lens-import-code").value, "{not json");
+  assert.ok(!setKeys.includes("lenses"), "malformed import did not write lenses");
   assert.equal(harness.document.querySelector("#toast-host .toast").textContent, "Not a valid lens code.");
+});
+
+test("loadAll keeps a concurrent storage.onChanged update instead of reverting it", async () => {
+  const harness = createHarness({ storage: { aiGroupingPrompt: "OLD prompt from disk" } });
+  await settle();
+  assert.equal(harness.document.getElementById("ai-grouping-prompt").value, "OLD prompt from disk");
+
+  const oldSnapshot = clone(harness.storageData);
+  let resolveGet;
+  harness.browser.storage.local.get = () => new Promise((resolve) => {
+    resolveGet = () => resolve(clone(oldSnapshot));
+  });
+
+  const loadPromise = harness.window.loadAll();
+  await nextTick();
+
+  // A newer value arrives via storage.onChanged while loadAll's read is in flight.
+  await harness.browser.storage.local.set({ aiGroupingPrompt: "NEW prompt via onChanged" });
+  await nextTick();
+
+  // loadAll's stale read now resolves with the OLD value; it must not clobber the newer one.
+  resolveGet();
+  await loadPromise;
+  await settle();
+
+  assert.equal(
+    harness.document.getElementById("ai-grouping-prompt").value,
+    "NEW prompt via onChanged",
+  );
 });
 
 test("provider test connection lists models and persists successful diagnostics", async () => {

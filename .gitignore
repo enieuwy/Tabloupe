@@ -1,5 +1,6 @@
 .env
 web-ext-artifacts/
+.build.lock/
 node_modules/
 
 .DS_Store
