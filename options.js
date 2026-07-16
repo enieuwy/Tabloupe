@@ -2939,15 +2939,17 @@ function validateProviderBaseURL(baseURL) {
   } catch (error) {
     return { error: "That base URL is not valid." };
   }
-  const loopbackHosts = ["localhost", "127.0.0.1", "[::1]"];
+  const loopbackHosts = ["localhost", "127.0.0.1"];
   if (parsed.protocol !== "https:" && !loopbackHosts.includes(parsed.hostname)) {
     return { error: "Use an https:// URL. Plain http is only allowed for localhost." };
   }
   return { parsed, origin: parsed.origin };
 }
 
-function requestProviderOriginPermission(origin) {
-  return browser.permissions.request({ origins: [`${origin}/*`] });
+function requestProviderOriginPermission(parsed) {
+  // WebExtension host match patterns forbid a port, so request protocol+hostname only
+  // (e.g. http://localhost/* for http://localhost:11434/v1).
+  return browser.permissions.request({ origins: [`${parsed.protocol}//${parsed.hostname}/*`] });
 }
 
 function providerEndpoint(baseURL, path) {
@@ -3277,7 +3279,7 @@ async function saveProvider() {
 
   let granted;
   try {
-    granted = await requestProviderOriginPermission(origin);
+    granted = await requestProviderOriginPermission(validation.parsed);
   } catch (error) {
     console.error("Host permission request failed:", error);
     showToast("Could not request permission for that domain.", "error");

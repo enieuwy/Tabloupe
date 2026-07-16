@@ -1168,8 +1168,12 @@ test("saveProvider rejects a non-loopback http:// URL and stores nothing", async
   );
 });
 
-test("saveProvider accepts loopback http:// URLs", async () => {
-  for (const baseURL of ["http://localhost:11434/v1", "http://127.0.0.1:8080/v1"]) {
+test("saveProvider accepts loopback http:// URLs and requests a port-less host pattern", async () => {
+  const cases = [
+    { baseURL: "http://localhost:11434/v1", origin: "http://localhost/*" },
+    { baseURL: "http://127.0.0.1:8080/v1", origin: "http://127.0.0.1/*" },
+  ];
+  for (const { baseURL, origin } of cases) {
     const harness = createHarness();
     await settle();
 
@@ -1183,6 +1187,8 @@ test("saveProvider accepts loopback http:// URLs", async () => {
     await settle();
 
     assert.deepEqual(harness.storageData.aiProvider, { kind: "custom", baseURL, model: "m", apiKey: "k" });
+    assert.equal(harness.permissionRequests.length, 1);
+    assert.equal(harness.permissionRequests[0].origins[0], origin);
   }
 });
 

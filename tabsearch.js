@@ -909,26 +909,30 @@ function dropAtPosition(tabIds, index, placeAfter) {
   moveOntoPosition(tabIds, anchor.windowId, anchor.id, placeAfter, groupId);
 }
 
-async function moveOntoPosition(tabIds, windowId, anchorId, placeAfter, groupId) {
+function moveOntoPosition(tabIds, windowId, anchorId, placeAfter, groupId) {
   if (!Array.isArray(tabIds) || tabIds.length === 0) return;
-  try {
-    const refreshed = await browser.runtime.sendMessage({
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({
       type: "tabsearch-move",
       tabIds,
       windowId,
       anchorId,
       placeAfter,
       groupId,
-    });
-    if (Array.isArray(refreshed)) {
-      allTabs = prepareTabsForSearch(refreshed);
-      clearMarks();
-      pruneMarked();
-    }
-  } catch (error) {
-    actionMessage = "Could not move tabs.";
-  }
-  if (isOpen()) render(inputEl.value);
+    }),
+    {
+      onResult(refreshed) {
+        if (Array.isArray(refreshed)) {
+          allTabs = prepareTabsForSearch(refreshed);
+          clearMarks();
+          pruneMarked();
+        }
+      },
+      onError() {
+        actionMessage = "Could not move tabs.";
+      },
+    },
+  );
 }
 
 function renderPreview() {
@@ -1035,21 +1039,25 @@ function makeGroupHeader(tab, count) {
   return header;
 }
 
-async function groupOntoExisting(tabIds, groupId, windowId) {
+function groupOntoExisting(tabIds, groupId, windowId) {
   if (!Array.isArray(tabIds) || tabIds.length === 0) return;
-  try {
-    const result = await browser.runtime.sendMessage({ type: "tabsearch-group", tabIds, groupId, windowId });
-    if (result && result.ok) {
-      if (Array.isArray(result.list)) allTabs = prepareTabsForSearch(result.list);
-      clearMarks();
-      pruneMarked();
-    } else {
-      actionMessage = (result && (result.message || result.error)) || "Could not group tabs.";
-    }
-  } catch (error) {
-    actionMessage = "Could not group tabs.";
-  }
-  if (isOpen()) render(inputEl.value);
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type: "tabsearch-group", tabIds, groupId, windowId }),
+    {
+      onResult(result) {
+        if (result && result.ok) {
+          if (Array.isArray(result.list)) allTabs = prepareTabsForSearch(result.list);
+          clearMarks();
+          pruneMarked();
+        } else {
+          actionMessage = (result && (result.message || result.error)) || "Could not group tabs.";
+        }
+      },
+      onError() {
+        actionMessage = "Could not group tabs.";
+      },
+    },
+  );
 }
 
 function makeFavFallback() {
@@ -1486,70 +1494,98 @@ function activate(item) {
   );
 }
 
-async function closeTab(tab) {
-  try {
-    const refreshed = await browser.runtime.sendMessage({ type: "tabsearch-close", tabId: tab.id });
-    if (Array.isArray(refreshed)) allTabs = prepareTabsForSearch(refreshed);
-  } catch (error) {
-    allTabs = allTabs.filter((candidate) => candidate.id !== tab.id);
-  }
-  if (isOpen()) render(inputEl.value);
-}
-
-async function runBulkListAction(type, payload) {
+// Runs a list-refreshing action under the reopen/out-of-order guard: captures the
+// overlay generation and action sequence before the round-trip and drops the result
+// (no state writes, no render) when a close+reopen or a newer action superseded it.
+async function runGuardedListAction(send, { onResult, onError } = {}) {
   const gen = overlayGen;
   const seq = (latestActionSeq += 1);
   try {
-    const refreshed = await browser.runtime.sendMessage({ type, ...payload });
-    // A newer action or a reopen superseded this one; drop the stale result.
+    const result = await send();
     if (gen !== overlayGen || seq !== latestActionSeq) return;
-    if (Array.isArray(refreshed)) {
-      allTabs = prepareTabsForSearch(refreshed);
-      clearMarks();
-      pruneMarked();
-    }
+    if (onResult) onResult(result);
   } catch (error) {
     if (gen !== overlayGen || seq !== latestActionSeq) return;
-    actionMessage = "Action failed.";
+    if (onError) onError(error);
   }
   if (isOpen()) render(inputEl.value);
 }
 
-async function submitManualGroup(tabIds, title, windowId) {
+function closeTab(tab) {
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type: "tabsearch-close", tabId: tab.id }),
+    {
+      onResult(refreshed) {
+        if (Array.isArray(refreshed)) allTabs = prepareTabsForSearch(refreshed);
+      },
+      onError() {
+        allTabs = allTabs.filter((candidate) => candidate.id !== tab.id);
+      },
+    },
+  );
+}
+
+function runBulkListAction(type, payload) {
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type, ...payload }),
+    {
+      onResult(refreshed) {
+        if (Array.isArray(refreshed)) {
+          allTabs = prepareTabsForSearch(refreshed);
+          clearMarks();
+          pruneMarked();
+        }
+      },
+      onError() {
+        actionMessage = "Action failed.";
+      },
+    },
+  );
+}
+
+function submitManualGroup(tabIds, title, windowId) {
   if (!title) {
     actionMessage = "Enter a group name.";
     render(inputEl.value);
     return;
   }
-  try {
-    const result = await browser.runtime.sendMessage({ type: "tabsearch-group", tabIds, title, windowId });
-    if (result && result.ok) {
-      if (Array.isArray(result.list)) allTabs = prepareTabsForSearch(result.list);
-      clearMarks();
-      pruneMarked();
-    } else {
-      actionMessage = (result && (result.message || result.error)) || "Could not group tabs.";
-    }
-  } catch (error) {
-    actionMessage = "Could not group tabs.";
-  }
-  if (isOpen()) render(inputEl.value);
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type: "tabsearch-group", tabIds, title, windowId }),
+    {
+      onResult(result) {
+        if (result && result.ok) {
+          if (Array.isArray(result.list)) allTabs = prepareTabsForSearch(result.list);
+          clearMarks();
+          pruneMarked();
+        } else {
+          actionMessage = (result && (result.message || result.error)) || "Could not group tabs.";
+        }
+      },
+      onError() {
+        actionMessage = "Could not group tabs.";
+      },
+    },
+  );
 }
 
-async function previewAiGroups(windowId) {
+function previewAiGroups(windowId) {
   const tabIds = markedTabs().map((tab) => tab.id);
-  try {
-    const result = await browser.runtime.sendMessage({ type: "tabsearch-ai-preview", windowId, tabIds });
-    if (result && result.ok) {
-      previewState = { windowId, groups: result.groups || [] };
-      actionMessage = "";
-    } else {
-      actionMessage = (result && (result.message || result.error)) || "Could not preview AI groups.";
-    }
-  } catch (error) {
-    actionMessage = "Could not preview AI groups.";
-  }
-  if (isOpen()) render(inputEl.value);
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type: "tabsearch-ai-preview", windowId, tabIds }),
+    {
+      onResult(result) {
+        if (result && result.ok) {
+          previewState = { windowId, groups: result.groups || [] };
+          actionMessage = "";
+        } else {
+          actionMessage = (result && (result.message || result.error)) || "Could not preview AI groups.";
+        }
+      },
+      onError() {
+        actionMessage = "Could not preview AI groups.";
+      },
+    },
+  );
 }
 
 async function applyAiPreview() {

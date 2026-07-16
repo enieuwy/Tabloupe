@@ -1356,6 +1356,36 @@ test("a stale in-flight list does not repaint a reopened overlay", async () => {
   await settle();
   assert.deepEqual(rowTitles(harness), ["FreshTab"]);
 });
+test("a stale closeTab response does not repaint a reopened overlay", async () => {
+  const closeResolvers = [];
+  const STALE = [{ id: 1, windowId: 1, title: "StaleClose", url: "https://stale.example", currentWindow: true }];
+  const FRESH = [{ id: 2, windowId: 1, title: "FreshTab", url: "https://fresh.example", currentWindow: true }];
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return FRESH.slice();
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    if (message.type === "tabsearch-close") return new Promise((resolve) => closeResolvers.push(resolve));
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+
+  pressCtrlS(harness); // open #1
+  await settle();
+
+  // Start a close whose refreshed-list response stays pending.
+  harness.window.closeTab({ id: 2 });
+  await settle();
+
+  pressCtrlS(harness); // close the overlay while the close response is in flight
+  await settle();
+  pressCtrlS(harness); // reopen — the fresh list renders
+  await settle();
+  assert.deepEqual(rowTitles(harness), ["FreshTab"]);
+
+  // The stale close response resolves after the reopen; it must be discarded.
+  closeResolvers[0](STALE);
+  await settle();
+  assert.deepEqual(rowTitles(harness), ["FreshTab"], "stale closeTab response must not repaint the reopened overlay");
+});
 
 test("out-of-order bulk refreshes keep the latest-issued list", async () => {
   const bulkResolvers = [];
