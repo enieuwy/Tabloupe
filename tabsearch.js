@@ -154,8 +154,10 @@ function scheduleHistoryFetch(query) {
       historyQuery = trimmed;
       render(inputEl.value);
     } catch (error) {
-      historyResults = [];
+      // Check staleness BEFORE mutating shared state: an older query's failure
+      // must not clear results that belong to the current query.
       if (!inputEl || inputEl.value.trim() !== trimmed) return;
+      historyResults = [];
       historyQuery = trimmed;
       render(inputEl.value);
     }
@@ -1475,8 +1477,12 @@ function activate(item) {
   } else {
     message = { type: "tabsearch-activate", tabId: item.id, windowId: item.windowId };
   }
+  const gen = overlayGen;
   browser.runtime.sendMessage(message).then(
     (result) => {
+      // A close+reopen while this action was in flight starts a new session;
+      // never close or repaint it with a stale completion.
+      if (gen !== overlayGen) return;
       // A resolved {ok:false} is a real backend failure (e.g. the tab was
       // closed, or the URL/search could not open). Surface it and keep the
       // overlay open instead of closing as if the action succeeded.
@@ -1488,6 +1494,7 @@ function activate(item) {
       closeOverlay();
     },
     () => {
+      if (gen !== overlayGen) return;
       actionMessage = "Action failed.";
       if (isOpen()) render(inputEl.value);
     }
@@ -1595,14 +1602,19 @@ async function applyAiPreview() {
     color: group.color,
     tabs: group.tabs.map((tab) => ({ id: tab.id })),
   }));
+  const gen = overlayGen;
   try {
     const result = await browser.runtime.sendMessage({ type: "ai-group-apply", windowId: previewState.windowId, groups });
+    // A close+reopen while applying starts a new session; never close or repaint
+    // it with this stale completion.
+    if (gen !== overlayGen) return;
     if (result && result.ok) {
       closeOverlay();
       return;
     }
     actionMessage = (result && (result.message || result.error)) || "Could not apply AI groups.";
   } catch (error) {
+    if (gen !== overlayGen) return;
     actionMessage = "Could not apply AI groups.";
   }
   previewState = null;

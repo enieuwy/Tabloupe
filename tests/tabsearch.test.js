@@ -841,6 +841,43 @@ test("history rows render before the web row", async () => {
   );
   assert.equal(cappedActionRows[cappedActionRows.length - 1].querySelector(".name").textContent, "Search the web");
 });
+
+test("an older history query's late failure does not clear newer results", async () => {
+  let rejectStale;
+  const stalePending = new Promise((_, reject) => { rejectStale = reject; });
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-history") {
+      if (message.query === "rust") return stalePending; // stays pending, rejected later
+      if (message.query === "rustlang") {
+        return { ok: true, results: [{ title: "Rustlang Docs", url: "https://rustlang.example/" }] };
+      }
+      return { ok: true, results: [] };
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  // Fire the "rust" fetch (left in flight), then supersede it with "rustlang".
+  await typeTabSearchQuery(harness, "rust");
+  await typeTabSearchQuery(harness, "rustlang");
+
+  const hasRustlang = () => Array.from(overlayRoot(harness).querySelectorAll(".row.action-row"))
+    .some((row) => row.querySelector(".name").textContent === "Rustlang Docs");
+  assert.ok(hasRustlang(), "newer query's history is shown");
+
+  // The stale "rust" fetch now fails, after "rustlang" already populated results.
+  rejectStale(new Error("history unavailable"));
+  await settle();
+
+  // Re-render synchronously (input handler renders before the debounced fetch)
+  // to surface the in-memory history state without repopulating it.
+  const input = overlayRoot(harness).querySelector(".search");
+  input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
+  assert.ok(hasRustlang(), "the stale failure must not clear the newer query's results");
+});
 test("sections label open tabs, history, and search", async () => {
   const respond = (message) => {
     if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
@@ -1414,6 +1451,38 @@ test("out-of-order bulk refreshes keep the latest-issued list", async () => {
   await settle();
 
   assert.deepEqual(rowTitles(harness), ["LatestResult"], "the latest-issued action wins regardless of resolution order");
+});
+
+test("a stale activate completion does not close a reopened overlay", async () => {
+  let resolveActivate;
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    if (message.type === "tabsearch-activate") {
+      return new Promise((resolve) => { resolveActivate = resolve; });
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+
+  pressCtrlS(harness); // open session #1
+  await settle();
+  pressKey(harness, "Enter"); // activation left in flight
+  await settle();
+  assert.ok(resolveActivate, "activate request was sent");
+
+  pressKey(harness, "Escape"); // close session #1
+  await settle();
+  assert.equal(overlayRoot(harness), null);
+
+  pressCtrlS(harness); // reopen as session #2
+  await settle();
+  assert.ok(overlayRoot(harness), "overlay reopened");
+
+  // The stale activation resolves now; it must not close the fresh session.
+  resolveActivate({ ok: true });
+  await settle();
+  assert.ok(overlayRoot(harness), "a stale activate completion must not close the reopened overlay");
 });
 
 test("a failed action send surfaces a visible failure message instead of swallowing it", async () => {

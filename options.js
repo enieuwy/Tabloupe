@@ -509,21 +509,40 @@ function mergeLensStateSummaries(lensSummaries) {
     }
   }
 }
-let loadChangedKeys = null;
+// Each loadAll is single-flight by generation: overlapping loads (init, import,
+// storage-driven reloads) must not share one guard. A stale load that resolves
+// after a newer one started drops its snapshot instead of clobbering fresher
+// state, and each load tracks the keys changed during its own await window in a
+// local set so a concurrent storage change is never overwritten.
+let loadGeneration = 0;
+const activeLoadChangeSets = new Set();
 
 async function loadAll() {
-  loadChangedKeys = new Set();
-  const windowId = await currentWindowId();
-  state.windowId = windowId;
-  const [stored, firefoxSnapshot, lensState, containers] = await Promise.all([
-    browser.storage.local.get(STORAGE_KEYS),
-    queryFirefoxGroupSnapshot(),
-    requestLensState(windowId),
-    requestContainers(),
-  ]);
+  const myGen = ++loadGeneration;
+  const changedKeys = new Set();
+  activeLoadChangeSets.add(changedKeys);
+  try {
+    const windowId = await currentWindowId();
+    const [stored, firefoxSnapshot, lensState, containers] = await Promise.all([
+      browser.storage.local.get(STORAGE_KEYS),
+      queryFirefoxGroupSnapshot(),
+      requestLensState(windowId),
+      requestContainers(),
+    ]);
+    // A newer load superseded this one while it awaited; drop the stale snapshot.
+    if (myGen !== loadGeneration) {
+      return;
+    }
+    state.windowId = windowId;
+    await commitLoadedState({ stored, firefoxSnapshot, lensState, containers, changedKeys });
+  } finally {
+    activeLoadChangeSets.delete(changedKeys);
+  }
+}
 
+async function commitLoadedState({ stored, firefoxSnapshot, lensState, containers, changedKeys }) {
   const applyStored = (key, value) => {
-    if (!loadChangedKeys.has(key)) {
+    if (!changedKeys.has(key)) {
       state[key] = value;
     }
   };
@@ -589,7 +608,6 @@ async function loadAll() {
   renderProvider();
   renderGroupingPrompt();
   refreshCommandShortcuts();
-  loadChangedKeys = null;
 }
 
 function clearStatusUndoTimer() {
@@ -1565,19 +1583,29 @@ function scheduleForLens(lensId) {
   };
 }
 
-async function persistLensSchedule(lensId, patch) {
-  const schedules = normalizeLensSchedules(state.lensSchedules);
-  const index = schedules.findIndex((schedule) => schedule.lensId === lensId);
-  const existing = index === -1 ? scheduleForLens(lensId) : schedules[index];
-  const next = { ...existing, ...patch, lensId };
-  if (index === -1) {
-    schedules.push(next);
-  } else {
-    schedules[index] = next;
-  }
-  state.lensSchedules = normalizeLensSchedules(schedules);
-  await browser.storage.local.set({ lensSchedules: state.lensSchedules });
-  render();
+// Schedule writes are serialized and each recomputes from the authoritative
+// stored array, not mutable UI state. Two rapid edits (two lenses, or two
+// fields) otherwise read-modify-write a stale whole-array snapshot and silently
+// revert one another.
+let scheduleWriteQueue = Promise.resolve();
+function persistLensSchedule(lensId, patch) {
+  scheduleWriteQueue = scheduleWriteQueue.catch(() => {}).then(async () => {
+    const stored = await browser.storage.local.get("lensSchedules");
+    const schedules = normalizeLensSchedules(stored.lensSchedules);
+    const index = schedules.findIndex((schedule) => schedule.lensId === lensId);
+    const existing = index === -1 ? scheduleForLens(lensId) : schedules[index];
+    const next = { ...existing, ...patch, lensId };
+    if (index === -1) {
+      schedules.push(next);
+    } else {
+      schedules[index] = next;
+    }
+    const normalized = normalizeLensSchedules(schedules);
+    state.lensSchedules = normalized;
+    await browser.storage.local.set({ lensSchedules: normalized });
+    render();
+  });
+  return scheduleWriteQueue;
 }
 
 function makeScheduleEditor(lens) {
@@ -2760,9 +2788,11 @@ function setupAnchorNav() {
 
 
 function applyStorageChange(changes) {
-  if (loadChangedKeys) {
+  // Record the changed keys for every in-flight load so none of them overwrite
+  // this fresher value with its older snapshot when it commits.
+  for (const changeSet of activeLoadChangeSets) {
     for (const key of Object.keys(changes)) {
-      loadChangedKeys.add(key);
+      changeSet.add(key);
     }
   }
   if (changes.lenses) {
@@ -2862,8 +2892,15 @@ function applyStorageChange(changes) {
   render();
 }
 
+let firefoxGroupsRefreshGen = 0;
 async function refreshFirefoxGroups() {
+  // Focus-triggered refreshes can overlap; stamp each and apply only the latest
+  // snapshot so an older query resolving last cannot repaint stale group state.
+  const myGen = ++firefoxGroupsRefreshGen;
   const snapshot = await queryFirefoxGroupSnapshot();
+  if (myGen !== firefoxGroupsRefreshGen) {
+    return;
+  }
   state.firefoxGroupTitles = snapshot.titles;
   state.firefoxGroupTitleCounts = snapshot.counts;
   state.currentGroups = snapshot.currentGroups;

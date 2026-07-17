@@ -1014,6 +1014,38 @@ test("the lens advanced panel toggles open and closed", async () => {
   assert.equal(card.querySelector(".icon-btn-options").getAttribute("aria-expanded"), "false");
 });
 
+test("editing a schedule preserves a schedule written outside the stale UI snapshot", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lensFixture()],
+      lensSchedules: [
+        { lensId: "lens_work", enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "17:00" },
+      ],
+    },
+  });
+  await settle();
+
+  // A schedule for another lens lands in storage without the Options page's
+  // change listener seeing it, so state.lensSchedules is now stale.
+  harness.storageData.lensSchedules = [
+    { lensId: "lens_work", enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "17:00" },
+    { lensId: "lens_play", enabled: true, days: [0, 6], start: "10:00", end: "12:00" },
+  ];
+
+  lensCard(harness.document).querySelector(".icon-btn-options").click();
+  await settle();
+  const toggle = lensCard(harness.document).querySelector(".schedule-editor .toggle input[type='checkbox']");
+  assert.ok(toggle, "schedule enable toggle is present");
+  toggle.checked = true;
+  toggle.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  await settle();
+
+  const written = harness.storageData.lensSchedules;
+  assert.equal(written.length, 2, "the concurrently-stored lens_play schedule must not be dropped");
+  assert.ok(written.find((schedule) => schedule.lensId === "lens_play"), "lens_play schedule preserved");
+  assert.equal(written.find((schedule) => schedule.lensId === "lens_work").enabled, true);
+});
+
 test("advanced panel shows glob help and icon color editors", async () => {
   const { document } = createHarness({
     storage: { lenses: [lensFixture()] },
@@ -1307,6 +1339,60 @@ test("loadAll keeps a concurrent storage.onChanged update instead of reverting i
     harness.document.getElementById("ai-grouping-prompt").value,
     "NEW prompt via onChanged",
   );
+});
+
+test("a superseded loadAll does not clobber a newer load's committed state", async () => {
+  const harness = createHarness({ storage: { aiGroupingPrompt: "disk value" } });
+  await settle();
+
+  let firstResolve;
+  let getCount = 0;
+  harness.browser.storage.local.get = (keys) => {
+    getCount += 1;
+    if (getCount === 1) {
+      return new Promise((resolve) => { firstResolve = () => resolve({ aiGroupingPrompt: "STALE" }); });
+    }
+    return Promise.resolve({ aiGroupingPrompt: "FRESH" });
+  };
+
+  const first = harness.window.loadAll();      // stale snapshot, read gated
+  await nextTick();
+  const second = harness.window.loadAll();     // newer load reads FRESH and commits
+  await second;
+  firstResolve();                              // the superseded load resolves late
+  await first;
+  await settle();
+
+  assert.equal(harness.document.getElementById("ai-grouping-prompt").value, "FRESH");
+});
+
+test("out-of-order group refreshes apply only the latest snapshot", async () => {
+  const harness = createHarness();
+  await settle();
+
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let queryCount = 0;
+  harness.browser.tabGroups.query = async () => {
+    queryCount += 1;
+    if (queryCount === 1) {
+      await firstGate;
+      return [{ id: 1, title: "Stale", windowId: 7 }];
+    }
+    return [{ id: 2, title: "Fresh", windowId: 7 }];
+  };
+
+  const first = harness.window.refreshFirefoxGroups();  // stale query, gated
+  await nextTick();
+  const second = harness.window.refreshFirefoxGroups(); // fresh query applies
+  await second;
+  releaseFirst();                                       // stale resolves late, dropped
+  await first;
+  await settle();
+
+  const diag = harness.document.getElementById("diag-current-groups").textContent;
+  assert.match(diag, /Fresh/);
+  assert.doesNotMatch(diag, /Stale/);
 });
 
 test("provider test connection lists models and persists successful diagnostics", async () => {

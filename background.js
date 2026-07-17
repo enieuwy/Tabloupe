@@ -77,6 +77,9 @@ let lastError = null;
 let socket = null;
 let reconnectDelay = MIN_RECONNECT_MS;
 let reconnectTimer = null;
+// Storage writes are asynchronous. Keep lifecycle updates ordered so a fast
+// close cannot persist "reconnecting" before an earlier "connected" write.
+let connectionStateUpdateQueue = Promise.resolve();
 let messageQueue = Promise.resolve();
 // Resolves once the one-time legacy->v2 lens migration has finished (or been
 // determined unnecessary). Every lens read/write awaits it so a lens mutation
@@ -98,6 +101,10 @@ let loggedLegacyCreateTabGroup = false;
 // dismiss, window close, or TTL expiry.
 const PROPOSAL_TTL_MS = 5 * 60 * 1000;
 const lastProposalByWindow = new Map();
+// Per-window proposal generation. Bumped on dismiss, apply, and window close so
+// an AI preview that was already computing when the proposal was invalidated
+// cannot repopulate the cache with a stale/just-cleared proposal.
+const proposalGenByWindow = new Map();
 
 // AI previews collapse onto one in-flight request per window so re-opening the
 // popup or clicking Regroup mid-compute can't fan out duplicate daemon/LLM calls.
@@ -109,7 +116,9 @@ const autoGroupCooldown = new Set();
 // compute+commit. The cooldown alone can't serialize runs because on-device
 // clustering can outlive AUTO_GROUP_COOLDOWN_MS, letting a later run start and
 // then fail re-validation ("no_groups") on tabs the first run already grouped.
-const autoGroupInflight = new Set();
+// Maps windowId -> a promise that resolves when the run finishes, so a manual
+// preview can await an auto-group pass instead of racing a second clustering.
+const autoGroupInflight = new Map();
 const windowProfileOverrides = new Map();
 let containersCache = null;
 let containersCacheGen = 0;
@@ -261,13 +270,15 @@ function withGroupingLock(windowId, task) {
     groupingActiveWindows.add(key);
     return task();
   });
+  let tail;
   const released = run.finally(() => {
     groupingActiveWindows.delete(key);
-    if (groupingLocks.get(key) === released) {
+    if (groupingLocks.get(key) === tail) {
       groupingLocks.delete(key);
     }
   });
-  groupingLocks.set(key, released.catch(() => {}));
+  tail = released.catch(() => {});
+  groupingLocks.set(key, tail);
   return run;
 }
 
@@ -375,11 +386,16 @@ function sendBusEnvelope(envelope) {
 }
 
 async function lensStatePayload() {
-  const [activeView, stored, lenses] = await Promise.all([
-    getActiveView(),
-    browser.storage.local.get("lastActivation"),
-    getLenses(),
-  ]);
+  await lensMigrationReady;
+  // One read so activeView, lastActivation, and lenses form a single consistent
+  // snapshot. setActiveView writes activeView + lastActivation in one atomic
+  // set(); separate reads here could interleave with that write and combine
+  // fields from two different activations.
+  const stored = await browser.storage.local.get(["activeView", "lastActivation", "lenses"]);
+  const activeView = isPersistedView(stored.activeView) ? stored.activeView : { kind: "all" };
+  const lenses = Array.isArray(stored.lenses)
+    ? stored.lenses.map(normalizeLens).filter(Boolean)
+    : [];
   const lens = activeView.kind === "lens"
     ? lenses.find((entry) => entry.id === activeView.lensId)
     : null;
@@ -1129,24 +1145,40 @@ async function pushLensSync() {
       await setLensSyncLastError("");
     }
 
+    const setFailed = setOk === false;
+    const removeFailed = removeOk === false;
     if (all) {
-      pendingLensSyncAll = false;
-      pendingLensSyncIds.clear();
-      pendingLensSyncRemovedIds.clear();
-      pendingLensSyncOrder = false;
-      pendingLensSyncPrefs = false;
+      // Only drop the full-push intent once both writes landed; a failed
+      // set/remove must be retried, not silently forgotten (permanent desync).
+      if (!setFailed && !removeFailed) {
+        pendingLensSyncAll = false;
+        pendingLensSyncIds.clear();
+        pendingLensSyncRemovedIds.clear();
+        pendingLensSyncOrder = false;
+        pendingLensSyncPrefs = false;
+      }
     } else {
-      for (const id of idsToPush) pendingLensSyncIds.delete(id);
-      for (const id of removedIds) pendingLensSyncRemovedIds.delete(id);
-      if (pushOrder) pendingLensSyncOrder = false;
-      if (pushPrefs) pendingLensSyncPrefs = false;
+      // Lens items, order, and prefs ride the single set(); removals ride the
+      // single remove(). Clear each group only if its own write succeeded.
+      if (!setFailed) {
+        for (const id of idsToPush) pendingLensSyncIds.delete(id);
+        if (pushOrder) pendingLensSyncOrder = false;
+        if (pushPrefs) pendingLensSyncPrefs = false;
+      }
+      if (!removeFailed) {
+        for (const id of removedIds) pendingLensSyncRemovedIds.delete(id);
+      }
     }
 
     // A local edit landed while we were pushing; the cleanup above may have
     // cleared a flag for an id that was re-queued mid-push. Force a full
-    // follow-up push so that edit is never dropped.
+    // follow-up push so that edit is never dropped. A failed write likewise
+    // leaves its pending items in place -- retry them rather than waiting for
+    // the next local edit.
     if (lensSyncMutationSeq !== startSeq) {
       pendingLensSyncAll = true;
+      scheduleLensSyncPush();
+    } else if (setFailed || removeFailed) {
       scheduleLensSyncPush();
     }
   });
@@ -1156,7 +1188,11 @@ function syncSnapshotsEqual(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-async function pullLensSync() {
+function pullLensSync() {
+  return enqueueLensSync(pullLensSyncQueued);
+}
+
+async function pullLensSyncQueued() {
   if (!lensSyncEnabled || applyingInboundLensSync || !syncStorageArea()) {
     return false;
   }
@@ -1372,13 +1408,21 @@ async function handleScheduleTick(now = new Date()) {
 // The minute tick only exists while at least one schedule is enabled; an
 // unconditional periodic alarm would wake the event page forever for a
 // feature most installs never opt into.
-async function syncScheduleAlarm() {
-  const schedules = await getLensSchedules();
-  if (schedules.some((schedule) => schedule.enabled)) {
-    browser.alarms.create(SCHEDULE_ALARM_NAME, { periodInMinutes: 1 });
-  } else {
-    browser.alarms.clear(SCHEDULE_ALARM_NAME);
-  }
+let scheduleAlarmSyncQueue = Promise.resolve();
+function syncScheduleAlarm() {
+  // Serialize reconciliation and re-read state inside the chain: overlapping
+  // lensSchedules changes must reconcile in commit order so the final
+  // create/clear reflects the latest stored schedules, never a stale read that
+  // lands after a newer one.
+  scheduleAlarmSyncQueue = scheduleAlarmSyncQueue.catch(() => {}).then(async () => {
+    const schedules = await getLensSchedules();
+    if (schedules.some((schedule) => schedule.enabled)) {
+      await browser.alarms.create(SCHEDULE_ALARM_NAME, { periodInMinutes: 1 });
+    } else {
+      await browser.alarms.clear(SCHEDULE_ALARM_NAME);
+    }
+  });
+  return scheduleAlarmSyncQueue;
 }
 
 function titleSelectorMatcher(selectors) {
@@ -1859,6 +1903,9 @@ async function handleSocketFrame(ws, event) {
   }
   if (socketAuthState === BUS_AUTH_STATES.UNAUTHENTICATED) {
     if (msg.type === "hello") {
+      // Claim the handshake before awaiting storage/crypto so a following
+      // daemon frame cannot be treated as an unauthenticated legacy frame.
+      socketAuthState = BUS_AUTH_STATES.AWAITING_AUTH_OK;
       await sendAuthFrame(ws, msg);
       return;
     }
@@ -1900,6 +1947,9 @@ async function connect() {
   socket = ws;
 
   ws.onopen = () => {
+    if (socket !== ws) {
+      return;
+    }
     reconnectDelay = MIN_RECONNECT_MS;
     clearReconnectTimer();
     setConnectionState("connected").catch((error) => {
@@ -2287,6 +2337,7 @@ browser.runtime.onMessage.addListener((message) => {
 if (browser.windows && browser.windows.onRemoved) {
   browser.windows.onRemoved.addListener((windowId) => {
     lastProposalByWindow.delete(windowId);
+    bumpProposalGen(windowId);
     const removedTransient = transientViewsByWindow.delete(windowId);
     const removedProfile = windowProfileOverrides.delete(windowId);
     if (removedTransient || removedProfile) {
@@ -2439,9 +2490,13 @@ async function setFocusBadge(badge) {
   await refreshBadge();
 }
 
-async function setConnectionState(state) {
-  await browser.storage.local.set({ connectionState: state });
-  await refreshBadge();
+function setConnectionState(state) {
+  const update = connectionStateUpdateQueue.catch(() => {}).then(async () => {
+    await browser.storage.local.set({ connectionState: state });
+    await refreshBadge();
+  });
+  connectionStateUpdateQueue = update;
+  return update;
 }
 
 async function setLastError(code, message) {
@@ -2688,6 +2743,23 @@ async function discardCollapsedGroupTabs(groups) {
   }
 
   await Promise.all(Array.from(groupIdsByWindow, async ([windowId, groupIds]) => {
+    // A newer activation may have re-expanded one of these groups between the
+    // collapse and this deferred discard. Re-query group state and never unload
+    // tabs from a group that is visible again.
+    let liveGroups;
+    try {
+      liveGroups = await browser.tabGroups.query({ windowId });
+    } catch (error) {
+      return;
+    }
+    const stillCollapsed = new Set(
+      liveGroups
+        .filter((group) => group.collapsed === true && groupIds.has(group.id))
+        .map((group) => group.id),
+    );
+    if (stillCollapsed.size === 0) {
+      return;
+    }
     let tabs;
     try {
       tabs = await browser.tabs.query({ windowId });
@@ -2696,7 +2768,7 @@ async function discardCollapsedGroupTabs(groups) {
     }
     const ids = tabs
       .filter((tab) => (
-        groupIds.has(tab.groupId) &&
+        stillCollapsed.has(tab.groupId) &&
         !tab.active &&
         !tab.pinned &&
         !tab.audible &&
@@ -3393,22 +3465,35 @@ function matchCreateTabGroupTabs(urls, tabs) {
   return { matchedTabs, skipped };
 }
 
+function noTabsMatchedResult(windowId, skipped) {
+  return {
+    ok: false,
+    groupId: null,
+    windowId,
+    grouped: [],
+    skipped,
+    error: "no_tabs_matched",
+  };
+}
+
 async function createTabGroupFromRequest(request) {
-  const tabs = await collectNormalWindowTabs();
-  const { matchedTabs, skipped } = matchCreateTabGroupTabs(request.urls, tabs);
-  if (matchedTabs.length === 0) {
-    return {
-      ok: false,
-      groupId: null,
-      windowId: request.windowId,
-      grouped: [],
-      skipped,
-      error: "no_tabs_matched",
-    };
+  let targetWindowId = request.windowId;
+  if (targetWindowId === null) {
+    const initialTabs = await collectNormalWindowTabs();
+    const initialMatch = matchCreateTabGroupTabs(request.urls, initialTabs);
+    if (initialMatch.matchedTabs.length === 0) {
+      return noTabsMatchedResult(request.windowId, initialMatch.skipped);
+    }
+    targetWindowId = initialMatch.matchedTabs[0].windowId;
   }
 
-  const targetWindowId = request.windowId !== null ? request.windowId : matchedTabs[0].windowId;
   return withGroupingLock(targetWindowId, async () => {
+    const tabs = await collectNormalWindowTabs();
+    const { matchedTabs, skipped } = matchCreateTabGroupTabs(request.urls, tabs);
+    if (matchedTabs.length === 0) {
+      return noTabsMatchedResult(targetWindowId, skipped);
+    }
+
     const existingByTitle = await tabGroupsByTitle(targetWindowId);
     const targetGroup = existingByTitle.get(request.title) || null;
     const grouped = [];
@@ -3572,6 +3657,17 @@ async function pinTopicsToActiveFocus(topics) {
   }
 }
 
+function bumpProposalGen(windowId) {
+  if (typeof windowId !== "number") {
+    return;
+  }
+  proposalGenByWindow.set(windowId, (proposalGenByWindow.get(windowId) || 0) + 1);
+}
+
+function currentProposalGen(windowId) {
+  return typeof windowId === "number" ? (proposalGenByWindow.get(windowId) || 0) : 0;
+}
+
 function cachedProposal(windowId) {
   const entry = lastProposalByWindow.get(windowId);
   if (!entry) {
@@ -3607,6 +3703,9 @@ async function handleGroupState(windowId) {
 function handleGroupClear(windowId) {
   if (typeof windowId === "number") {
     lastProposalByWindow.delete(windowId);
+    // Invalidate any preview still computing so it cannot repopulate the cache
+    // with the proposal the user just dismissed.
+    bumpProposalGen(windowId);
   }
   return { ok: true };
 }
@@ -3635,10 +3734,22 @@ async function handleGroupPreview(windowId) {
     return existing;
   }
   const work = (async () => {
+    // An auto-group pass may already be clustering this window. Wait for it so
+    // we don't run a second clustering pass over the same tabs; the preview
+    // then covers whatever remains ungrouped.
+    if (typeof windowId === "number") {
+      const auto = autoGroupInflight.get(windowId);
+      if (auto) {
+        await auto.catch(() => {});
+      }
+    }
+    const gen = currentProposalGen(windowId);
     const result = await computeTabGrouping(windowId);
     if (result.ok) {
       await clearLastError();
-      if (typeof windowId === "number") {
+      // Only cache if no dismiss/apply/window-close invalidated this proposal
+      // while it was computing.
+      if (typeof windowId === "number" && currentProposalGen(windowId) === gen) {
         lastProposalByWindow.set(windowId, { groups: result.groups, ts: Date.now() });
       }
     } else {
@@ -3686,6 +3797,9 @@ async function commitTabGroups(windowId, groups, { notify: doNotify = true, surf
     if (pinToActiveLens) await pinTopicsToActiveFocus(outcome.applied);
     if (typeof windowId === "number") {
       lastProposalByWindow.delete(windowId);
+      // Invalidate any preview still computing so it cannot repopulate the
+      // cache after these tabs were just grouped.
+      bumpProposalGen(windowId);
     }
   }
   const message = ok
@@ -3751,7 +3865,9 @@ async function runAutoGroup(windowId) {
   ) {
     return;
   }
-  autoGroupInflight.add(windowId);
+  let resolveInflight;
+  const inflight = new Promise((resolve) => { resolveInflight = resolve; });
+  autoGroupInflight.set(windowId, inflight);
   try {
     if (!(await aiGroupingEnabled())) {
       return;
@@ -3771,6 +3887,7 @@ async function runAutoGroup(windowId) {
     await commitTabGroups(windowId, result.groups, { notify: false, surfaceEmptyError: false, surfaceStatus: false, pinToActiveLens: false });
   } finally {
     autoGroupInflight.delete(windowId);
+    resolveInflight();
   }
 }
 
@@ -3958,12 +4075,33 @@ async function groupTabsFromSearch(tabIds, title, windowId, groupId) {
   // Drag-onto-section: add tabs to an existing group by id — no title needed,
   // and the group's existing title/color are preserved.
   if (typeof groupId === "number") {
-    try {
-      await browser.tabs.group({ groupId, tabIds: validIds });
-    } catch (error) {
-      return { ok: false, error: "group_failed", message: "Could not add tabs to the group.", list: await listTabsForSearch() };
+    // Resolve the group's window so this shares the same per-window transaction
+    // boundary as AI / manual title grouping / bus createTabGroup. A bare
+    // tabs.group() here could interleave with an in-flight grouping pass and
+    // yield nondeterministic final membership.
+    let lockWindowId = typeof windowId === "number" ? windowId : null;
+    if (lockWindowId === null && browser.tabGroups && typeof browser.tabGroups.get === "function") {
+      const info = await browser.tabGroups.get(groupId).catch(() => null);
+      if (info && typeof info.windowId === "number") {
+        lockWindowId = info.windowId;
+      }
     }
-    return { ok: true, list: await listTabsForSearch() };
+    return withGroupingLock(lockWindowId, async () => {
+      // Re-validate inside the lock: the group may have been dissolved by a
+      // concurrent ungroup/close between the drag and acquiring the lock.
+      if (browser.tabGroups && typeof browser.tabGroups.get === "function") {
+        const info = await browser.tabGroups.get(groupId).catch(() => null);
+        if (!info) {
+          return { ok: false, error: "group_failed", message: "Could not add tabs to the group.", list: await listTabsForSearch() };
+        }
+      }
+      try {
+        await browser.tabs.group({ groupId, tabIds: validIds });
+      } catch (error) {
+        return { ok: false, error: "group_failed", message: "Could not add tabs to the group.", list: await listTabsForSearch() };
+      }
+      return { ok: true, list: await listTabsForSearch() };
+    });
   }
   const trimmed = typeof title === "string" ? title.trim() : "";
   if (trimmed === "") {

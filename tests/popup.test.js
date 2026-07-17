@@ -381,6 +381,38 @@ test("persisted last error renders once and clears when AI subview opens", async
   assert.equal(harness.storageData.lastError, null);
 });
 
+test("popup does not clear a newer error that arrives during acknowledgement", async () => {
+  const oldError = { code: "provider-http", message: "Old error", at: 1000, source: "ai" };
+  const newError = { code: "provider-http", message: "New error", at: 2000, source: "ai" };
+  const harness = createHarness({
+    storage: { connectionState: "connected", lastError: oldError },
+    respond: (msg) => {
+      if (msg.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (msg.type === "ai-group-state") return { enabled: false, groupableCount: 0, proposal: null };
+      return {};
+    },
+  });
+
+  // The acknowledgement re-reads lastError before clearing; simulate a newer AI
+  // failure landing between the initial snapshot and that re-read.
+  const realGet = harness.browser.storage.local.get;
+  harness.browser.storage.local.get = async (keys) => {
+    if (keys === "lastError") {
+      harness.storageData.lastError = newError;
+      return { lastError: newError };
+    }
+    return realGet(keys);
+  };
+
+  await settle();
+  await openAi(harness);
+
+  // The newer error must survive (not be clobbered by the stale ack) and surface.
+  assert.deepEqual(harness.storageData.lastError, newError);
+  const connection = harness.document.getElementById("popup-connection");
+  assert.equal(connection.textContent, "New error");
+});
+
 test("persisted last error is preserved when reconnect banner is shown", async () => {
   const message = "Provider returned HTTP 401. Check your API key.";
   const storedError = { code: "provider-http", message, at: Date.now(), source: "ai" };

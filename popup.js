@@ -49,6 +49,13 @@ function renderConnectionStatus(state = connectionStatus) {
   connection.className = "conn";
 }
 
+function sameLastError(a, b) {
+  if (!a || !b) {
+    return a === b;
+  }
+  return a.at === b.at && a.message === b.message;
+}
+
 async function initConnectionStatus() {
   const stored = await browser.storage.local.get(["connectionState", "lastError"]);
   connectionStatus = {
@@ -61,8 +68,18 @@ async function initConnectionStatus() {
     connectionStatus.lastError &&
     connectionStatus.lastError.message;
   if (errorSurfaced) {
-    await browser.storage.local.set({ lastError: null });
-    connectionStatus.lastError = null;
+    // Acknowledge only the error we actually surfaced. A concurrent AI failure
+    // can write a newer lastError between our read and this clear; clobbering
+    // it would hide the new failure from all UI and drop its diagnostic.
+    const current = await browser.storage.local.get("lastError");
+    if (sameLastError(current.lastError || null, connectionStatus.lastError)) {
+      await browser.storage.local.set({ lastError: null });
+      connectionStatus.lastError = null;
+    } else {
+      // A newer error arrived mid-clear; surface it instead of the stale one.
+      connectionStatus.lastError = current.lastError || null;
+      renderConnectionStatus();
+    }
   }
 }
 
