@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icons/icon.svg" alt="Tabloupe" width="120" height="120">
+</p>
+
 # Tabloupe
 
 Save and switch views of your Firefox tab groups. A **lens** is a saved view: switching to it expands the groups you care about and collapses the rest. Tabs stay open — nothing is closed, nothing is lost.
