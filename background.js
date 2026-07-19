@@ -7,6 +7,7 @@ const MIN_RECONNECT_MS = 1000;
 const MAX_RECONNECT_MS = 600000;
 const MIN_RECONNECT_ALARM_MINUTES = 1;
 const OPTIONS_NOTIFICATION_PREFIX = "focus-unmapped-";
+const UNBOUND_APPLE_FOCUS_NOTIFICATION_ID = `${OPTIONS_NOTIFICATION_PREFIX}current`;
 // On-device FoundationModels can take ~1s/tab; a busy window easily exceeds 60s.
 // Cloud backends return in a few seconds. Budget generously — the popup caches
 // per window, so a slow run isn't lost if the user closes the popup.
@@ -1836,7 +1837,7 @@ async function notifyUnboundAppleFocus(rawId) {
     type: "basic",
     title: "Tabloupe",
     message: `Unbound automation mode ${focusName} — open options to bind it to a lens`,
-  }, `${OPTIONS_NOTIFICATION_PREFIX}${rawId}`);
+  }, UNBOUND_APPLE_FOCUS_NOTIFICATION_ID);
 }
 
 async function getLastAppliedAppleFocusId() {
@@ -2345,6 +2346,11 @@ async function handleLensLinkFocus(msg) {
   }
   if (changed) {
     await saveLenses(lenses);
+  }
+  const stored = await browser.storage.local.get("unmappedFocusId");
+  if (stored.unmappedFocusId === focusId) {
+    await browser.notifications.clear(UNBOUND_APPLE_FOCUS_NOTIFICATION_ID);
+    await browser.storage.local.set({ unmappedFocusId: null });
   }
   return { ok: true };
 }
@@ -4631,7 +4637,12 @@ async function openTabSearchOverlay() {
       try {
         await browser.tabs.remove(active.id);
       } catch (removeError) {
-        // Leaving the blank tab is harmless if it can't be removed.
+        await Promise.resolve();
+        try {
+          await browser.tabs.remove(active.id);
+        } catch (retryError) {
+          // The extension tab opened successfully; a permanent cleanup failure is harmless.
+        }
       }
       return { ok: true };
     }

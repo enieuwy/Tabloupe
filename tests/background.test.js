@@ -60,6 +60,7 @@ function createHarness({
   currentWindowId = 1,
   deferFirstGroupUpdate = false,
   failTabMessage = false,
+  failTabRemoveAttempts = 0,
   fetchHandler = null,
   history = [],
   failSearch = false,
@@ -76,6 +77,7 @@ function createHarness({
   const groupState = clone(groups);
   const tabState = clone(tabs);
   const notifications = [];
+  const clearedNotifications = [];
   const tabUpdates = [];
   const openedOptions = [];
   const storageListeners = [];
@@ -107,6 +109,7 @@ function createHarness({
   const searchQueries = [];
   let historyResults = history;
   let nextTabId = Math.max(1000, ...tabState.map((tab) => (typeof tab.id === "number" ? tab.id : 0))) + 1;
+  let remainingTabRemoveFailures = failTabRemoveAttempts;
   const timers = new Map();
   const consoleErrors = [];
   const consoleWarnings = [];
@@ -324,7 +327,9 @@ function createHarness({
         notifications.push(args);
         return args.length === 2 ? args[0] : "generated-notification-id";
       },
-      async clear() {},
+      async clear(notificationId) {
+        clearedNotifications.push(notificationId);
+      },
       onClicked: { addListener: (listener) => clickedListeners.push(listener) },
       onButtonClicked: { addListener: (listener) => buttonClickedListeners.push(listener) },
     },
@@ -429,6 +434,10 @@ function createHarness({
         return id;
       },
       async remove(id) {
+        if (remainingTabRemoveFailures > 0) {
+          remainingTabRemoveFailures -= 1;
+          throw new Error("tab removal failed");
+        }
         const ids = Array.isArray(id) ? id : [id];
         for (const tabId of ids) {
           const index = tabState.findIndex((candidate) => candidate.id === tabId);
@@ -591,6 +600,7 @@ function createHarness({
     groupState,
     tabState,
     notifications,
+    clearedNotifications,
     tabUpdates,
     openedOptions,
     storageListeners,
@@ -1630,8 +1640,36 @@ test("unbound Apple Focus leaves groups untouched and prompts to bind in options
   assert.equal(harness.storageData.lastAction, "unmapped_focus_id");
   assert.equal(harness.storageData.unmappedFocusId, "com.apple.focus.custom");
   assert.equal(harness.notifications.length, 1);
-  assert.equal(harness.notifications[0][0], "focus-unmapped-com.apple.focus.custom");
+  assert.equal(harness.notifications[0][0], "focus-unmapped-current");
   assert.match(harness.notifications[0][1].message, /bind it to a lens/);
+});
+
+test("unbound Apple Focus replaces the prior notice and clears it when the id is linked", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])],
+    },
+  });
+  await settle();
+
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.first" } } });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 1, payload: { focus: { id: "com.apple.focus.second" } } });
+
+  assert.deepEqual(harness.notifications.map(([id]) => id), [
+    "focus-unmapped-current",
+    "focus-unmapped-current",
+  ]);
+  assert.equal(harness.storageData.unmappedFocusId, "com.apple.focus.second");
+
+  const result = await harness.request({
+    type: "lens-link-focus",
+    lensId: "lens_work",
+    focusId: "com.apple.focus.second",
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(harness.clearedNotifications, ["focus-unmapped-current"]);
+  assert.equal(harness.storageData.unmappedFocusId, null);
 });
 
 test("lens-state returns multi-lens savedIn annotations and feature flags", async () => {
@@ -2565,6 +2603,23 @@ test("search-tabs command opens extension search page in a fresh tab from Firefo
   assert.deepEqual(harness.removedTabs, [20]);
   assert.equal(harness.tabUpdates.some((u) => u.id === 20), false);
   assert.equal(harness.notifications.length, 0);
+});
+
+test("search-tabs command retries blank-tab cleanup after a transient removal failure", async () => {
+  const harness = createHarness({
+    currentWindowId: 1,
+    failTabMessage: true,
+    failTabRemoveAttempts: 1,
+    tabs: [{ id: 20, windowId: 1, title: "New Tab", url: "about:newtab", active: true }],
+  });
+  await settle();
+
+  await harness.runCommand("search-tabs");
+  await settle();
+
+  assert.equal(harness.removedTabs.length, 1);
+  assert.equal(harness.removedTabs[0], 20);
+  assert.equal(harness.tabState.some((tab) => tab.id === 20), false);
 });
 
 test("search-tabs command notifies when the page has no content script", async () => {

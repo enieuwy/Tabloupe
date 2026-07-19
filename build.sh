@@ -78,4 +78,13 @@ echo "Packaging and submitting to Mozilla ($CHANNEL)..."
 npx --no-install web-ext sign --channel="$CHANNEL"
 SIGN_SUCCEEDED=true
 
+# Keep only the newest signed artifacts; old XPIs accumulate a full copy of
+# the extension per build and deploy only ever needs the latest one.
+KEEP_ARTIFACTS=5
+if [[ -d web-ext-artifacts ]]; then
+  ls -t web-ext-artifacts/*.xpi 2>/dev/null | tail -n +$((KEEP_ARTIFACTS + 1)) | while IFS= read -r old_xpi; do
+    rm -f "$old_xpi"
+  done
+fi
+
 echo "Done! You can install the new .xpi from ./web-ext-artifacts/ via about:addons"
