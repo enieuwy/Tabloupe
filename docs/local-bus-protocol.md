@@ -78,6 +78,37 @@ All Groups:
 
 The daemon forwards an `activateView` frame received from one authenticated client to all other authenticated clients; it does not interpret the view.
 
+
+## `createTabGroup` / `createTabGroupResult`
+
+Authenticated peers may ask Tabloupe to place matching open tabs into a real Firefox tab group. Tabloupe honors this frame only on authenticated connections; legacy connections ignore it. The daemon forwards both `createTabGroup` and `createTabGroupResult` frames between authenticated clients; it does not interpret the tab URLs, grouping result, or error code.
+
+Request:
+
+```json
+{"type":"createTabGroup","schemaVersion":1,"payload":{"requestId":"0123456789abcdef0123456789abcdef","title":"zotio staging","color":"blue","match":{"urls":["https://example.com/a","https://example.com/b#notes"]},"windowId":null}}
+```
+
+`payload.requestId` is a 32-character lowercase hex string echoed in the result. `title` is required, trimmed, and capped at 128 characters. `color` is optional; when present it must be one of Firefox's tab-group color names (`blue`, `cyan`, `green`, `orange`, `pink`, `purple`, `red`, `yellow`). Invalid or absent colors are omitted from the tab-group update. `match.urls` is required and must contain 1 to 64 URL strings. `windowId` is optional; `null` or absence means Tabloupe uses the window of the first matched tab.
+
+Matching is against normal browser windows only. Tabloupe first matches tabs by exact `tab.url` string. For request URLs with no exact match, it retries with URL fragments stripped from both the requested URL and open tab URLs. If several tabs match one requested URL, all matching tabs are considered. The target window is the supplied `windowId`, or otherwise the window of the first matched tab. Matched tabs in other windows are skipped with `cross_window`; v1 never moves tabs across windows. Pinned tabs are skipped with `pinned`. Tabs already in a different group in the target window are skipped with `already_grouped_elsewhere`.
+
+If a group with the same title already exists in the target window, Tabloupe merges tabs into that group and preserves its existing title and color. Tabs already in that target group count as grouped, making repeated requests idempotent.
+
+Result:
+
+```json
+{"type":"createTabGroupResult","schemaVersion":1,"payload":{"requestId":"0123456789abcdef0123456789abcdef","ok":true,"groupId":123,"windowId":45,"grouped":["https://example.com/a"],"skipped":[{"url":"https://example.com/b#notes","reason":"not_found"}],"error":null}}
+```
+
+`ok` is true when at least one matched tab is in the requested target group after handling the request. `grouped` lists the URLs of tabs that were grouped or were already in the target group. `skipped` entries use one of these stable reasons: `not_found`, `pinned`, `cross_window`, or `already_grouped_elsewhere`.
+
+Stable `error` codes:
+
+- `invalid_payload`: the frame had a usable `requestId` but failed validation.
+- `no_tabs_matched`: no requested tab could be placed in the target group.
+- `group_failed`: Firefox rejected the tab-group operation.
+
 ## `calendarEvents`
 
 Phase 4 consumers use daemon-published active calendar events. Tabloupe ignores this frame in the current phase.
@@ -90,7 +121,7 @@ Phase 4 consumers use daemon-published active calendar events. Tabloupe ignores 
 
 ## Legacy behavior
 
-Old daemons send no `hello` first frame. When Tabloupe sees any other first frame, it marks the connection `legacy (unpaired)`, processes existing `focus`, `focusCatalog`, and `groupTabsResult` frames unchanged, publishes `lensState`, and ignores inbound `activateView`.
+Old daemons (or any peer) send no `hello` first frame. Tabloupe only downgrades to legacy when no `busToken` is stored: it marks the connection `legacy (unpaired)`, processes existing `focus`, `focusCatalog`, and `groupTabsResult` frames unchanged, publishes `lensState`, and ignores inbound `activateView` and `createTabGroup`. If a `busToken` *is* configured, skipping `hello` is a protocol violation — Tabloupe closes the socket and reports `pairing_failed` instead of downgrading, so a peer cannot bypass pairing by omitting the handshake.
 
 Old Tabloupe versions cannot authenticate to a new daemon. The daemon closes those sockets after its auth deadline; users must update and pair.
 

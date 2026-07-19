@@ -97,6 +97,7 @@ function createHarness({
   const commandListeners = [];
   const tabCreatedListeners = [];
   const tabUpdatedListeners = [];
+  const windowRemovedListeners = [];
   const syncSets = [];
   const syncRemoves = [];
   const identityQueries = [];
@@ -176,6 +177,7 @@ function createHarness({
         }
         return { id };
       },
+      onRemoved: { addListener: (listener) => windowRemovedListeners.push(listener) },
     },
     storage: {
       local: {
@@ -622,6 +624,12 @@ function createHarness({
     commandListeners,
     tabCreatedListeners,
     tabUpdatedListeners,
+    windowRemovedListeners,
+    async fireWindowRemoved(windowId) {
+      for (const listener of windowRemovedListeners) {
+        await listener(windowId);
+      }
+    },
     browserActionState,
     browserActionCalls,
     async sendMessage(message) {
@@ -731,6 +739,42 @@ async function authenticatedBusSocket(harness) {
   return socket;
 }
 
+
+function createTabGroupPayload(overrides = {}) {
+  return {
+    requestId: "0123456789abcdef0123456789abcdef",
+    title: "Bus Group",
+    match: { urls: ["https://example.test/"] },
+    ...overrides,
+  };
+}
+
+async function authenticatedCreateTabGroupSocket(harness) {
+  const socket = await authenticatedBusSocket(harness);
+  await settle();
+  harness.sentMessages.length = 0;
+  return socket;
+}
+
+async function sendCreateTabGroupEnvelope(socket, payload) {
+  await sendSocketFrame(socket, {
+    type: "createTabGroup",
+    schemaVersion: 1,
+    payload,
+  });
+}
+
+function createTabGroupResultPayloads(harness) {
+  return harness.sentMessages
+    .filter((frame) => frame.type === "createTabGroupResult")
+    .map((frame) => frame.payload);
+}
+
+function lastCreateTabGroupResultPayload(harness) {
+  const payloads = createTabGroupResultPayloads(harness);
+  assert.ok(payloads.length > 0, "createTabGroupResult frame was sent");
+  return payloads[payloads.length - 1];
+}
 test("badge error indicator takes priority and clears back to focus badge", async () => {
   const harness = createHarness();
   await settle();
@@ -761,6 +805,30 @@ test("connection state tracks websocket open and close", async () => {
   assert.equal(harness.storageData.connectionState, "connected");
 
   harness.sockets[0].close();
+  await settle();
+  assert.equal(harness.storageData.connectionState, "reconnecting");
+});
+
+test("connection state keeps a close update after a delayed open update", async () => {
+  const harness = createHarness();
+  await settle();
+
+  const originalSet = harness.browser.storage.local.set;
+  const delayedOpenWrite = deferred();
+  let connectionWrites = 0;
+  harness.browser.storage.local.set = async (values) => {
+    if (values.connectionState && connectionWrites++ === 0) {
+      delayedOpenWrite.started = true;
+      await delayedOpenWrite.promise;
+    }
+    return originalSet(values);
+  };
+
+  harness.sockets[0].onopen();
+  await waitFor(() => assert.equal(delayedOpenWrite.started, true));
+  harness.sockets[0].close();
+  delayedOpenWrite.resolve();
+
   await settle();
   assert.equal(harness.storageData.connectionState, "reconnecting");
 });
@@ -859,7 +927,7 @@ test("focusCatalog envelope caches the id -> {name, icon, color} table", async (
   const harness = createHarness(twoGroups());
   await settle();
 
-  await harness.context.handleMessage({ data: JSON.stringify({
+  await harness.context.handleMessage({
     type: "focusCatalog",
     schemaVersion: 1,
     ts: 0,
@@ -867,7 +935,7 @@ test("focusCatalog envelope caches the id -> {name, icon, color} table", async (
       "com.apple.focus.work": { name: "Work", icon: "briefcase", color: "#c678dd" },
       "com.apple.focus.custom": { name: "Custom", icon: "target", color: null },
     } },
-  }) });
+  });
 
   assert.deepEqual(harness.storageData.focusCatalog["com.apple.focus.work"], { name: "Work", icon: "briefcase", color: "#c678dd" });
   assert.equal(harness.storageData.focusCatalog["com.apple.focus.custom"].name, "Custom");
@@ -960,12 +1028,12 @@ test("Apple Focus envelope activates the bound lens and records detected modes",
   });
   await settle();
 
-  await harness.context.handleMessage({ data: JSON.stringify({
+  await harness.context.handleMessage({
     type: "focus",
     schemaVersion: 1,
     ts: 0,
     payload: { focus: { id: "com.apple.focus.work", name: "Work", icon: "briefcase", color: "#c678dd" } },
-  }) });
+  });
 
   assert.equal(harness.storageData.lastFocusSeen, "com.apple.focus.work");
   assert.ok(harness.storageData.seenFocusIds["com.apple.focus.work"].firstSeen > 0);
@@ -996,12 +1064,12 @@ test("same-id Apple Focus rebroadcast after manual activation is a no-op", async
   });
   await settle();
 
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.work" } } }) });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.work" } } });
   await harness.request({ type: "lens-activate", windowId: 1, view: { kind: "lens", lensId: "lens_other" } });
   assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, true);
   assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, false);
 
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 1, payload: { focus: { id: "com.apple.focus.work" } } }) });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 1, payload: { focus: { id: "com.apple.focus.work" } } });
 
   assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, true);
   assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, false);
@@ -1028,15 +1096,15 @@ test("Apple Focus off returns to fallback only while automation owns the view", 
   });
   await settle();
 
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.work" } } }) });
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 1, payload: { focus: null } }) });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.work" } } });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 1, payload: { focus: null } });
   assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_other" });
   assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, true);
   assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, false);
 
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 2, payload: { focus: { id: "com.apple.focus.work" } } }) });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 2, payload: { focus: { id: "com.apple.focus.work" } } });
   await harness.request({ type: "lens-activate", windowId: 1, view: { kind: "all" } });
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 3, payload: { focus: null } }) });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 3, payload: { focus: null } });
   assert.deepEqual(harness.storageData.activeView, { kind: "all" });
   assert.equal(harness.groupState.every((group) => group.collapsed === false), true);
 });
@@ -1284,12 +1352,278 @@ test("Malformed Calendar events are ignored without closing the bus", async () =
   assert.deepEqual(harness.consoleErrors, []);
 });
 
+test("createTabGroup ignores legacy sockets and processes authenticated frames", async () => {
+  const payload = createTabGroupPayload({
+    match: { urls: ["https://auth.test/"] },
+  });
+  const legacyHarness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [{ id: 10, windowId: 1, url: "https://auth.test/", groupId: -1 }],
+  });
+  await settle();
+  const legacySocket = legacyHarness.sockets[0];
+  legacySocket.onopen();
+  await settle();
+
+  await sendCreateTabGroupEnvelope(legacySocket, payload);
+
+  assert.equal(legacyHarness.groupCreations.length, 0);
+  assert.equal(createTabGroupResultPayloads(legacyHarness).length, 0);
+
+  const authenticatedHarness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [{ id: 10, windowId: 1, url: "https://auth.test/", groupId: -1 }],
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(authenticatedHarness);
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const result = lastCreateTabGroupResultPayload(authenticatedHarness);
+  assert.equal(result.requestId, payload.requestId);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.grouped, ["https://auth.test/"]);
+  assert.equal(authenticatedHarness.groupCreations.length, 1);
+});
+
+test("createTabGroup validation rejects invalid payloads before grouping", async () => {
+  const cases = [
+    {
+      name: "missing title",
+      payload: {
+        requestId: "11111111111111111111111111111111",
+        match: { urls: ["https://valid.test/"] },
+      },
+    },
+    {
+      name: "empty urls",
+      payload: createTabGroupPayload({
+        requestId: "22222222222222222222222222222222",
+        match: { urls: [] },
+      }),
+    },
+    {
+      name: "too many urls",
+      payload: createTabGroupPayload({
+        requestId: "33333333333333333333333333333333",
+        match: { urls: Array.from({ length: 65 }, (_, index) => `https://many.test/${index}`) },
+      }),
+    },
+    {
+      name: "non-string url",
+      payload: createTabGroupPayload({
+        requestId: "44444444444444444444444444444444",
+        match: { urls: ["https://valid.test/", 42] },
+      }),
+    },
+  ];
+
+  for (const { name, payload } of cases) {
+    const harness = createHarness({
+      storage: { busToken: BUS_TOKEN },
+      tabs: [{ id: 10, windowId: 1, url: "https://valid.test/", groupId: -1 }],
+    });
+    await settle();
+    const socket = await authenticatedCreateTabGroupSocket(harness);
+
+    await sendCreateTabGroupEnvelope(socket, payload);
+
+    const result = lastCreateTabGroupResultPayload(harness);
+    assert.equal(result.requestId, payload.requestId, name);
+    assert.equal(result.ok, false, name);
+    assert.equal(result.error, "invalid_payload", name);
+    assert.deepEqual(result.grouped, [], name);
+    assert.deepEqual(result.skipped, [], name);
+    assert.equal(harness.groupCreations.length, 0, name);
+  }
+});
+
+test("createTabGroup matches exact and fragmentless URLs and skips unsuitable tabs", async () => {
+  const harness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [
+      { id: 10, windowId: 1, url: "https://exact.test/", groupId: -1 },
+      { id: 11, windowId: 1, url: "https://fragment.test/path#open", groupId: -1 },
+      { id: 12, windowId: 1, url: "https://pinned.test/", groupId: -1, pinned: true },
+      { id: 13, windowId: 2, url: "https://other-window.test/", groupId: -1 },
+    ],
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(harness);
+  const payload = createTabGroupPayload({
+    requestId: "55555555555555555555555555555555",
+    match: {
+      urls: [
+        "https://exact.test/",
+        "https://fragment.test/path#request",
+        "https://missing.test/",
+        "https://pinned.test/",
+        "https://other-window.test/",
+      ],
+    },
+  });
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const result = lastCreateTabGroupResultPayload(harness);
+  assert.equal(result.requestId, payload.requestId);
+  assert.equal(result.ok, true);
+  assert.equal(result.windowId, 1);
+  assert.deepEqual(result.grouped, [
+    "https://exact.test/",
+    "https://fragment.test/path#open",
+  ]);
+  assert.deepEqual(result.skipped, [
+    { url: "https://missing.test/", reason: "not_found" },
+    { url: "https://pinned.test/", reason: "pinned" },
+    { url: "https://other-window.test/", reason: "cross_window" },
+  ]);
+  assert.deepEqual(harness.groupCreations, [{ id: result.groupId, tabIds: [10, 11] }]);
+});
+
+test("createTabGroup revalidates tabs after waiting for the window lock", async () => {
+  const harness = createHarness({
+    tabs: [{ id: 10, windowId: 1, url: "https://shared.test/", groupId: -1 }],
+  });
+  await settle();
+
+  const originalQuery = harness.browser.tabGroups.query;
+  const firstGroupQuery = deferred();
+  let groupQueries = 0;
+  harness.browser.tabGroups.query = async (query) => {
+    if (groupQueries++ === 0) {
+      firstGroupQuery.started = true;
+      await firstGroupQuery.promise;
+    }
+    return originalQuery(query);
+  };
+
+  const first = harness.context.createTabGroupFromRequest({
+    title: "First",
+    color: null,
+    urls: ["https://shared.test/"],
+    windowId: 1,
+  });
+  await waitFor(() => assert.equal(firstGroupQuery.started, true));
+  const second = harness.context.createTabGroupFromRequest({
+    title: "Second",
+    color: null,
+    urls: ["https://shared.test/"],
+    windowId: 1,
+  });
+  firstGroupQuery.resolve();
+
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult.ok, true);
+  assert.equal(secondResult.ok, false);
+  assert.deepEqual(clone(secondResult.skipped), [{ url: "https://shared.test/", reason: "already_grouped_elsewhere" }]);
+  assert.equal(harness.groupState.length, 1);
+  assert.equal(harness.groupState[0].title, "First");
+  assert.equal(vm.runInContext("groupingLocks.size", harness.context), 0);
+});
+
+test("createTabGroup respects an explicit target window", async () => {
+  const harness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [
+      { id: 10, windowId: 1, url: "https://wrong-window.test/", groupId: -1 },
+      { id: 20, windowId: 2, url: "https://target-window.test/", groupId: -1 },
+    ],
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(harness);
+  const payload = createTabGroupPayload({
+    requestId: "66666666666666666666666666666666",
+    windowId: 2,
+    match: { urls: ["https://wrong-window.test/", "https://target-window.test/"] },
+  });
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const result = lastCreateTabGroupResultPayload(harness);
+  assert.equal(result.requestId, payload.requestId);
+  assert.equal(result.ok, true);
+  assert.equal(result.windowId, 2);
+  assert.deepEqual(result.grouped, ["https://target-window.test/"]);
+  assert.deepEqual(result.skipped, [
+    { url: "https://wrong-window.test/", reason: "cross_window" },
+  ]);
+  assert.deepEqual(harness.groupCreations, [{ id: result.groupId, tabIds: [20] }]);
+});
+
+test("createTabGroup merges same-title groups and is idempotent for tabs already in the target group", async () => {
+  const groupFailTabIds = [];
+  const harness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    groups: [{ id: 42, windowId: 1, title: "Bus Group", color: "red", collapsed: false }],
+    tabs: [
+      { id: 10, windowId: 1, url: "https://new.test/", groupId: -1 },
+      { id: 11, windowId: 1, url: "https://already.test/", groupId: 42 },
+    ],
+    groupFailTabIds,
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(harness);
+  const payload = createTabGroupPayload({
+    requestId: "77777777777777777777777777777777",
+    match: { urls: ["https://new.test/", "https://already.test/"] },
+  });
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const first = lastCreateTabGroupResultPayload(harness);
+  assert.equal(first.requestId, payload.requestId);
+  assert.equal(first.ok, true);
+  assert.equal(first.groupId, 42);
+  assert.deepEqual(first.grouped, ["https://already.test/", "https://new.test/"]);
+  assert.deepEqual(first.skipped, []);
+  assert.deepEqual(harness.groupCreations, [{ id: 42, tabIds: [10], merged: true }]);
+  assert.equal(harness.groupState.find((group) => group.id === 42).color, "red");
+
+  groupFailTabIds.push(10, 11);
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const second = lastCreateTabGroupResultPayload(harness);
+  assert.equal(second.requestId, payload.requestId);
+  assert.equal(second.ok, true);
+  assert.equal(second.groupId, 42);
+  assert.deepEqual(second.grouped, ["https://new.test/", "https://already.test/"]);
+  assert.deepEqual(second.skipped, []);
+  assert.equal(harness.groupCreations.length, 1);
+});
+
+test("createTabGroup reports no_tabs_matched with exact result arrays when every URL is absent", async () => {
+  const harness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [{ id: 10, windowId: 1, url: "https://other.test/", groupId: -1 }],
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(harness);
+  const payload = createTabGroupPayload({
+    requestId: "88888888888888888888888888888888",
+    match: { urls: ["https://missing.test/"] },
+  });
+
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  assert.deepEqual(lastCreateTabGroupResultPayload(harness), {
+    requestId: payload.requestId,
+    ok: false,
+    groupId: null,
+    windowId: null,
+    grouped: [],
+    skipped: [{ url: "https://missing.test/", reason: "not_found" }],
+    error: "no_tabs_matched",
+  });
+  assert.equal(harness.groupCreations.length, 0);
+});
+
 test("unbound Apple Focus leaves groups untouched and prompts to bind in options", async () => {
   const fixture = twoGroups();
   const harness = createHarness(fixture);
   await settle();
 
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.custom" } } }) });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.custom" } } });
 
   assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, true);
   assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, false);
@@ -1341,8 +1675,8 @@ test("non-focus state envelopes are ignored", async () => {
   });
   await settle();
 
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.work" } } }) });
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "bluetooth", schemaVersion: 1, ts: 1, payload: { available: true, devices: [] } }) });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.work" } } });
+  await harness.context.handleMessage({ type: "bluetooth", schemaVersion: 1, ts: 1, payload: { available: true, devices: [] } });
 
   assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, false);
   assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
@@ -1623,6 +1957,10 @@ test("AI apply creates titled, colored groups via tabs.group", async () => {
   assert.equal(work.color, "blue");
   assert.equal(harness.tabState.find((tab) => tab.id === 10).groupId, work.id);
   assert.equal(harness.tabState.find((tab) => tab.id === 11).groupId, work.id);
+  const play = harness.groupState.find((group) => group.title === "Play");
+  assert.ok(play);
+  assert.equal(play.color, "green");
+  assert.equal(harness.tabState.find((tab) => tab.id === 12).groupId, play.id);
 });
 
 test("AI apply refuses when the feature is disabled", async () => {
@@ -1653,7 +1991,7 @@ test("grouping responses are not mistaken for Apple Focus updates", async () => 
   assert.equal(harness.storageData.lastFocusSeen, undefined);
   assert.equal(harness.storageData.lastAction, undefined);
 
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.work" } } }) });
+  await harness.context.handleMessage({ type: "focus", schemaVersion: 1, ts: 0, payload: { focus: { id: "com.apple.focus.work" } } });
   assert.equal(harness.storageData.lastAction, "applied");
 });
 
@@ -2973,7 +3311,7 @@ test("window profile overrides automation per window", async () => {
   await settle();
 
   await harness.request({ type: "window-profile-set", windowId: 2, profile: { kind: "lens", lensId: "lens_personal" } });
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", payload: { focus: { id: "com.apple.focus.work" } } }) });
+  await harness.context.handleMessage({ type: "focus", payload: { focus: { id: "com.apple.focus.work" } } });
 
   assert.equal(harness.groupState.find((group) => group.id === 1).collapsed, false);
   assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, true);
@@ -3138,7 +3476,7 @@ test("focus-off fallback fires after event-page restart using the persisted appl
 
   // Fresh page after suspension: only storage survives. A focus-off frame must
   // still apply the automation fallback and clear the persisted key.
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", payload: { focus: null } }) });
+  await harness.context.handleMessage({ type: "focus", payload: { focus: null } });
 
   assert.deepEqual(harness.storageData.activeView, { kind: "all" });
   assert.equal(harness.storageData.lastAppliedAppleFocusId, null);
@@ -3167,7 +3505,7 @@ test("same-id focus replay after restart is ignored when the last activation was
   });
   await settle();
 
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", payload: { focus: { id: "com.apple.focus.work" } } }) });
+  await harness.context.handleMessage({ type: "focus", payload: { focus: { id: "com.apple.focus.work" } } });
 
   assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_other" });
 });
@@ -3243,7 +3581,7 @@ test("a focus frame with a __proto__ id pollutes neither seen ids nor Object.pro
   const harness = createHarness();
   await settle();
 
-  await harness.context.handleMessage({ data: JSON.stringify({ type: "focus", payload: { focus: { id: "__proto__", name: "Evil" } } }) });
+  await harness.context.handleMessage({ type: "focus", payload: { focus: { id: "__proto__", name: "Evil" } } });
 
   assert.equal(harness.storageData.seenFocusIds, undefined);
   assert.equal(harness.storageData.focusCatalog, undefined);
@@ -3254,10 +3592,10 @@ test("a focusCatalog frame with a __proto__ entry id is skipped", async () => {
   const harness = createHarness();
   await settle();
 
-  await harness.context.handleMessage({ data: JSON.stringify({
+  await harness.context.handleMessage({
     type: "focusCatalog",
     payload: { entries: { "__proto__": { name: "Evil", icon: "x", color: "#ffffff" } } },
-  }) });
+  });
 
   assert.equal(harness.storageData.focusCatalog, undefined);
   assert.equal(({}).name, undefined);
@@ -3360,6 +3698,42 @@ test("discardCollapsedTabs discards only eligible tabs in newly collapsed groups
   assert.equal(result.ok, true);
   assert.equal(harness.tabState.find((tab) => tab.id === 20).discarded, true);
   assert.equal(harness.tabState.find((tab) => tab.id === 30).discarded, undefined);
+});
+
+test("discardCollapsedTabs skips a group re-expanded before the deferred discard runs", async () => {
+  const harness = createHarness({
+    storage: {
+      discardCollapsedTabs: true,
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: true, url: "https://work.test" },
+      { id: 20, windowId: 1, groupId: 2, active: false, url: "https://eligible.test" },
+    ],
+  });
+  await settle();
+
+  // The deferred discard re-queries group state via a windowId-scoped call.
+  // Simulate a newer activation re-expanding "Other" right before that read.
+  const realQuery = harness.browser.tabGroups.query;
+  harness.browser.tabGroups.query = async (query = {}) => {
+    if (typeof query.windowId === "number") {
+      const other = harness.groupState.find((group) => group.id === 2);
+      if (other) other.collapsed = false;
+    }
+    return realQuery(query);
+  };
+
+  const result = await harness.request({ type: "lens-activate", view: { kind: "lens", lensId: "lens_work" } });
+  await settle();
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(harness.discardedTabs, []);
+  assert.equal(harness.tabState.find((tab) => tab.id === 20).discarded, undefined);
 });
 
 test("discardCollapsedTabs absent leaves newly collapsed tabs loaded", async () => {
@@ -3497,6 +3871,50 @@ test("lens sync pushes edited lenses and lens order to storage.sync when enabled
   assert.ok(harness.syncSets.some((values) => values["lens/lens_sync"] && values.lensOrder));
 });
 
+test("lens sync retries pending edits after a failed storage.sync write", async () => {
+  const localLens = lens("lens_sync", "Sync me", [{ type: "title", value: "Sync" }]);
+  const harness = createHarness({
+    storage: { syncLenses: true, lenses: [localLens] },
+    storageSync: {},
+  });
+  await waitFor(() => assert.ok(harness.syncData.lensOrder));
+  harness.syncSets.length = 0;
+
+  const realSet = harness.browser.storage.sync.set;
+  let failNextSet = true;
+  harness.browser.storage.sync.set = async (values) => {
+    if (failNextSet) {
+      failNextSet = false;
+      throw new Error("sync unavailable");
+    }
+    return realSet(values);
+  };
+
+  await harness.request({
+    type: "lens-update",
+    lensId: "lens_sync",
+    patch: { name: "Synced name" },
+  });
+  await settle();
+
+  const firstTimer = [...harness.timers.entries()].find(([, entry]) => entry.delay === 2000);
+  assert.ok(firstTimer, "initial push is debounced");
+  harness.runTimer(firstTimer[0]);
+  await settle();
+
+  // The write failed, so the new name must NOT be persisted yet and a retry
+  // must be queued rather than the pending state being cleared.
+  assert.equal(harness.syncData["lens/lens_sync"].lens.name, "Sync me");
+  const retryTimer = [...harness.timers.entries()].find(([, entry]) => entry.delay === 2000);
+  assert.ok(retryTimer, "a retry push is scheduled after the failed write");
+
+  harness.runTimer(retryTimer[0]);
+  await waitFor(() => assert.equal(
+    harness.syncData["lens/lens_sync"] && harness.syncData["lens/lens_sync"].lens.name,
+    "Synced name",
+  ));
+});
+
 test("lens sync applies newer inbound lenses, ignores older inbound lenses, and stays quiet when disabled", async () => {
   const localLens = { ...lens("lens_sync", "Local", [{ type: "title", value: "Local" }]), updatedAt: 1000 };
   const harness = createHarness({
@@ -3529,6 +3947,53 @@ test("lens sync applies newer inbound lenses, ignores older inbound lenses, and 
   await settle();
   assert.deepEqual(disabled.syncSets, []);
   assert.deepEqual(disabled.syncData, {});
+});
+
+test("lens sync applies the newest snapshot after concurrent inbound pulls", async () => {
+  const localLens = { ...lens("lens_sync", "Local", [{ type: "title", value: "Local" }]), updatedAt: 1000 };
+  const harness = createHarness({
+    storage: { syncLenses: true, lenses: [localLens], lensSyncMeta: { lensOrderUpdatedAt: 1000 } },
+    storageSync: { lensOrder: { ids: ["lens_sync"], updatedAt: 1000 } },
+  });
+  await settle();
+
+  const oldRemote = {
+    lensOrder: { ids: ["lens_sync"], updatedAt: 2000 },
+    "lens/lens_sync": { lens: { ...localLens, name: "Older remote", updatedAt: 2000 }, schedule: null },
+  };
+  const newRemote = {
+    lensOrder: { ids: ["lens_sync"], updatedAt: 3000 },
+    "lens/lens_sync": { lens: { ...localLens, name: "Newer remote", updatedAt: 3000 }, schedule: null },
+  };
+  const originalSyncGet = harness.browser.storage.sync.get;
+  let pullCount = 0;
+  harness.browser.storage.sync.get = async (keys) => {
+    if (keys === null || keys === undefined) {
+      pullCount += 1;
+      return clone(pullCount === 1 ? oldRemote : newRemote);
+    }
+    return originalSyncGet(keys);
+  };
+
+  const originalLocalSet = harness.browser.storage.local.set;
+  const delayedOldWrite = deferred();
+  let inboundWrites = 0;
+  harness.browser.storage.local.set = async (values) => {
+    if (values.lenses && inboundWrites++ === 0) {
+      delayedOldWrite.started = true;
+      await delayedOldWrite.promise;
+    }
+    return originalLocalSet(values);
+  };
+
+  for (const listener of harness.storageListeners) {
+    listener({ "lens/lens_sync": { oldValue: null, newValue: oldRemote["lens/lens_sync"] } }, "sync");
+    listener({ "lens/lens_sync": { oldValue: oldRemote["lens/lens_sync"], newValue: newRemote["lens/lens_sync"] } }, "sync");
+  }
+  await waitFor(() => assert.equal(delayedOldWrite.started, true));
+  delayedOldWrite.resolve();
+
+  await waitFor(() => assert.equal(harness.storageData.lenses[0].name, "Newer remote"));
 });
 
 test("bus pairing authenticates hello, handles focus and activateView envelopes, and publishes lensState", async () => {
@@ -3582,6 +4047,44 @@ test("bus pairing authenticates hello, handles focus and activateView envelopes,
       lastActivation: harness.storageData.lastActivation,
     },
   });
+});
+
+test("a frame arriving during token lookup does not break the handshake", async () => {
+  const harness = createHarness({ storage: { busToken: BUS_TOKEN } });
+  await settle();
+
+  const originalGet = harness.browser.storage.local.get;
+  const tokenRead = deferred();
+  harness.browser.storage.local.get = async (keys) => {
+    if (keys === "busToken") {
+      tokenRead.started = true;
+      await tokenRead.promise;
+    }
+    return originalGet(keys);
+  };
+
+  const socket = harness.sockets[0];
+  socket.onopen();
+  socket.onmessage({
+    data: JSON.stringify({
+      type: "hello",
+      schemaVersion: 1,
+      payload: { nonce: "00112233445566778899aabbccddeeff" },
+    }),
+  });
+  await waitFor(() => assert.equal(tokenRead.started, true));
+  socket.onmessage({
+    data: JSON.stringify({
+      type: "focus",
+      schemaVersion: 1,
+      payload: { focus: { id: "com.apple.focus.work" } },
+    }),
+  });
+  tokenRead.resolve();
+
+  await waitFor(() => assert.ok(harness.sentMessages.some((message) => message.type === "auth")));
+  assert.equal(socket.readyState, harness.context.WebSocket.OPEN);
+  assert.notEqual(harness.storageData.busPairingStatus, "pairing_failed");
 });
 
 test("bus pairing rejects wrong server MACs and missing tokens", async () => {
@@ -3652,4 +4155,1071 @@ test("legacy bus frames still handle focus but ignore unauthenticated activateVi
   await settle();
   assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_focus" });
   assert.equal(harness.consoleWarnings.length, 1);
+});
+
+test("bus rejects a non-hello first frame once a busToken is configured, instead of downgrading to legacy", async () => {
+  const token = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+  const harness = createHarness({
+    storage: {
+      busToken: token,
+      lenses: [lens("lens_focus", "Focus", [{ type: "title", value: "Focus" }], ["com.apple.focus.work"])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Focus", collapsed: true },
+    ],
+    tabs: [{ id: 10, windowId: 1, groupId: 1, active: true, url: "https://focus.test" }],
+  });
+  await settle();
+  const socket = harness.sockets[0];
+  socket.onopen();
+
+  // Peer skips `hello`/`auth` entirely and goes straight for an
+  // automation-triggering frame -- the legacy-bus PoC.
+  await sendSocketFrame(socket, {
+    type: "focus",
+    schemaVersion: 1,
+    payload: { focus: { id: "com.apple.focus.work", name: "Work" } },
+  });
+
+  assert.equal(harness.storageData.busPairingStatus, "pairing_failed");
+  assert.equal(socket.readyState, harness.context.WebSocket.CLOSED);
+  assert.equal(harness.storageData.activeView, undefined);
+  assert.deepEqual(harness.sentMessages, []);
+});
+
+// ── Regression: stranded focus-tab-groups findings ────────────────────
+
+test("activating a lens keeps focus when the active tab is already in a matching group", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lens("lens_work", "Work", [{ type: "glob", value: "Work*" }])] },
+    groups: [
+      { id: 1, windowId: 1, title: "Work A", collapsed: true },
+      { id: 2, windowId: 1, title: "Work B", collapsed: true },
+      { id: 3, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: true },
+      { id: 20, windowId: 1, groupId: 2, active: false },
+      { id: 30, windowId: 1, groupId: 3, active: false },
+    ],
+  });
+  await settle();
+
+  await harness.request({ type: "lens-activate", windowId: 1, view: { kind: "lens", lensId: "lens_work" } });
+
+  // The active tab was already inside a matching group, so no handoff runs and
+  // focus is not yanked into the other matching group.
+  assert.equal(harness.tabUpdates.some((entry) => entry.patch.active === true), false);
+  assert.equal(harness.groupState.find((group) => group.id === 1).collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.id === 3).collapsed, true);
+});
+
+test("lens activation leaves a no-match window's active group expanded when it cannot hand off focus", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])] },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 2, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 2, groupId: 2, active: true },
+    ],
+  });
+  await settle();
+
+  const result = await harness.request({ type: "lens-activate", windowId: 1, view: { kind: "lens", lensId: "lens_work" } });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.groupState.find((group) => group.id === 1).collapsed, false);
+  // window 2 has no ungrouped tab to receive focus, so its active group stays
+  // expanded instead of surfacing a "cannot collapse active group" failure.
+  assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, false);
+  assert.deepEqual(harness.storageData.updateFailures, []);
+  assert.equal(harness.storageData.lastAction, "applied");
+});
+
+test("lens activation hands focus to an ungrouped tab so a no-match window's group can collapse", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])] },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 2, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 2, groupId: 2, active: true },
+      { id: 21, windowId: 2, groupId: -1, active: false },
+    ],
+  });
+  await settle();
+
+  const result = await harness.request({ type: "lens-activate", windowId: 1, view: { kind: "lens", lensId: "lens_work" } });
+
+  assert.equal(result.ok, true);
+  assert.ok(harness.tabUpdates.some((entry) => entry.id === 21 && entry.patch.active === true));
+  assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, true);
+  assert.deepEqual(harness.storageData.updateFailures, []);
+});
+
+test("overlapping schedules: the first enabled matching schedule wins", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [
+        lens("lens_a", "Alpha", [{ type: "title", value: "Alpha" }]),
+        lens("lens_b", "Beta", [{ type: "title", value: "Beta" }]),
+      ],
+      lensSchedules: [
+        { lensId: "lens_a", enabled: true, days: [], start: "09:00", end: "17:00" },
+        { lensId: "lens_b", enabled: true, days: [], start: "10:00", end: "12:00" },
+      ],
+      lastActivation: { trigger: "manual", at: new Date("2026-06-28T10:00:00").getTime() },
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Alpha", collapsed: true },
+      { id: 2, windowId: 1, title: "Beta", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: true },
+    ],
+  });
+  await settle();
+
+  await harness.context.handleScheduleTick(new Date("2026-06-29T11:00:00"));
+
+  // Both windows match 11:00; ties resolve to the first schedule in stored order.
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_a" });
+});
+
+test("a schedule whose days exclude today does not activate on tick", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])],
+      // days:[2] is Tuesday; the tick below is a Monday.
+      lensSchedules: [{ lensId: "lens_work", enabled: true, days: [2], start: "09:00", end: "17:00" }],
+      lastActivation: { trigger: "manual", at: new Date("2026-06-28T10:00:00").getTime() },
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: true },
+    ],
+  });
+  await settle();
+
+  await harness.context.handleScheduleTick(new Date("2026-06-29T10:00:00"));
+
+  assert.equal(harness.storageData.lastActivation.trigger, "manual");
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, true);
+});
+
+test("parseGroupsFromContent accepts a bare array and coerces string tab indices", () => {
+  const { context } = createHarness();
+
+  assert.deepEqual(
+    clone(context.parseGroupsFromContent('[{"topic":"A","tabIndices":[0,1]}]')),
+    [{ topic: "A", tabIndices: [0, 1] }]
+  );
+  assert.deepEqual(
+    clone(context.parseGroupsFromContent('{"groups":[{"topic":"B","tabIndices":["2","3"]}]}')),
+    [{ topic: "B", tabIndices: [2, 3] }]
+  );
+  // Entries without a topic are dropped; unparseable content yields [].
+  assert.deepEqual(clone(context.parseGroupsFromContent('{"groups":[{"tabIndices":[0]}]}')), []);
+  assert.deepEqual(clone(context.parseGroupsFromContent("not json at all")), []);
+});
+
+test("custom provider surfaces non-HTTP error codes", async () => {
+  const baseTabs = [
+    { id: 10, url: "https://a.com", title: "A", groupId: -1 },
+    { id: 11, url: "https://b.com", title: "B", groupId: -1 },
+  ];
+  const provider = { kind: "custom", baseURL: "https://api.example.com/v1", model: "m", apiKey: "k" };
+  const cases = [
+    { name: "unreachable", handler: async () => { throw new Error("boom"); }, code: "cloud_unreachable" },
+    {
+      name: "timeout",
+      handler: async () => { const error = new Error("aborted"); error.name = "AbortError"; throw error; },
+      code: "cloud_timeout",
+    },
+    {
+      name: "bad json",
+      handler: async () => ({ ok: true, status: 200, async json() { throw new Error("not json"); } }),
+      code: "cloud_bad_json",
+    },
+    {
+      name: "malformed",
+      handler: async () => ({ ok: true, status: 200, async json() { return { choices: [{ message: { content: 42 } }] }; } }),
+      code: "cloud_malformed",
+    },
+  ];
+  for (const testCase of cases) {
+    const harness = createHarness({
+      storage: { aiGroupingEnabled: true, aiProvider: provider },
+      tabs: baseTabs,
+      fetchHandler: testCase.handler,
+    });
+    await settle();
+    const result = await harness.messageListeners[0]({ type: "ai-group-preview", windowId: 1 });
+    assert.equal(result.ok, false, `${testCase.name} fails`);
+    assert.equal(result.error, testCase.code, `${testCase.name} -> ${testCase.code}`);
+  }
+});
+
+test("a windowId-less preview de-duplicates a concurrent auto-group run for the same window", async () => {
+  let releaseFetch;
+  const gate = new Promise((resolve) => { releaseFetch = resolve; });
+  const harness = createHarness({
+    currentWindowId: 7,
+    storage: {
+      aiGroupingEnabled: true,
+      aiAutoGroup: true,
+      aiProvider: { kind: "custom", baseURL: "https://api.example.com/v1", model: "m", apiKey: "k" },
+    },
+    tabs: [
+      { id: 10, windowId: 7, url: "https://a.com", title: "A", groupId: -1 },
+      { id: 11, windowId: 7, url: "https://b.com", title: "B", groupId: -1 },
+    ],
+    fetchHandler: async () => {
+      await gate;
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content: '{"groups":[{"topic":"X","tabIndices":[0,1]}]}' } }] }; } };
+    },
+  });
+  await settle();
+
+  // Preview dispatched without a windowId resolves to the current window (7) and
+  // holds the shared inflight slot under the numeric key while fetch is gated.
+  const previewPromise = harness.context.handleGroupPreview(undefined);
+  await settle();
+  assert.equal(harness.fetchCalls.length, 1);
+
+  // Auto-group for the same physical window must see the in-flight preview and skip.
+  await harness.context.runAutoGroup(7);
+  assert.equal(harness.fetchCalls.length, 1, "auto-group must not start a second clustering pass");
+
+  releaseFetch();
+  await previewPromise;
+  await settle();
+});
+
+test("a dismiss during an in-flight preview does not repopulate the proposal cache", async () => {
+  let releaseFetch;
+  const gate = new Promise((resolve) => { releaseFetch = resolve; });
+  const harness = createHarness({
+    currentWindowId: 7,
+    storage: {
+      aiGroupingEnabled: true,
+      aiProvider: { kind: "custom", baseURL: "https://api.example.com/v1", model: "m", apiKey: "k" },
+    },
+    tabs: [
+      { id: 10, windowId: 7, url: "https://a.com", title: "A", groupId: -1 },
+      { id: 11, windowId: 7, url: "https://b.com", title: "B", groupId: -1 },
+    ],
+    fetchHandler: async () => {
+      await gate;
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content: '{"groups":[{"topic":"X","tabIndices":[0,1]}]}' } }] }; } };
+    },
+  });
+  await settle();
+
+  const previewPromise = harness.context.handleGroupPreview(7);
+  await settle();
+  assert.equal(harness.fetchCalls.length, 1);
+
+  // User dismisses the proposal while the preview is still computing.
+  harness.context.handleGroupClear(7);
+
+  releaseFetch();
+  await previewPromise;
+  await settle();
+
+  assert.equal(
+    vm.runInContext("lastProposalByWindow.has(7)", harness.context),
+    false,
+    "a dismissed proposal must not be repopulated by the in-flight preview",
+  );
+});
+
+test("a manual preview waits for an in-flight auto-group instead of racing a second clustering pass", async () => {
+  let releaseFetch;
+  const gate = new Promise((resolve) => { releaseFetch = resolve; });
+  const harness = createHarness({
+    currentWindowId: 7,
+    storage: {
+      aiGroupingEnabled: true,
+      aiAutoGroup: true,
+      aiProvider: { kind: "custom", baseURL: "https://api.example.com/v1", model: "m", apiKey: "k" },
+    },
+    tabs: [
+      { id: 10, windowId: 7, url: "https://a.com", title: "A", groupId: -1 },
+      { id: 11, windowId: 7, url: "https://b.com", title: "B", groupId: -1 },
+    ],
+    fetchHandler: async () => {
+      await gate;
+      return { ok: true, status: 200, async json() { return { choices: [{ message: { content: '{"groups":[{"topic":"X","tabIndices":[0,1]}]}' } }] }; } };
+    },
+  });
+  await settle();
+
+  // Auto-group starts and hangs mid-compute (fetch gated).
+  const autoPromise = harness.context.runAutoGroup(7);
+  await settle();
+  assert.equal(harness.fetchCalls.length, 1, "auto-group is computing");
+
+  // A manual preview for the same window must wait for the auto pass rather than
+  // firing a second concurrent clustering call.
+  const previewPromise = harness.context.handleGroupPreview(7);
+  await settle();
+  assert.equal(harness.fetchCalls.length, 1, "manual preview must not race a second clustering pass");
+
+  releaseFetch();
+  await autoPromise;
+  await previewPromise;
+  await settle();
+});
+
+test("lensState payload reads activeView and lastActivation from one consistent snapshot", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("lens_x", "X", [{ type: "title", value: "X" }])],
+      activeView: { kind: "all" },
+      lastActivation: { trigger: "manual", at: 1 },
+    },
+  });
+  await settle();
+
+  const realGet = harness.browser.storage.local.get;
+  const realSet = harness.browser.storage.local.set;
+  let interfered = false;
+  harness.browser.storage.local.get = async (keys) => {
+    const result = await realGet(keys);
+    const wantsActiveView = keys === "activeView" || (Array.isArray(keys) && keys.includes("activeView"));
+    if (!interfered && wantsActiveView) {
+      // A new activation commits atomically right after this snapshot read.
+      interfered = true;
+      await realSet({ activeView: { kind: "lens", lensId: "lens_x" }, lastActivation: { trigger: "calendar", at: 2 } });
+    }
+    return result;
+  };
+
+  const payload = await harness.context.lensStatePayload();
+  // The snapshot must be internally consistent: the "all" view it read pairs
+  // with the "manual" activation, never the interfering calendar activation.
+  assert.equal(payload.activeView.kind, "all");
+  assert.equal(payload.lastActivation.trigger, "manual");
+});
+
+test("overlapping schedule-alarm syncs reconcile to the latest state in order", async () => {
+  const schedule = (enabled) => ({
+    lensId: "lens_x",
+    enabled,
+    days: [0, 1, 2, 3, 4, 5, 6],
+    start: "09:00",
+    end: "17:00",
+  });
+  const harness = createHarness({
+    storage: { lensSchedules: [schedule(true)] },
+  });
+  await settle();
+
+  const alarmName = vm.runInContext("SCHEDULE_ALARM_NAME", harness.context);
+  const ops = [];
+  const realCreate = harness.browser.alarms.create;
+  const realClear = harness.browser.alarms.clear;
+  harness.browser.alarms.create = (name, config) => { ops.push(`create:${name}`); return realCreate(name, config); };
+  harness.browser.alarms.clear = (name) => { ops.push(`clear:${name}`); return realClear(name); };
+
+  const realGet = harness.browser.storage.local.get;
+  const gate = deferred();
+  let scheduleReads = 0;
+  harness.browser.storage.local.get = async (keys) => {
+    if (keys === "lensSchedules") {
+      scheduleReads += 1;
+      if (scheduleReads === 1) {
+        const snapshot = await realGet(keys); // capture enabled state now
+        await gate.promise;
+        return snapshot;
+      }
+    }
+    return realGet(keys);
+  };
+
+  const first = harness.context.syncScheduleAlarm(); // reads enabled (gated)
+  await settle();
+  harness.storageData.lensSchedules = [schedule(false)];
+  const second = harness.context.syncScheduleAlarm(); // must run strictly after first
+  await settle();
+  gate.resolve();
+  await Promise.all([first, second]);
+
+  // Serialized: create (enabled) then clear (disabled). Never clear-then-create,
+  // which would leave a stale alarm running after schedules were disabled.
+  assert.deepEqual(ops, [`create:${alarmName}`, `clear:${alarmName}`]);
+});
+
+test("tab search drag-to-group waits for an in-flight grouping pass on the same window", async () => {
+  const harness = createHarness({
+    currentWindowId: 1,
+    groups: [{ id: 7, windowId: 1, title: "Work", color: "purple" }],
+    tabs: [
+      { id: 20, windowId: 1, url: "https://a.com", title: "A", groupId: -1 },
+      { id: 30, windowId: 1, url: "https://b.com", title: "B", groupId: -1 },
+    ],
+  });
+  await settle();
+
+  const realGroup = harness.browser.tabs.group;
+  const gate = deferred();
+  const groupCalls = [];
+  harness.browser.tabs.group = async (arg) => {
+    groupCalls.push(arg);
+    if (groupCalls.length === 1) await gate.promise;
+    return realGroup(arg);
+  };
+
+  // First: a titled grouping goes through applyTabGrouping -> withGroupingLock.
+  const first = harness.request({ type: "tabsearch-group", tabIds: [20], title: "New", windowId: 1 });
+  await settle();
+  assert.equal(groupCalls.length, 1, "first grouping is applying under the lock");
+
+  // Drag tab 30 onto existing group 7 while the first pass holds the window lock.
+  const drag = harness.request({ type: "tabsearch-group", tabIds: [30], groupId: 7, windowId: 1 });
+  await settle();
+  assert.equal(groupCalls.length, 1, "drag-to-group must wait for the in-flight grouping lock");
+
+  gate.resolve();
+  await Promise.all([first, drag]);
+  assert.equal(groupCalls.length, 2);
+  assert.equal(harness.tabState.find((tab) => tab.id === 30).groupId, 7);
+});
+
+test("truncateList caps long group lists for notifications", () => {
+  const { context } = createHarness();
+
+  // NOTIFICATION_LIST_MAX is 12; a longer list is capped with an overflow tail.
+  const many = Array.from({ length: 15 }, (_, index) => `G${index + 1}`);
+  assert.match(context.truncateList(many), /\(\+3 more\)$/);
+  // Short lists join in full.
+  assert.equal(context.truncateList(["A", "B"]), "A, B");
+});
+
+// ── Regression: concurrency/robustness findings ───────────────────────
+
+test("an AI grouping request before hello never downgrades a token-configured socket to legacy", async () => {
+  const harness = createHarness({ storage: { busToken: BUS_TOKEN } });
+  await settle();
+  const socket = harness.sockets[0];
+  socket.onopen();
+  await settle();
+
+  // Socket is OPEN but UNAUTHENTICATED. A grouping request racing the daemon's
+  // hello must not promote the socket to legacy while a token is configured.
+  await assert.rejects(
+    harness.context.requestTabGrouping([{ index: 0, title: "A", url: "https://a.test" }])
+  );
+  assert.notEqual(harness.storageData.busPairingStatus, "legacy (unpaired)");
+  assert.ok(!harness.sentMessages.some((m) => m.type === "groupTabs"), "no groupTabs sent pre-auth");
+
+  // hello still starts the HMAC handshake on the same socket.
+  await sendSocketFrame(socket, {
+    type: "hello",
+    schemaVersion: 1,
+    payload: { nonce: "00112233445566778899aabbccddeeff" },
+  });
+  await waitFor(() => assert.ok(harness.sentMessages.some((m) => m.type === "auth")));
+});
+
+test("concurrent same-title Tab Search grouping creates one group and merges the second", async () => {
+  const harness = createHarness({
+    currentWindowId: 1,
+    tabs: [
+      { id: 20, windowId: 1, title: "Docs A", url: "https://a.example.com", groupId: -1, active: true },
+      { id: 21, windowId: 1, title: "Docs B", url: "https://b.example.com", groupId: -1 },
+    ],
+  });
+  await settle();
+
+  // Fire both same-title groupings before either resolves: the per-window
+  // grouping lock must serialize them so the second merges into the first's
+  // group instead of creating a duplicate.
+  const first = harness.request({ type: "tabsearch-group", tabIds: [20], title: "Docs" });
+  const second = harness.request({ type: "tabsearch-group", tabIds: [21], title: "Docs" });
+  await Promise.all([first, second]);
+
+  const docsGroups = harness.groupState.filter((group) => group.title === "Docs");
+  assert.equal(docsGroups.length, 1, "only one Docs group is created");
+  const groupId = docsGroups[0].id;
+  assert.equal(harness.tabState.find((tab) => tab.id === 20).groupId, groupId);
+  assert.equal(harness.tabState.find((tab) => tab.id === 21).groupId, groupId);
+});
+
+test("a lens saved during startup migration survives alongside the migrated lenses", async () => {
+  const harness = createHarness({
+    storage: {
+      [LEGACY_KEY]: { "com.apple.focus.work": ["Work"] },
+      focusCatalog: { "com.apple.focus.work": { name: "Work", icon: "briefcase", color: null } },
+    },
+    groups: [{ id: 1, windowId: 1, title: "New", collapsed: false }],
+    tabs: [{ id: 10, windowId: 1, groupId: 1, active: true }],
+  });
+  // Do NOT settle first: migration is still in flight. Saving a lens now must
+  // queue behind the migration barrier so neither write clobbers the other.
+  const savePromise = harness.request({ type: "lens-save", source: "group", groupTitle: "New", name: "New Lens" });
+  await settle();
+  const saved = await savePromise;
+
+  assert.equal(saved.ok, true);
+  assert.equal(harness.storageData.schemaVersion, 2);
+  const names = harness.storageData.lenses.map((entry) => entry.name).sort();
+  assert.deepEqual(names, ["New Lens", "Work"]);
+});
+
+test("lens-import validates and appends a portable lens through the serialized queue", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lens("lens_a", "A", [{ type: "title", value: "A" }])] },
+  });
+  await settle();
+
+  const code = JSON.stringify({
+    tabloupeLens: 1,
+    lens: { name: "Imported", icon: "star", color: "#123456", groupSelectors: [{ type: "title", value: "X" }] },
+  });
+  const result = await harness.request({ type: "lens-import", code });
+  assert.equal(result.ok, true);
+  assert.equal(result.lens.name, "Imported");
+  assert.ok(result.lens.id.startsWith("lens_"));
+  assert.equal(result.lens.triggers.appleFocusIds.length, 0);
+  assert.equal(result.lens.triggers.calendarPatterns.length, 0);
+  assert.deepEqual(harness.storageData.lenses.map((entry) => entry.name), ["A", "Imported"]);
+
+  const before = JSON.stringify(harness.storageData.lenses);
+  const badJson = await harness.request({ type: "lens-import", code: "not json" });
+  assert.equal(badJson.ok, false);
+  assert.equal(badJson.error, "invalid_code");
+  const badShape = await harness.request({ type: "lens-import", code: JSON.stringify({ foo: 1 }) });
+  assert.equal(badShape.ok, false);
+  assert.equal(JSON.stringify(harness.storageData.lenses), before, "invalid imports never write");
+});
+
+test("tabsearch-activate returns a structured error when the tab was already closed", async () => {
+  const harness = createHarness({
+    currentWindowId: 1,
+    tabs: [{ id: 20, windowId: 1, title: "Docs", url: "https://docs.example.com", active: false, failActivate: true }],
+  });
+  await settle();
+
+  const result = await harness.request({ type: "tabsearch-activate", tabId: 20, windowId: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "tab_not_found");
+});
+
+test("open-tab-search reports failure when the overlay cannot open", async () => {
+  const noTab = createHarness({ tabs: [] });
+  await settle();
+  const noResult = await noTab.request({ type: "open-tab-search" });
+  assert.equal(noResult.ok, false);
+  assert.equal(noResult.error, "no_active_tab");
+
+  const privileged = createHarness({
+    failTabMessage: true,
+    tabs: [{ id: 7, windowId: 1, url: "about:addons", active: true }],
+  });
+  await settle();
+  const privResult = await privileged.request({ type: "open-tab-search" });
+  assert.equal(privResult.ok, false);
+  assert.equal(privResult.error, "unsupported_page");
+  assert.equal(privileged.notifications.length, 1);
+});
+
+test("concurrent local changes record both lens and prefs sync timestamps without clobbering", async () => {
+  const harness = createHarness({
+    storage: { syncLenses: true, lenses: [lens("lens_a", "A", [{ type: "title", value: "A" }])] },
+    storageSync: {},
+  });
+  await settle();
+
+  // Two near-simultaneous local edits (a lens change and a prefs change) each
+  // read-modify-write lensSyncMeta; serialization must keep both timestamps.
+  await harness.browser.storage.local.set({ lenses: [lens("lens_a", "A2", [{ type: "title", value: "A" }])] });
+  await harness.browser.storage.local.set({ aiGroupingPrompt: "custom" });
+  await waitFor(() => {
+    const meta = harness.storageData.lensSyncMeta || {};
+    assert.ok(meta.lensOrderUpdatedAt > 0, "lens timestamp recorded");
+    assert.ok(meta.prefsUpdatedAt > 0, "prefs timestamp recorded");
+  });
+});
+
+test("startup retries a transient lens migration write before unblocking lens operations", async () => {
+  const harness = createHarness({
+    storage: { [LEGACY_KEY]: { "com.apple.focus.work": ["Work"] } },
+  });
+  const originalSet = harness.browser.storage.local.set;
+  let migrationWrites = 0;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "schemaVersion")) {
+      migrationWrites += 1;
+      if (migrationWrites === 1) {
+        throw new Error("temporary migration storage failure");
+      }
+    }
+    return originalSet(values);
+  };
+
+  await settle();
+
+  assert.equal(migrationWrites, 2);
+  assert.equal(harness.storageData.schemaVersion, 2);
+  assert.equal(harness.storageData.lenses.length, 1);
+});
+
+test("a failed Focus seen-state write does not prevent lens activation", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["com.apple.focus.work"])] },
+    ...twoGroups(),
+  });
+  await settle();
+  const originalSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "seenFocusIds")) {
+      throw new Error("seen-state unavailable");
+    }
+    return originalSet(values);
+  };
+
+  await harness.context.handleMessage({
+    type: "focus",
+    payload: { focus: { id: "com.apple.focus.work", name: "Work" } },
+  });
+
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_work" });
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, false);
+  assert.ok(harness.consoleErrors.some(([message]) => message === "Focus seen-state error:"));
+});
+
+test("Focus-off retains its trigger marker until fallback activation succeeds", async () => {
+  const harness = createHarness({
+    storage: {
+      automationFallback: { kind: "lens", lensId: "lens_other" },
+      lenses: [
+        lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["com.apple.focus.work"]),
+        lens("lens_other", "Other", [{ type: "title", value: "Other" }]),
+      ],
+    },
+    groups: [
+      { id: 1, title: "Work", collapsed: true },
+      { id: 2, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, groupId: 1, active: false },
+      { id: 20, groupId: 2, active: true, failActivate: false },
+    ],
+  });
+  await settle();
+
+  await harness.context.handleMessage({
+    type: "focus",
+    payload: { focus: { id: "com.apple.focus.work" } },
+  });
+  harness.tabState.find((tab) => tab.id === 20).failActivate = true;
+  await harness.context.handleMessage({ type: "focus", payload: { focus: null } });
+
+  assert.equal(harness.storageData.lastAppliedAppleFocusId, "com.apple.focus.work");
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_work" });
+
+  harness.tabState.find((tab) => tab.id === 20).failActivate = false;
+  await harness.context.handleMessage({ type: "focus", payload: { focus: null } });
+
+  assert.equal(harness.storageData.lastAppliedAppleFocusId, null);
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_other" });
+});
+
+test("activation commits the requested view when diagnostic persistence fails after group updates", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])] },
+    ...twoGroups(),
+  });
+  await settle();
+  const originalSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "lastAction")) {
+      throw new Error("diagnostics unavailable");
+    }
+    return originalSet(values);
+  };
+
+  const result = await harness.request({
+    type: "lens-activate",
+    windowId: 1,
+    view: { kind: "lens", lensId: "lens_work" },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.groupState.find((group) => group.title === "Work").collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_work" });
+  assert.equal(harness.storageData.lastActivation.trigger, "manual");
+});
+
+test("window-profile activation reports a partial failure after applying other windows", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [
+        lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["com.apple.focus.work"]),
+        lens("lens_personal", "Personal", [{ type: "title", value: "Personal" }]),
+      ],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+      { id: 3, windowId: 2, title: "Work", collapsed: false },
+      { id: 4, windowId: 2, title: "Personal", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 11, windowId: 1, groupId: 2, active: true },
+      { id: 20, windowId: 2, groupId: 3, active: true },
+      { id: 21, windowId: 2, groupId: 4, active: false, failActivate: true },
+    ],
+  });
+  await settle();
+  await harness.request({
+    type: "window-profile-set",
+    windowId: 2,
+    profile: { kind: "lens", lensId: "lens_personal" },
+  });
+
+  await harness.context.handleMessage({
+    type: "focus",
+    payload: { focus: { id: "com.apple.focus.work" } },
+  });
+
+  assert.equal(harness.groupState.find((group) => group.id === 1).collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, true);
+  assert.equal(harness.groupState.find((group) => group.id === 3).collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.id === 4).collapsed, true);
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_work" });
+  assert.equal(harness.storageData.lastAction, "activation_partial");
+  assert.deepEqual(harness.storageData.windowFailures, [2]);
+  assert.equal(harness.storageData.lastAppliedAppleFocusId, undefined);
+});
+
+test("session window-state persistence coalesces rapid superseded snapshots", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lens("lens_personal", "Personal", [{ type: "title", value: "Personal" }])] },
+  });
+  const originalSet = harness.browser.storage.session.set;
+  const firstWrite = deferred();
+  let writes = 0;
+  harness.browser.storage.session.set = async (values) => {
+    writes += 1;
+    if (writes === 1) {
+      firstWrite.started = true;
+      await firstWrite.promise;
+    }
+    return originalSet(values);
+  };
+  await settle();
+
+  const first = harness.context.handleWindowProfileSet({ windowId: 1, profile: { kind: "none" } });
+  await waitFor(() => assert.equal(firstWrite.started, true));
+  const second = harness.context.handleWindowProfileSet({
+    windowId: 1,
+    profile: { kind: "lens", lensId: "lens_personal" },
+  });
+  const third = harness.context.handleWindowProfileSet({ windowId: 1, profile: { kind: "default" } });
+  firstWrite.resolve();
+  await Promise.all([first, second, third]);
+
+  assert.equal(writes, 2, "only the in-flight and final snapshots are written");
+  assert.deepEqual(harness.sessionData.windowViewState.windowProfiles, {});
+});
+
+test("lens sync timestamp recording coalesces local edits while a sync operation is blocked", async () => {
+  const harness = createHarness();
+  await settle();
+  const originalGet = harness.browser.storage.local.get;
+  const blocked = deferred();
+  let metadataReads = 0;
+  harness.browser.storage.local.get = async (keys) => {
+    if (keys === "lensSyncMeta") {
+      metadataReads += 1;
+      await blocked.promise;
+    }
+    return originalGet(keys);
+  };
+
+  const writes = Array.from({ length: 20 }, () =>
+    harness.context.recordLocalLensSyncTimestamps({ lenses: {} }));
+  await waitFor(() => assert.equal(metadataReads, 1));
+  blocked.resolve();
+  await Promise.all(writes);
+  assert.equal(metadataReads, 1, "all pending edits share one timestamp mutation");
+});
+
+test("inbound state frames coalesce to the newest pending frame", async () => {
+  const harness = createHarness();
+  await settle();
+  const blocked = deferred();
+  const handled = [];
+  const first = harness.context.enqueueFocusWork(async () => {
+    handled.push("first");
+    await blocked.promise;
+  }, { bus: true, coalesceKey: "focus" });
+  await waitFor(() => assert.deepEqual(handled, ["first"]));
+  const queued = Array.from({ length: 20 }, (_, index) =>
+    harness.context.enqueueFocusWork(() => handled.push(index), { bus: true, coalesceKey: "focus" }));
+  blocked.resolve();
+  await Promise.all([first, ...queued]);
+  assert.deepEqual(handled, ["first", 19]);
+});
+
+test("Focus metadata retains a bounded recent catalog and seen-id set", async () => {
+  const seenFocusIds = Object.fromEntries(
+    Array.from({ length: 200 }, (_, index) => [`focus-${index}`, { firstSeen: index, lastSeen: index }]),
+  );
+  const focusCatalog = Object.fromEntries(
+    Array.from({ length: 200 }, (_, index) => [`focus-${index}`, { name: `Focus ${index}`, icon: "target", color: null }]),
+  );
+  const harness = createHarness({ storage: { seenFocusIds, focusCatalog } });
+  await settle();
+
+  await harness.context.handleMessage({ type: "focus", payload: { focus: { id: "focus-current", name: "Current" } } });
+
+  assert.equal(Object.keys(harness.storageData.seenFocusIds).length, 200);
+  assert.equal(Object.keys(harness.storageData.focusCatalog).length, 200);
+  assert.ok(harness.storageData.seenFocusIds["focus-current"]);
+  assert.equal(harness.storageData.focusCatalog["focus-current"].name, "Current");
+  assert.equal(harness.storageData.seenFocusIds["focus-0"], undefined);
+  assert.equal(harness.storageData.focusCatalog["focus-0"], undefined);
+});
+
+test("deleting a lens clears its window override and automation falls back to the requested view", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [
+        lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["com.apple.focus.work"]),
+        lens("lens_personal", "Personal", [{ type: "title", value: "Personal" }]),
+      ],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Personal", collapsed: false },
+      { id: 3, windowId: 2, title: "Work", collapsed: true },
+      { id: 4, windowId: 2, title: "Personal", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 11, windowId: 1, groupId: 2, active: true },
+      { id: 20, windowId: 2, groupId: 3, active: false },
+      { id: 21, windowId: 2, groupId: 4, active: true },
+    ],
+  });
+  await settle();
+  await harness.request({
+    type: "window-profile-set",
+    windowId: 2,
+    profile: { kind: "lens", lensId: "lens_personal" },
+  });
+  await harness.request({ type: "lens-delete", lensId: "lens_personal" });
+  await harness.context.handleMessage({ type: "focus", payload: { focus: { id: "com.apple.focus.work" } } });
+
+  const state = await harness.request({ type: "lens-state", windowId: 2 });
+  assert.equal(state.windowProfile.kind, "default");
+  assert.equal(harness.groupState.find((group) => group.id === 3).collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.id === 4).collapsed, true);
+});
+
+test("a failed container query is retried instead of cached as an empty result", async () => {
+  const harness = createHarness({ containers: [] });
+  await settle();
+  let attempts = 0;
+  harness.browser.contextualIdentities.query = async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      throw new Error("temporary contextual identity failure");
+    }
+    return [{ cookieStoreId: "firefox-container-work", name: "Work", color: "blue", icon: "briefcase" }];
+  };
+
+  assert.equal(JSON.stringify(await harness.context.getContainers()), "[]");
+  assert.equal(JSON.stringify(await harness.context.getContainers()), JSON.stringify([
+    { cookieStoreId: "firefox-container-work", name: "Work", color: "blue", icon: "briefcase" },
+  ]));
+  assert.equal(attempts, 2);
+});
+
+test("schedule alarm reconciliation retries a transient browser API failure", async () => {
+  const harness = createHarness({
+    storage: { lensSchedules: [{ lensId: "lens_work", enabled: true, days: [1], start: "09:00", end: "17:00" }] },
+  });
+  const originalCreate = harness.browser.alarms.create;
+  let attempts = 0;
+  harness.browser.alarms.create = async (...args) => {
+    attempts += 1;
+    if (attempts === 1) {
+      throw new Error("temporary alarm failure");
+    }
+    return originalCreate(...args);
+  };
+  await settle();
+
+  const retry = [...harness.timers.entries()].find(([, timer]) => timer.delay === 1000);
+  assert.ok(retry, "a bounded alarm retry is scheduled");
+  harness.runTimer(retry[0]);
+  await waitFor(() => assert.equal(attempts, 2));
+  assert.ok(harness.alarms.some((alarm) => alarm.name === "lens-schedule-tick"));
+});
+
+test("closing a window retires its proposal generation entry", async () => {
+  const harness = createHarness();
+  await settle();
+  harness.context.currentProposalGen(42);
+  assert.equal(vm.runInContext("proposalGenByWindow.has(42)", harness.context), true);
+  await harness.fireWindowRemoved(42);
+  assert.equal(vm.runInContext("proposalGenByWindow.has(42)", harness.context), false);
+});
+
+test("failed tab-search moves return their refreshed list and explicit partial failure", async () => {
+  const harness = createHarness({
+    tabs: [
+      { id: 1, windowId: 1, index: 0, url: "https://one.test" },
+      { id: 2, windowId: 1, index: 1, url: "https://two.test" },
+    ],
+  });
+  const realMove = harness.browser.tabs.move;
+  harness.browser.tabs.move = async () => {
+    throw new Error("second move failed");
+  };
+
+  const newWindow = await harness.context.moveTabsToNewWindow([1, 2]);
+  assert.deepEqual([...newWindow.moved], [1]);
+  assert.deepEqual([...newWindow.failed], [2]);
+  assert.equal(newWindow.error, "move_failed");
+  assert.ok(Array.isArray(newWindow.list));
+
+  harness.browser.tabs.move = realMove;
+  harness.browser.tabs.group = async () => {
+    throw new Error("membership failed");
+  };
+  const reordered = await harness.context.moveTabsFromSearch([2], 1, 1, true, 99);
+  assert.equal(reordered.error, "membership_failed");
+  assert.deepEqual([...reordered.failed], [2]);
+  assert.ok(Array.isArray(reordered.list));
+});
+
+test("failed container source removal removes the replacement and reports the partial failure", async () => {
+  const harness = createHarness({
+    containers: [{ cookieStoreId: "firefox-container-work", name: "Work" }],
+    tabs: [{ id: 1, windowId: 1, index: 0, url: "https://one.test" }],
+  });
+  const realRemove = harness.browser.tabs.remove;
+  harness.browser.tabs.remove = async (id) => {
+    if (id === 1) throw new Error("source removal failed");
+    return realRemove(id);
+  };
+
+  const result = await harness.context.moveTabsToContainerFromSearch([1], "firefox-container-work");
+  assert.equal(result.error, "container_move_failed");
+  assert.deepEqual([...result.failed], [1]);
+  assert.equal(harness.tabState.filter((tab) => tab.url === "https://one.test").length, 1);
+  assert.ok(Array.isArray(result.list));
+});
+
+test("activation history changes only after a successful view activation", async () => {
+  const harness = createHarness({
+    storage: {
+      activeView: { kind: "all" },
+      lastActivation: { trigger: "manual", at: 1 },
+      focusSessionHistory: [],
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])],
+    },
+    groups: [
+      { id: 1, title: "Work", collapsed: true },
+      { id: 2, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 1, groupId: 1, active: false, failActivate: true, url: "https://work.test" },
+      { id: 2, groupId: 2, active: true, url: "https://other.test" },
+    ],
+  });
+
+  assert.equal(await harness.context.activateView({ kind: "lens", lensId: "lens_work" }), false);
+  assert.deepEqual(harness.storageData.focusSessionHistory, []);
+  harness.tabState[0].failActivate = false;
+  assert.equal(await harness.context.activateView({ kind: "lens", lensId: "lens_work" }), true);
+  assert.equal(harness.storageData.focusSessionHistory.length, 1);
+  assert.deepEqual(harness.storageData.focusSessionHistory[0].view, { kind: "all" });
+});
+
+test("parsed bus frames with a data field are not parsed again", async () => {
+  const harness = createHarness();
+  await harness.context.handleMessage({
+    type: "focus",
+    data: { not: "json" },
+    payload: { focus: null },
+  });
+  assert.equal(
+    harness.context.tryResolveGroupingResponse({ type: "groupTabsResult", id: "unknown", data: { not: "json" } }),
+    true,
+  );
+});
+
+test("non-quota Firefox Sync failures record a durable diagnostic", async () => {
+  const harness = createHarness({ storageSync: {} });
+  harness.browser.storage.sync.get = async () => {
+    throw new Error("sync offline");
+  };
+  harness.browser.storage.sync.set = async () => {
+    throw new Error("sync offline");
+  };
+  harness.browser.storage.sync.remove = async () => {
+    throw new Error("sync offline");
+  };
+
+  assert.equal(await harness.context.safeSyncGet("lensOrder"), null);
+  assert.equal(await harness.context.safeSyncSet({ lensOrder: { ids: [] } }), false);
+  assert.equal(await harness.context.safeSyncRemove(["lens/removed"]), false);
+  await settle();
+  assert.equal(harness.storageData.syncLastError, "sync offline");
+});
+
+test("view activation and tab grouping share the per-window grouping lock", async () => {
+  const harness = createHarness({
+    deferFirstGroupUpdate: true,
+    storage: { lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }])] },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 1, windowId: 1, groupId: 1, active: false, url: "https://work.test" },
+      { id: 2, windowId: 1, groupId: 2, active: true, url: "https://other.test" },
+      { id: 3, windowId: 1, groupId: -1, active: false, url: "https://ungrouped.test" },
+    ],
+  });
+  const activation = harness.context.activateView({ kind: "lens", lensId: "lens_work" });
+  await waitFor(() => assert.equal(harness.firstGroupUpdate.started, true));
+  const grouping = harness.context.applyTabGrouping([{ topic: "Later", tabs: [{ id: 3 }] }], 1);
+  await settle();
+  assert.equal(harness.groupCreations.length, 0);
+
+  harness.firstGroupUpdate.resolve();
+  await Promise.all([activation, grouping]);
+  assert.equal(harness.groupCreations.length, 1);
+});
+
+test("websocket reconnect backoff resets only after authentication succeeds", async () => {
+  const harness = createHarness({ storage: { busToken: BUS_TOKEN } });
+  await settle();
+  vm.runInContext("reconnectDelay = 8000", harness.context);
+  harness.sockets[0].onopen();
+  assert.equal(vm.runInContext("reconnectDelay", harness.context), 8000);
+
+  await authenticateBus(harness, BUS_TOKEN);
+  assert.equal(vm.runInContext("reconnectDelay", harness.context), 1000);
 });

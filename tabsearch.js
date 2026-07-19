@@ -32,16 +32,34 @@ let containerPickerOpen = false;
 let actionMessage = "";
 let previewState = null;
 const collapsedGroups = new Set();
+let aiPreviewInFlight = false;
+let listLoadError = "";
 let dragTabIds = [];
 let dropIndicator = null;
 let historyResults = [];
 let historyQuery = "";
 let historyDebounceTimer = null;
 let tabContainers = [];
+// Guards against stale async work repainting a reopened overlay: bumped on every
+// open (buildOverlay) and every close (closeOverlay). In-flight open/refresh work
+// captures the value and bails when it no longer matches.
+let overlayGen = 0;
+// Monotonic token for list-refreshing actions; only the latest-issued result is
+// allowed to apply, so out-of-order responses are discarded.
+let latestActionSeq = 0;
 const MAX_RENDERED_RESULTS = 50;
 
 const DEFAULT_TAB_SEARCH_SHORTCUT = { ctrl: true, alt: false, shift: false, meta: false, key: "s" };
 let shortcut = { ...DEFAULT_TAB_SEARCH_SHORTCUT };
+// The in-page keydown and the WebExtension `search-tabs` command both resolve to
+// Ctrl+S on Windows/Linux; a page's preventDefault does not reliably suppress a
+// registered command, so both fire for one keypress. When the content-script
+// keydown handles the shortcut it stamps this timestamp; the command's relayed
+// `tabsearch-open` message ignores itself within the echo window so the overlay
+// isn't opened-then-closed. The keydown path itself is never debounced, so
+// pressing Ctrl+S again to toggle the overlay closed always works.
+const COMMAND_ECHO_WINDOW_MS = 400;
+let lastShortcutToggleAt = 0;
 
 const ICON_SEARCH =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>';
@@ -138,8 +156,10 @@ function scheduleHistoryFetch(query) {
       historyQuery = trimmed;
       render(inputEl.value);
     } catch (error) {
-      historyResults = [];
+      // Check staleness BEFORE mutating shared state: an older query's failure
+      // must not clear results that belong to the current query.
       if (!inputEl || inputEl.value.trim() !== trimmed) return;
+      historyResults = [];
       historyQuery = trimmed;
       render(inputEl.value);
     }
@@ -165,6 +185,7 @@ function isOpen() {
 }
 
 function buildOverlay() {
+  overlayGen += 1;
   host = document.createElement("div");
   host.id = TABSEARCH_HOST_ID;
   // Keep the host itself inert to page styles; the real UI lives in the shadow.
@@ -492,8 +513,18 @@ function buildOverlay() {
   document.documentElement.appendChild(host);
 }
 
+function pruneCollapsedGroups() {
+  const liveGroupIds = new Set(
+    allTabs.filter((tab) => tab.grouped && tab.groupId !== null && tab.groupId !== undefined).map((tab) => tab.groupId),
+  );
+  for (const groupId of collapsedGroups) {
+    if (!liveGroupIds.has(groupId)) collapsedGroups.delete(groupId);
+  }
+}
+
 function render(query) {
   pruneMarked();
+  pruneCollapsedGroups();
   if (previewState) {
     renderPreview();
     return;
@@ -520,6 +551,21 @@ function render(query) {
   }
   listEl.textContent = "";
   listEl.classList.toggle("has-marks", marked.size > 0);
+
+  if (listLoadError) {
+    const error = document.createElement("li");
+    error.className = "empty";
+    const errorText = document.createElement("span");
+    errorText.textContent = listLoadError;
+    error.appendChild(errorText);
+    listEl.appendChild(error);
+    filtered = [];
+    selectedIndex = 0;
+    footerEl.className = "actions";
+    footerEl.textContent = "";
+    footerEl.appendChild(makeActionButton("Retry", retryOverlayTabs));
+    return;
+  }
 
   if (renderedCount === 0 && actionRows.length === 0) {
     const empty = document.createElement("li");
@@ -892,26 +938,38 @@ function dropAtPosition(tabIds, index, placeAfter) {
   moveOntoPosition(tabIds, anchor.windowId, anchor.id, placeAfter, groupId);
 }
 
-async function moveOntoPosition(tabIds, windowId, anchorId, placeAfter, groupId) {
+function applyListActionResult(result, fallbackMessage) {
+  const list = Array.isArray(result) ? result : result && Array.isArray(result.list) ? result.list : null;
+  if (list) {
+    allTabs = prepareTabsForSearch(list);
+    clearMarks();
+    pruneMarked();
+  }
+  if (!Array.isArray(result) && result && typeof result === "object") {
+    actionMessage = result.message || result.error || fallbackMessage;
+  }
+}
+
+function moveOntoPosition(tabIds, windowId, anchorId, placeAfter, groupId) {
   if (!Array.isArray(tabIds) || tabIds.length === 0) return;
-  try {
-    const refreshed = await browser.runtime.sendMessage({
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({
       type: "tabsearch-move",
       tabIds,
       windowId,
       anchorId,
       placeAfter,
       groupId,
-    });
-    if (Array.isArray(refreshed)) {
-      allTabs = prepareTabsForSearch(refreshed);
-      clearMarks();
-      pruneMarked();
-    }
-  } catch (error) {
-    actionMessage = "Could not move tabs.";
-  }
-  if (isOpen()) render(inputEl.value);
+    }),
+    {
+      onResult(result) {
+        applyListActionResult(result, "Could not move tabs.");
+      },
+      onError() {
+        actionMessage = "Could not move tabs.";
+      },
+    },
+  );
 }
 
 function renderPreview() {
@@ -1018,21 +1076,25 @@ function makeGroupHeader(tab, count) {
   return header;
 }
 
-async function groupOntoExisting(tabIds, groupId, windowId) {
+function groupOntoExisting(tabIds, groupId, windowId) {
   if (!Array.isArray(tabIds) || tabIds.length === 0) return;
-  try {
-    const result = await browser.runtime.sendMessage({ type: "tabsearch-group", tabIds, groupId, windowId });
-    if (result && result.ok) {
-      if (Array.isArray(result.list)) allTabs = prepareTabsForSearch(result.list);
-      clearMarks();
-      pruneMarked();
-    } else {
-      actionMessage = (result && (result.message || result.error)) || "Could not group tabs.";
-    }
-  } catch (error) {
-    actionMessage = "Could not group tabs.";
-  }
-  if (isOpen()) render(inputEl.value);
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type: "tabsearch-group", tabIds, groupId, windowId }),
+    {
+      onResult(result) {
+        if (result && result.ok) {
+          if (Array.isArray(result.list)) allTabs = prepareTabsForSearch(result.list);
+          clearMarks();
+          pruneMarked();
+        } else {
+          actionMessage = (result && (result.message || result.error)) || "Could not group tabs.";
+        }
+      },
+      onError() {
+        actionMessage = "Could not group tabs.";
+      },
+    },
+  );
 }
 
 function makeFavFallback() {
@@ -1128,6 +1190,12 @@ function renderFooter() {
     if (duplicateTabIds.length > 0) {
       footerEl.appendChild(makeActionButton(`Select ${duplicateTabIds.length} duplicates`, markDuplicateTabs));
     }
+    if (actionMessage) {
+      const message = document.createElement("span");
+      message.className = "message";
+      message.textContent = actionMessage;
+      footerEl.appendChild(message);
+    }
     return;
   }
 
@@ -1156,8 +1224,9 @@ function renderFooter() {
   footerEl.appendChild(group);
 
   const ai = makeActionButton("AI group", () => previewAiGroups(windowId));
-  ai.disabled = !sameWindow;
+  ai.disabled = !sameWindow || aiPreviewInFlight;
   if (!sameWindow) ai.title = "select tabs from one window to group";
+  else if (aiPreviewInFlight) ai.title = "AI preview in progress";
   footerEl.appendChild(ai);
 
   footerEl.appendChild(makeActionButton("Close", () => runBulkListAction("tabsearch-close-many", { tabIds: tabs.map((tab) => tab.id) })));
@@ -1373,32 +1442,52 @@ function focusInput() {
   attempt(10);
 }
 
+async function loadOverlayTabs(gen) {
+  try {
+    const [tabs, containersResult] = await Promise.all([
+      browser.runtime.sendMessage({ type: "tabsearch-list" }),
+      browser.runtime.sendMessage({ type: "tabsearch-containers" }).catch(() => ({ ok: false, containers: [] })),
+    ]);
+    if (gen !== overlayGen || !isOpen()) return false;
+    allTabs = prepareTabsForSearch(tabs || []);
+    tabContainers = containersResult && containersResult.ok && Array.isArray(containersResult.containers)
+      ? containersResult.containers
+      : [];
+    listLoadError = "";
+    return true;
+  } catch (error) {
+    if (gen !== overlayGen || !isOpen()) return false;
+    allTabs = [];
+    tabContainers = [];
+    listLoadError = "Could not load tabs. Try again.";
+    return false;
+  }
+}
+
+async function retryOverlayTabs() {
+  const gen = overlayGen;
+  await loadOverlayTabs(gen);
+  if (gen !== overlayGen || !isOpen()) return;
+  render(inputEl.value);
+}
+
 async function openOverlay() {
   if (isOpen()) {
     closeOverlay();
     return;
   }
   buildOverlay();
+  const gen = overlayGen;
   selectedIndex = 0;
+  listLoadError = "";
   focusInput();
-  try {
-    const [tabs, containersResult] = await Promise.all([
-      browser.runtime.sendMessage({ type: "tabsearch-list" }),
-      browser.runtime.sendMessage({ type: "tabsearch-containers" }).catch(() => ({ ok: false, containers: [] })),
-    ]);
-    allTabs = prepareTabsForSearch(tabs || []);
-    tabContainers = containersResult && containersResult.ok && Array.isArray(containersResult.containers)
-      ? containersResult.containers
-      : [];
-  } catch (error) {
-    allTabs = [];
-    tabContainers = [];
-  }
-  if (!isOpen()) return; // closed while awaiting
+  await loadOverlayTabs(gen);
+  if (gen !== overlayGen || !isOpen()) return; // closed or reopened while awaiting
   render(inputEl.value);
 }
 
 function closeOverlay() {
+  overlayGen += 1;
   if (host && host.parentNode) host.parentNode.removeChild(host);
   host = null;
   shadow = null;
@@ -1411,6 +1500,7 @@ function closeOverlay() {
   clearMarks();
   previewState = null;
   tabContainers = [];
+  listLoadError = "";
   dropIndicator = null;
   // When we are the extension-hosted new-tab page (not an in-page overlay),
   // removing the host leaves a blank extension tab behind. Close the tab instead.
@@ -1425,88 +1515,139 @@ function closeOverlay() {
   }
 }
 
+// Fire an action send that closes the overlay on success. A runtime rejection is
+// surfaced as a visible failure message with the overlay kept open, instead of
+// being swallowed by a bare empty catch.
 function activate(item) {
+  let message;
   if (item.kind === "web") {
     // A URL-shaped query opens directly; anything else is a web search.
-    const message = item.url
+    message = item.url
       ? { type: "tabsearch-open-url", url: item.url }
       : { type: "tabsearch-web-search", query: item.query };
-    browser.runtime.sendMessage(message).catch(() => {});
-    closeOverlay();
-    return;
+  } else if (item.kind === "history") {
+    message = { type: "tabsearch-open-url", url: item.url };
+  } else {
+    message = { type: "tabsearch-activate", tabId: item.id, windowId: item.windowId };
   }
-  if (item.kind === "history") {
-    browser.runtime
-      .sendMessage({ type: "tabsearch-open-url", url: item.url })
-      .catch(() => {});
-    closeOverlay();
-    return;
-  }
-  browser.runtime
-    .sendMessage({ type: "tabsearch-activate", tabId: item.id, windowId: item.windowId })
-    .catch(() => {});
-  closeOverlay();
-}
-
-async function closeTab(tab) {
-  try {
-    const refreshed = await browser.runtime.sendMessage({ type: "tabsearch-close", tabId: tab.id });
-    if (Array.isArray(refreshed)) allTabs = prepareTabsForSearch(refreshed);
-  } catch (error) {
-    allTabs = allTabs.filter((candidate) => candidate.id !== tab.id);
-  }
-  if (isOpen()) render(inputEl.value);
-}
-
-async function runBulkListAction(type, payload) {
-  try {
-    const refreshed = await browser.runtime.sendMessage({ type, ...payload });
-    if (Array.isArray(refreshed)) {
-      allTabs = prepareTabsForSearch(refreshed);
-      clearMarks();
-      pruneMarked();
+  const gen = overlayGen;
+  browser.runtime.sendMessage(message).then(
+    (result) => {
+      // A close+reopen while this action was in flight starts a new session;
+      // never close or repaint it with a stale completion.
+      if (gen !== overlayGen) return;
+      // A resolved {ok:false} is a real backend failure (e.g. the tab was
+      // closed, or the URL/search could not open). Surface it and keep the
+      // overlay open instead of closing as if the action succeeded.
+      if (result && result.ok === false) {
+        actionMessage = "Action failed.";
+        if (isOpen()) render(inputEl.value);
+        return;
+      }
+      closeOverlay();
+    },
+    () => {
+      if (gen !== overlayGen) return;
+      actionMessage = "Action failed.";
+      if (isOpen()) render(inputEl.value);
     }
+  );
+}
+
+// Runs a list-refreshing action under the reopen/out-of-order guard: captures the
+// overlay generation and action sequence before the round-trip and drops the result
+// (no state writes, no render) when a close+reopen or a newer action superseded it.
+async function runGuardedListAction(send, { onResult, onError } = {}) {
+  const gen = overlayGen;
+  const seq = (latestActionSeq += 1);
+  try {
+    const result = await send();
+    if (gen !== overlayGen || seq !== latestActionSeq) return;
+    if (onResult) onResult(result);
   } catch (error) {
-    actionMessage = "Action failed.";
+    if (gen !== overlayGen || seq !== latestActionSeq) return;
+    if (onError) onError(error);
   }
   if (isOpen()) render(inputEl.value);
 }
 
-async function submitManualGroup(tabIds, title, windowId) {
+function closeTab(tab) {
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type: "tabsearch-close", tabId: tab.id }),
+    {
+      onResult(refreshed) {
+        if (Array.isArray(refreshed)) allTabs = prepareTabsForSearch(refreshed);
+      },
+      onError() {
+        allTabs = allTabs.filter((candidate) => candidate.id !== tab.id);
+      },
+    },
+  );
+}
+
+function runBulkListAction(type, payload) {
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type, ...payload }),
+    {
+      onResult(result) {
+        applyListActionResult(result, "Action failed.");
+      },
+      onError() {
+        actionMessage = "Action failed.";
+      },
+    },
+  );
+}
+
+function submitManualGroup(tabIds, title, windowId) {
   if (!title) {
     actionMessage = "Enter a group name.";
     render(inputEl.value);
     return;
   }
-  try {
-    const result = await browser.runtime.sendMessage({ type: "tabsearch-group", tabIds, title, windowId });
-    if (result && result.ok) {
-      if (Array.isArray(result.list)) allTabs = prepareTabsForSearch(result.list);
-      clearMarks();
-      pruneMarked();
-    } else {
-      actionMessage = (result && (result.message || result.error)) || "Could not group tabs.";
-    }
-  } catch (error) {
-    actionMessage = "Could not group tabs.";
-  }
-  if (isOpen()) render(inputEl.value);
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type: "tabsearch-group", tabIds, title, windowId }),
+    {
+      onResult(result) {
+        if (result && result.ok) {
+          if (Array.isArray(result.list)) allTabs = prepareTabsForSearch(result.list);
+          clearMarks();
+          pruneMarked();
+        } else {
+          actionMessage = (result && (result.message || result.error)) || "Could not group tabs.";
+        }
+      },
+      onError() {
+        actionMessage = "Could not group tabs.";
+      },
+    },
+  );
 }
 
-async function previewAiGroups(windowId) {
-  const tabIds = markedTabs().map((tab) => tab.id);
-  try {
-    const result = await browser.runtime.sendMessage({ type: "tabsearch-ai-preview", windowId, tabIds });
-    if (result && result.ok) {
-      previewState = { windowId, groups: result.groups || [] };
-      actionMessage = "";
-    } else {
-      actionMessage = (result && (result.message || result.error)) || "Could not preview AI groups.";
-    }
-  } catch (error) {
-    actionMessage = "Could not preview AI groups.";
-  }
+function previewAiGroups(windowId) {
+  if (aiPreviewInFlight) return;
+  aiPreviewInFlight = true;
   if (isOpen()) render(inputEl.value);
+  const tabIds = markedTabs().map((tab) => tab.id);
+  return runGuardedListAction(
+    () => browser.runtime.sendMessage({ type: "tabsearch-ai-preview", windowId, tabIds }),
+    {
+      onResult(result) {
+        if (result && result.ok) {
+          previewState = { windowId, groups: result.groups || [] };
+          actionMessage = "";
+        } else {
+          actionMessage = (result && (result.message || result.error)) || "Could not preview AI groups.";
+        }
+      },
+      onError() {
+        actionMessage = "Could not preview AI groups.";
+      },
+    },
+  ).finally(() => {
+    aiPreviewInFlight = false;
+    if (isOpen()) render(inputEl.value);
+  });
 }
 
 async function applyAiPreview() {
@@ -1516,14 +1657,19 @@ async function applyAiPreview() {
     color: group.color,
     tabs: group.tabs.map((tab) => ({ id: tab.id })),
   }));
+  const gen = overlayGen;
   try {
     const result = await browser.runtime.sendMessage({ type: "ai-group-apply", windowId: previewState.windowId, groups });
+    // A close+reopen while applying starts a new session; never close or repaint
+    // it with this stale completion.
+    if (gen !== overlayGen) return;
     if (result && result.ok) {
       closeOverlay();
       return;
     }
     actionMessage = (result && (result.message || result.error)) || "Could not apply AI groups.";
   } catch (error) {
+    if (gen !== overlayGen) return;
     actionMessage = "Could not apply AI groups.";
   }
   previewState = null;
@@ -1562,6 +1708,7 @@ function onGlobalKeydown(event) {
   if (matchesShortcut(event, shortcut)) {
     event.preventDefault();
     event.stopPropagation();
+    lastShortcutToggleAt = Date.now();
     openOverlay();
   }
 }
@@ -1616,6 +1763,13 @@ if (!window.__focusTabSearchInit) {
   if (browser.runtime && browser.runtime.onMessage) {
     browser.runtime.onMessage.addListener((message) => {
       if (message && message.type === "tabsearch-open") {
+        // Ignore the browser command's relayed open when the in-page keydown just
+        // handled the same Ctrl+S; otherwise the two entry points toggle the
+        // overlay open then closed. A deliberate open (popup button, new-tab
+        // route) arrives with no recent keydown and still opens.
+        if (Date.now() - lastShortcutToggleAt < COMMAND_ECHO_WINDOW_MS) {
+          return;
+        }
         openOverlay();
       }
     });

@@ -509,58 +509,82 @@ function mergeLensStateSummaries(lensSummaries) {
     }
   }
 }
+// Each loadAll is single-flight by generation: overlapping loads (init, import,
+// storage-driven reloads) must not share one guard. A stale load that resolves
+// after a newer one started drops its snapshot instead of clobbering fresher
+// state, and each load tracks the keys changed during its own await window in a
+// local set so a concurrent storage change is never overwritten.
+let loadGeneration = 0;
+const activeLoadChangeSets = new Set();
 
 async function loadAll() {
-  const windowId = await currentWindowId();
-  state.windowId = windowId;
-  const [stored, firefoxSnapshot, lensState, containers] = await Promise.all([
-    browser.storage.local.get(STORAGE_KEYS),
-    queryFirefoxGroupSnapshot(),
-    requestLensState(windowId),
-    requestContainers(),
-  ]);
+  const myGen = ++loadGeneration;
+  const changedKeys = new Set();
+  activeLoadChangeSets.add(changedKeys);
+  try {
+    const windowId = await currentWindowId();
+    const [stored, firefoxSnapshot, lensState, containers] = await Promise.all([
+      browser.storage.local.get(STORAGE_KEYS),
+      queryFirefoxGroupSnapshot(),
+      requestLensState(windowId),
+      requestContainers(),
+    ]);
+    // A newer load superseded this one while it awaited; drop the stale snapshot.
+    if (myGen !== loadGeneration) {
+      return;
+    }
+    state.windowId = windowId;
+    await commitLoadedState({ stored, firefoxSnapshot, lensState, containers, changedKeys });
+  } finally {
+    activeLoadChangeSets.delete(changedKeys);
+  }
+}
 
-  state.lenses = normalizeLenses(stored.lenses);
-  state.activeView = isRecord(stored.activeView) ? stored.activeView : { kind: "all" };
-  state.lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : null;
-  state.legacyFocusMappingsBackup = isRecord(stored.legacyFocusMappingsBackup) ? stored.legacyFocusMappingsBackup : null;
-  state.seenFocusIds = normalizeSeen(stored.seenFocusIds);
-  state.lastFocusSeen = typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null;
-  state.lastAction = typeof stored.lastAction === "string" ? stored.lastAction : null;
-  state.groupTitles = normalizeStringArray(stored.groupTitles);
+async function commitLoadedState({ stored, firefoxSnapshot, lensState, containers, changedKeys }) {
+  const applyStored = (key, value) => {
+    if (!changedKeys.has(key)) {
+      state[key] = value;
+    }
+  };
+  applyStored("lenses", normalizeLenses(stored.lenses));
+  applyStored("activeView", isRecord(stored.activeView) ? stored.activeView : { kind: "all" });
+  applyStored("lastActivation", isRecord(stored.lastActivation) ? stored.lastActivation : null);
+  applyStored("legacyFocusMappingsBackup", isRecord(stored.legacyFocusMappingsBackup) ? stored.legacyFocusMappingsBackup : null);
+  applyStored("seenFocusIds", normalizeSeen(stored.seenFocusIds));
+  applyStored("lastFocusSeen", typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null);
+  applyStored("lastAction", typeof stored.lastAction === "string" ? stored.lastAction : null);
+  applyStored("groupTitles", normalizeStringArray(stored.groupTitles));
   state.firefoxGroupTitles = firefoxSnapshot.titles;
   state.firefoxGroupTitleCounts = firefoxSnapshot.counts;
   state.currentGroups = firefoxSnapshot.currentGroups;
   state.containers = containers;
   state.containerNames = uniqueSortedTitlesFromValues(containers.map((container) => container.name));
-  state.unmappedFocusId = typeof stored.unmappedFocusId === "string" ? stored.unmappedFocusId : null;
-  state.missingGroup = typeof stored.missingGroup === "string" ? stored.missingGroup : null;
-  state.emptyGroup = typeof stored.emptyGroup === "string" ? stored.emptyGroup : null;
-  state.expandedGroups = normalizeStringArray(stored.expandedGroups);
-  state.collapsedGroups = normalizeStringArray(stored.collapsedGroups);
-  state.updateFailures = normalizeStringArray(stored.updateFailures);
-  state.connectionState = normalizeConnectionState(stored.connectionState);
-  state.lastError = normalizeLastError(stored.lastError);
-  state.tabSearchShortcut = "tabSearchShortcut" in stored
-    ? normalizeShortcut(stored.tabSearchShortcut)
-    : { ...DEFAULT_TAB_SEARCH_SHORTCUT };
-  state.aiProvider = normalizeProvider(stored.aiProvider);
-  state.aiGroupingPrompt = normalizeGroupingPrompt(stored.aiGroupingPrompt);
-  state.syncLenses = stored.syncLenses === true;
-  state.syncLastError = typeof stored.syncLastError === "string" ? stored.syncLastError : "";
-  state.lastProviderCheck = normalizeProviderCheck(stored.lastProviderCheck);
-  state.discardCollapsedTabs = stored.discardCollapsedTabs === true;
-  state.focusCatalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
-  state.lensSchedules = normalizeLensSchedules(stored.lensSchedules);
-  state.focusSessionHistory = normalizeFocusSessionHistory(stored.focusSessionHistory);
-  state.automationFallback = isRecord(stored.automationFallback) ? stored.automationFallback : { kind: "all" };
-  state.busToken = normalizeBusToken(stored.busToken);
-  state.busPairingStatus = normalizeBusPairingStatus(stored.busPairingStatus);
+  applyStored("unmappedFocusId", typeof stored.unmappedFocusId === "string" ? stored.unmappedFocusId : null);
+  applyStored("missingGroup", typeof stored.missingGroup === "string" ? stored.missingGroup : null);
+  applyStored("emptyGroup", typeof stored.emptyGroup === "string" ? stored.emptyGroup : null);
+  applyStored("expandedGroups", normalizeStringArray(stored.expandedGroups));
+  applyStored("collapsedGroups", normalizeStringArray(stored.collapsedGroups));
+  applyStored("updateFailures", normalizeStringArray(stored.updateFailures));
+  applyStored("connectionState", normalizeConnectionState(stored.connectionState));
+  applyStored("lastError", normalizeLastError(stored.lastError));
+  applyStored("tabSearchShortcut", "tabSearchShortcut" in stored ? normalizeShortcut(stored.tabSearchShortcut) : { ...DEFAULT_TAB_SEARCH_SHORTCUT });
+  applyStored("aiProvider", normalizeProvider(stored.aiProvider));
+  applyStored("aiGroupingPrompt", normalizeGroupingPrompt(stored.aiGroupingPrompt));
+  applyStored("syncLenses", stored.syncLenses === true);
+  applyStored("syncLastError", typeof stored.syncLastError === "string" ? stored.syncLastError : "");
+  applyStored("lastProviderCheck", normalizeProviderCheck(stored.lastProviderCheck));
+  applyStored("discardCollapsedTabs", stored.discardCollapsedTabs === true);
+  applyStored("focusCatalog", isRecord(stored.focusCatalog) ? stored.focusCatalog : {});
+  applyStored("lensSchedules", normalizeLensSchedules(stored.lensSchedules));
+  applyStored("focusSessionHistory", normalizeFocusSessionHistory(stored.focusSessionHistory));
+  applyStored("automationFallback", isRecord(stored.automationFallback) ? stored.automationFallback : { kind: "all" });
+  applyStored("busToken", normalizeBusToken(stored.busToken));
+  applyStored("busPairingStatus", normalizeBusPairingStatus(stored.busPairingStatus));
   if (isRecord(lensState)) {
-    if (isRecord(lensState.activeView)) {
+    if (!changedKeys.has("activeView") && isRecord(lensState.activeView)) {
       state.activeView = lensState.activeView;
     }
-    if (isRecord(lensState.lastActivation)) {
+    if (!changedKeys.has("lastActivation") && isRecord(lensState.lastActivation)) {
       state.lastActivation = lensState.lastActivation;
     }
     if (Array.isArray(lensState.currentGroups)) {
@@ -740,19 +764,6 @@ function nextLensColor() {
   return unused || LENS_COLOR_PALETTE[state.lenses.length % LENS_COLOR_PALETTE.length];
 }
 
-function generateLensId() {
-  return `lens_${Math.random().toString(36).slice(2, 10) || Date.now().toString(36)}`;
-}
-
-function uniqueLensId(lenses) {
-  const existingIds = new Set(lenses.map((lens) => lens.id));
-  let id = generateLensId();
-  while (existingIds.has(id)) {
-    id = generateLensId();
-  }
-  return id;
-}
-
 function sharePayloadForLens(lens) {
   return {
     tabloupeLens: 1,
@@ -796,33 +807,6 @@ async function shareLens(lens) {
   }
 }
 
-function importedLensFromCode(code, existingLenses) {
-  let parsed;
-  try {
-    parsed = JSON.parse(code.trim());
-  } catch (error) {
-    return null;
-  }
-  if (!isRecord(parsed) || parsed.tabloupeLens !== 1 || !isRecord(parsed.lens)) {
-    return null;
-  }
-  const name = typeof parsed.lens.name === "string" ? parsed.lens.name.trim() : "";
-  if (!name) {
-    return null;
-  }
-  const now = Date.now();
-  return normalizeLens({
-    id: uniqueLensId(existingLenses),
-    name,
-    icon: parsed.lens.icon,
-    color: parsed.lens.color,
-    groupSelectors: parsed.lens.groupSelectors,
-    triggers: { appleFocusIds: [], calendarPatterns: [] },
-    createdAt: now,
-    updatedAt: now,
-  });
-}
-
 function setLensImportVisible(visible) {
   const row = document.getElementById("lens-import-row");
   const toggle = document.getElementById("import-lens-toggle");
@@ -848,20 +832,18 @@ function closeLensImport() {
 async function addLensFromCode() {
   const input = document.getElementById("lens-import-code");
   const code = input ? input.value : "";
-  const stored = await browser.storage.local.get("lenses");
-  const lenses = normalizeLenses(stored.lenses);
-  const lens = importedLensFromCode(code, lenses);
-  if (!lens) {
+  const result = await browser.runtime.sendMessage({ type: "lens-import", code });
+  if (!result || result.ok !== true) {
     showToast("Not a valid lens code.", "error");
     return;
   }
-  const next = normalizeLenses([...lenses, lens]);
-  await browser.storage.local.set({ lenses: next });
-  state.lenses = next;
   if (input) {
     input.value = "";
   }
   setLensImportVisible(false);
+  const merged = state.lenses.filter((lens) => lens.id !== result.lens.id);
+  merged.push(result.lens);
+  state.lenses = normalizeLenses(merged);
   render();
   showToast("Lens added.", "ok");
 }
@@ -929,9 +911,22 @@ async function persistLensPatch(lensId, patch, statusMessage = "Saved") {
     return null;
   }
   render();
-  await browser.runtime.sendMessage({ type: "lens-update", lensId, patch });
+  const result = await browser.runtime.sendMessage({ type: "lens-update", lensId, patch });
+  if (!result || result.ok !== true) {
+    // The background rejected the edit; revert the optimistic UI to the
+    // authoritative stored state instead of falsely reporting success.
+    await reloadLensesFromStorage();
+    setStatus("Save failed. Please try again.", "error");
+    return null;
+  }
   setStatus(statusMessage, "ok");
   return next;
+}
+
+async function reloadLensesFromStorage() {
+  const stored = await browser.storage.local.get("lenses");
+  state.lenses = normalizeLenses(stored.lenses);
+  render();
 }
 
 function selectorFromText(value) {
@@ -1320,9 +1315,19 @@ async function linkFocusToLens(lensId, focusId) {
   if (lensId) {
     message.lensId = lensId;
   }
-  await browser.runtime.sendMessage(message);
+  const linkResult = await browser.runtime.sendMessage(message);
+  if (!linkResult || linkResult.ok !== true) {
+    await reloadLensesFromStorage();
+    setStatus("Save failed. Please try again.", "error");
+    return;
+  }
   if (lensId && namePatch.name) {
-    await browser.runtime.sendMessage({ type: "lens-update", lensId, patch: namePatch });
+    const nameResult = await browser.runtime.sendMessage({ type: "lens-update", lensId, patch: namePatch });
+    if (!nameResult || nameResult.ok !== true) {
+      await reloadLensesFromStorage();
+      setStatus("Save failed. Please try again.", "error");
+      return;
+    }
   }
   setStatus(lensId ? "Focus link saved." : "Focus link removed.", "ok");
 }
@@ -1578,19 +1583,29 @@ function scheduleForLens(lensId) {
   };
 }
 
-async function persistLensSchedule(lensId, patch) {
-  const schedules = normalizeLensSchedules(state.lensSchedules);
-  const index = schedules.findIndex((schedule) => schedule.lensId === lensId);
-  const existing = index === -1 ? scheduleForLens(lensId) : schedules[index];
-  const next = { ...existing, ...patch, lensId };
-  if (index === -1) {
-    schedules.push(next);
-  } else {
-    schedules[index] = next;
-  }
-  state.lensSchedules = normalizeLensSchedules(schedules);
-  await browser.storage.local.set({ lensSchedules: state.lensSchedules });
-  render();
+// Schedule writes are serialized and each recomputes from the authoritative
+// stored array, not mutable UI state. Two rapid edits (two lenses, or two
+// fields) otherwise read-modify-write a stale whole-array snapshot and silently
+// revert one another.
+let scheduleWriteQueue = Promise.resolve();
+function persistLensSchedule(lensId, patch) {
+  scheduleWriteQueue = scheduleWriteQueue.catch(() => {}).then(async () => {
+    const stored = await browser.storage.local.get("lensSchedules");
+    const schedules = normalizeLensSchedules(stored.lensSchedules);
+    const index = schedules.findIndex((schedule) => schedule.lensId === lensId);
+    const existing = index === -1 ? scheduleForLens(lensId) : schedules[index];
+    const next = { ...existing, ...patch, lensId };
+    if (index === -1) {
+      schedules.push(next);
+    } else {
+      schedules[index] = next;
+    }
+    const normalized = normalizeLensSchedules(schedules);
+    state.lensSchedules = normalized;
+    await browser.storage.local.set({ lensSchedules: normalized });
+    render();
+  });
+  return scheduleWriteQueue;
 }
 
 function makeScheduleEditor(lens) {
@@ -2074,7 +2089,11 @@ async function activateLensView(view) {
   state.windowId = windowId;
   state.activeView = view;
   render();
-  await browser.runtime.sendMessage({ type: "lens-activate", windowId, view });
+  const result = await browser.runtime.sendMessage({ type: "lens-activate", windowId, view });
+  if (!result || result.ok !== true) {
+    await refreshLensState(windowId);
+    throw new Error("Lens activation was not applied.");
+  }
   await refreshLensState(windowId);
   setStatus(view.kind === "all" ? "Showing all groups." : "Showing lens.", "ok");
 }
@@ -2773,6 +2792,13 @@ function setupAnchorNav() {
 
 
 function applyStorageChange(changes) {
+  // Record the changed keys for every in-flight load so none of them overwrite
+  // this fresher value with its older snapshot when it commits.
+  for (const changeSet of activeLoadChangeSets) {
+    for (const key of Object.keys(changes)) {
+      changeSet.add(key);
+    }
+  }
   if (changes.lenses) {
     state.lenses = normalizeLenses(changes.lenses.newValue);
     syncUntouchedDefaultLenses();
@@ -2870,8 +2896,15 @@ function applyStorageChange(changes) {
   render();
 }
 
+let firefoxGroupsRefreshGen = 0;
 async function refreshFirefoxGroups() {
+  // Focus-triggered refreshes can overlap; stamp each and apply only the latest
+  // snapshot so an older query resolving last cannot repaint stale group state.
+  const myGen = ++firefoxGroupsRefreshGen;
   const snapshot = await queryFirefoxGroupSnapshot();
+  if (myGen !== firefoxGroupsRefreshGen) {
+    return;
+  }
   state.firefoxGroupTitles = snapshot.titles;
   state.firefoxGroupTitleCounts = snapshot.counts;
   state.currentGroups = snapshot.currentGroups;
@@ -2947,15 +2980,17 @@ function validateProviderBaseURL(baseURL) {
   } catch (error) {
     return { error: "That base URL is not valid." };
   }
-  const loopbackHosts = ["localhost", "127.0.0.1", "[::1]"];
+  const loopbackHosts = ["localhost", "127.0.0.1"];
   if (parsed.protocol !== "https:" && !loopbackHosts.includes(parsed.hostname)) {
     return { error: "Use an https:// URL. Plain http is only allowed for localhost." };
   }
   return { parsed, origin: parsed.origin };
 }
 
-function requestProviderOriginPermission(origin) {
-  return browser.permissions.request({ origins: [`${origin}/*`] });
+function requestProviderOriginPermission(parsed) {
+  // WebExtension host match patterns forbid a port, so request protocol+hostname only
+  // (e.g. http://localhost/* for http://localhost:11434/v1).
+  return browser.permissions.request({ origins: [`${parsed.protocol}//${parsed.hostname}/*`] });
 }
 
 function providerEndpoint(baseURL, path) {
@@ -3091,7 +3126,7 @@ async function testProviderConnection() {
 
     let granted;
     try {
-      granted = await requestProviderOriginPermission(validation.origin);
+      granted = await requestProviderOriginPermission(validation.parsed);
     } catch (error) {
       await rememberProviderCheck(false, "Could not request permission for that domain.");
       return;
@@ -3285,7 +3320,7 @@ async function saveProvider() {
 
   let granted;
   try {
-    granted = await requestProviderOriginPermission(origin);
+    granted = await requestProviderOriginPermission(validation.parsed);
   } catch (error) {
     console.error("Host permission request failed:", error);
     showToast("Could not request permission for that domain.", "error");

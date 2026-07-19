@@ -1,8 +1,12 @@
 .env
 web-ext-artifacts/
+.build.lock/
 node_modules/
 
 .DS_Store
 .agents/
 .antigravitycli/
 .amo-upload-uuid
+
+# Scratch tier: throwaway dev artifacts (oracle one-shots, etc.)
+dev/scratch/

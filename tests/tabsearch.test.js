@@ -507,6 +507,43 @@ test("AI preview renders topic sections and apply sends reduced groups", async (
   assert.equal(overlayRoot(harness), null);
 });
 
+test("AI preview ignores re-entry until the in-flight request settles", async () => {
+  let previewCalls = 0;
+  let resolvePreview;
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-ai-preview") {
+        previewCalls += 1;
+        if (previewCalls === 1) return new Promise((resolve) => { resolvePreview = resolve; });
+        return { ok: false, message: "AI preview failed." };
+      }
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  rows(harness)[1].querySelector(".mark").click();
+  let aiButton = Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "AI group");
+  aiButton.click();
+  assert.equal(harness.sent.filter((message) => message.type === "tabsearch-ai-preview").length, 1);
+  aiButton = Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "AI group");
+  assert.equal(aiButton.disabled, true);
+
+  harness.window.previewAiGroups(1);
+  assert.equal(harness.sent.filter((message) => message.type === "tabsearch-ai-preview").length, 1);
+
+  resolvePreview({ ok: false, message: "AI preview failed." });
+  await settle();
+  aiButton = Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "AI group");
+  assert.equal(aiButton.disabled, false);
+  aiButton.click();
+  await settle();
+  assert.equal(harness.sent.filter((message) => message.type === "tabsearch-ai-preview").length, 2);
+});
+
 test("bulk close sends tabsearch-close-many and refreshes the list", async () => {
   const harness = createHarness({
     respond(message) {
@@ -649,6 +686,35 @@ test("browse mode renders a collapsible group section and collapsing hides its m
   assert.equal(rows(harness).length, 1);
 });
 
+test("a refreshed tab list prunes collapsed groups that no longer exist", async () => {
+  const initialTabs = [
+    { id: 1, windowId: 1, title: "Docs", url: "https://docs.example.com", favIconUrl: "", active: true, currentWindow: true, pinned: false, grouped: false, groupId: -1 },
+    { id: 2, windowId: 1, title: "HN", url: "https://news.ycombinator.com", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "Read", groupColor: "green" },
+    { id: 3, windowId: 1, title: "Lobsters", url: "https://lobste.rs", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "Read", groupColor: "green" },
+  ];
+  const refreshedTabs = initialTabs.map((tab) =>
+    tab.groupId === 5 ? { ...tab, groupId: 6, groupTitle: "Later" } : tab,
+  );
+  const harness = createHarness({
+    tabs: initialTabs,
+    respond(message) {
+      if (message.type === "tabsearch-list") return initialTabs.slice();
+      if (message.type === "refresh") return refreshedTabs;
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  overlayRoot(harness).querySelector(".group-header").click();
+  assert.equal(rows(harness).length, 1);
+  harness.window.runBulkListAction("refresh", {});
+  await settle();
+
+  assert.equal(overlayRoot(harness).querySelector(".group-header").classList.contains("collapsed"), false);
+  assert.equal(rows(harness).length, 3);
+});
+
 test("dragging a row onto a group header groups it via the target groupId", async () => {
   const tabs = [
     { id: 1, windowId: 1, title: "Docs", url: "https://docs.example.com", favIconUrl: "", active: true, currentWindow: true, pinned: false, grouped: false, groupId: -1 },
@@ -708,6 +774,27 @@ test("dropping a row inside a group (between two members) moves it into that gro
   assert.equal(sent.anchorId, 2);
   assert.equal(sent.placeAfter, true);
   assert.equal(sent.groupId, 5);
+});
+
+test("a partial tab-search move refreshes the list and surfaces its failure", async () => {
+  const refreshed = [{ ...SAMPLE_TABS[0], title: "Moved Docs" }];
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-move") {
+        return { ok: false, error: "group_update_failed", message: "Moved tabs, but could not update the group.", list: refreshed };
+      }
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  harness.window.moveOntoPosition([20], 1, 30, true, -1);
+  await settle();
+
+  assert.deepEqual(rowTitles(harness), ["Moved Docs"]);
+  assert.equal(overlayRoot(harness).querySelector(".message").textContent, "Moved tabs, but could not update the group.");
 });
 
 test("dropping a grouped row among ungrouped rows drags it out of the group", async () => {
@@ -840,6 +927,43 @@ test("history rows render before the web row", async () => {
     ["History 1", "History 2", "History 3"],
   );
   assert.equal(cappedActionRows[cappedActionRows.length - 1].querySelector(".name").textContent, "Search the web");
+});
+
+test("an older history query's late failure does not clear newer results", async () => {
+  let rejectStale;
+  const stalePending = new Promise((_, reject) => { rejectStale = reject; });
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-history") {
+      if (message.query === "rust") return stalePending; // stays pending, rejected later
+      if (message.query === "rustlang") {
+        return { ok: true, results: [{ title: "Rustlang Docs", url: "https://rustlang.example/" }] };
+      }
+      return { ok: true, results: [] };
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  // Fire the "rust" fetch (left in flight), then supersede it with "rustlang".
+  await typeTabSearchQuery(harness, "rust");
+  await typeTabSearchQuery(harness, "rustlang");
+
+  const hasRustlang = () => Array.from(overlayRoot(harness).querySelectorAll(".row.action-row"))
+    .some((row) => row.querySelector(".name").textContent === "Rustlang Docs");
+  assert.ok(hasRustlang(), "newer query's history is shown");
+
+  // The stale "rust" fetch now fails, after "rustlang" already populated results.
+  rejectStale(new Error("history unavailable"));
+  await settle();
+
+  // Re-render synchronously (input handler renders before the debounced fetch)
+  // to surface the in-memory history state without repopulating it.
+  const input = overlayRoot(harness).querySelector(".search");
+  input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
+  assert.ok(hasRustlang(), "the stale failure must not clear the newer query's results");
 });
 test("sections label open tabs, history, and search", async () => {
   const respond = (message) => {
@@ -1294,4 +1418,223 @@ test("container badges render for non-default containers only", async () => {
   assert.equal(badge.querySelector(".container-name").textContent, "Work");
   assert.equal(badge.dataset.color, "blue");
   assert.equal(byTitle.get("Default tab").querySelector(".container-badge"), null);
+});
+
+// ── Regression: stranded focus-tab-groups findings ────────────────────
+
+test("parseQueryAsUrl handles IPv4 edge cases", () => {
+  const { window } = createHarness();
+
+  // Valid dotted quads (with and without a port) navigate directly.
+  assert.equal(window.parseQueryAsUrl("192.168.1.1"), "https://192.168.1.1/");
+  assert.equal(window.parseQueryAsUrl("10.0.0.1:3000"), "https://10.0.0.1:3000/");
+  // Out-of-range octets are not a valid IPv4 host -> fall back to a web search.
+  assert.equal(window.parseQueryAsUrl("999.999.999.999"), null);
+  assert.equal(window.parseQueryAsUrl("256.1.1.1"), null);
+  // Three octets are not a dotted quad and "3" is not a known TLD.
+  assert.equal(window.parseQueryAsUrl("1.2.3"), null);
+});
+
+test("the browser command echo does not close the overlay the keydown just opened", async () => {
+  const harness = createHarness();
+
+  // Content-script keydown opens the overlay and stamps the shortcut time.
+  pressCtrlS(harness);
+  await settle();
+  assert.ok(overlayRoot(harness), "keydown opens the overlay");
+
+  // The WebExtension command relays tabsearch-open for the same keypress; it
+  // must be ignored as an echo so the overlay stays open instead of toggling.
+  harness.messageListeners[0]({ type: "tabsearch-open" });
+  await settle();
+  assert.ok(overlayRoot(harness), "the relayed command echo must not close the overlay");
+});
+
+// ── Regression: stale async work vs. reopen / out-of-order / silent failures ──
+
+test("a failed tab list shows a retryable load error instead of the empty-tab copy", async () => {
+  let listAttempts = 0;
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") {
+        listAttempts += 1;
+        if (listAttempts === 1) throw new Error("background unavailable");
+        return SAMPLE_TABS.slice();
+      }
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  const root = overlayRoot(harness);
+  assert.ok(root, "the overlay remains open after a list failure");
+  assert.equal(root.querySelector(".empty").textContent, "Could not load tabs. Try again.");
+  assert.equal(root.textContent.includes("No matching tabs"), false);
+
+  Array.from(root.querySelectorAll(".actions button")).find((button) => button.textContent === "Retry").click();
+  await settle();
+  assert.deepEqual(rowTitles(harness), ["Docs", "GitHub", "Mozilla"]);
+  assert.equal(listAttempts, 2);
+});
+
+test("a stale in-flight list does not repaint a reopened overlay", async () => {
+  const listResolvers = [];
+  const STALE = [{ id: 1, windowId: 1, title: "StaleTab", url: "https://stale.example", currentWindow: true }];
+  const FRESH = [{ id: 2, windowId: 1, title: "FreshTab", url: "https://fresh.example", currentWindow: true }];
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return new Promise((resolve) => listResolvers.push(resolve));
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+
+  pressCtrlS(harness); // open #1 — first list is in flight
+  await settle();
+  pressCtrlS(harness); // close #1 while its list is still pending
+  await settle();
+  pressCtrlS(harness); // reopen #2 — second list is in flight
+  await settle();
+
+  // The first open's list resolves after the reopen; it must be discarded.
+  listResolvers[0](STALE);
+  await settle();
+  assert.ok(!rowTitles(harness).includes("StaleTab"), "stale list must not repaint the reopened overlay");
+
+  // The reopened overlay's own list still renders normally.
+  listResolvers[1](FRESH);
+  await settle();
+  assert.deepEqual(rowTitles(harness), ["FreshTab"]);
+});
+test("a stale closeTab response does not repaint a reopened overlay", async () => {
+  const closeResolvers = [];
+  const STALE = [{ id: 1, windowId: 1, title: "StaleClose", url: "https://stale.example", currentWindow: true }];
+  const FRESH = [{ id: 2, windowId: 1, title: "FreshTab", url: "https://fresh.example", currentWindow: true }];
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return FRESH.slice();
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    if (message.type === "tabsearch-close") return new Promise((resolve) => closeResolvers.push(resolve));
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+
+  pressCtrlS(harness); // open #1
+  await settle();
+
+  // Start a close whose refreshed-list response stays pending.
+  harness.window.closeTab({ id: 2 });
+  await settle();
+
+  pressCtrlS(harness); // close the overlay while the close response is in flight
+  await settle();
+  pressCtrlS(harness); // reopen — the fresh list renders
+  await settle();
+  assert.deepEqual(rowTitles(harness), ["FreshTab"]);
+
+  // The stale close response resolves after the reopen; it must be discarded.
+  closeResolvers[0](STALE);
+  await settle();
+  assert.deepEqual(rowTitles(harness), ["FreshTab"], "stale closeTab response must not repaint the reopened overlay");
+});
+
+test("out-of-order bulk refreshes keep the latest-issued list", async () => {
+  const bulkResolvers = [];
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    if (message.type === "bulk-a" || message.type === "bulk-b") {
+      return new Promise((resolve) => bulkResolvers.push(resolve));
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  const STALE = [{ id: 101, windowId: 1, title: "StaleResult", url: "https://a.example", currentWindow: true }];
+  const LATEST = [{ id: 202, windowId: 1, title: "LatestResult", url: "https://b.example", currentWindow: true }];
+
+  harness.window.runBulkListAction("bulk-a", {}); // issued first
+  harness.window.runBulkListAction("bulk-b", {}); // issued last (the winner)
+
+  // Resolve out of order: the latest-issued arrives first, the stale one last.
+  bulkResolvers[1](LATEST);
+  await settle();
+  bulkResolvers[0](STALE);
+  await settle();
+
+  assert.deepEqual(rowTitles(harness), ["LatestResult"], "the latest-issued action wins regardless of resolution order");
+});
+
+test("a stale activate completion does not close a reopened overlay", async () => {
+  let resolveActivate;
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    if (message.type === "tabsearch-activate") {
+      return new Promise((resolve) => { resolveActivate = resolve; });
+    }
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+
+  pressCtrlS(harness); // open session #1
+  await settle();
+  pressKey(harness, "Enter"); // activation left in flight
+  await settle();
+  assert.ok(resolveActivate, "activate request was sent");
+
+  pressKey(harness, "Escape"); // close session #1
+  await settle();
+  assert.equal(overlayRoot(harness), null);
+
+  pressCtrlS(harness); // reopen as session #2
+  await settle();
+  assert.ok(overlayRoot(harness), "overlay reopened");
+
+  // The stale activation resolves now; it must not close the fresh session.
+  resolveActivate({ ok: true });
+  await settle();
+  assert.ok(overlayRoot(harness), "a stale activate completion must not close the reopened overlay");
+});
+
+test("a failed action send surfaces a visible failure message instead of swallowing it", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    if (message.type === "tabsearch-activate") return Promise.reject(new Error("boom"));
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  pressKey(harness, "Enter"); // activate the selected tab; the send rejects
+  await settle();
+
+  assert.ok(overlayRoot(harness), "overlay stays open when the activate fails");
+  const message = overlayRoot(harness).querySelector(".message");
+  assert.ok(message, "a failure message is rendered rather than silently swallowed");
+  assert.equal(message.textContent, "Action failed.");
+});
+
+test("a resolved ok:false action keeps the overlay open and surfaces the failure", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    // The backend now resolves with a structured failure rather than rejecting.
+    if (message.type === "tabsearch-activate") return { ok: false, error: "tab_not_found" };
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  pressKey(harness, "Enter"); // activate; backend resolves {ok:false}
+  await settle();
+
+  assert.ok(overlayRoot(harness), "overlay stays open when the action reports failure");
+  const message = overlayRoot(harness).querySelector(".message");
+  assert.ok(message, "a failure message is rendered rather than closing as success");
+  assert.equal(message.textContent, "Action failed.");
 });

@@ -31,7 +31,7 @@ function defaultLensState(overrides = {}) {
   };
 }
 
-function createHarness({ windowId = 7, respond = () => ({}), storage = {} } = {}) {
+function createHarness({ windowId = 7, respond = () => ({}), storage = {}, storageGet, storageSet } = {}) {
   const sent = [];
   const storageData = { ...storage };
   const optionsOpened = [];
@@ -47,6 +47,12 @@ function createHarness({ windowId = 7, respond = () => ({}), storage = {} } = {}
     storage: {
       local: {
         async get(keys) {
+          if (storageGet) {
+            const result = await storageGet(keys, storageData);
+            if (result !== undefined) {
+              return result;
+            }
+          }
           if (typeof keys === "string") {
             return { [keys]: storageData[keys] };
           }
@@ -56,6 +62,9 @@ function createHarness({ windowId = 7, respond = () => ({}), storage = {} } = {}
           return { ...storageData };
         },
         async set(values) {
+          if (storageSet) {
+            await storageSet(values, storageData);
+          }
           const changes = Object.fromEntries(
             Object.entries(values).map(([key, value]) => [key, { oldValue: storageData[key], newValue: value }]),
           );
@@ -381,6 +390,60 @@ test("persisted last error renders once and clears when AI subview opens", async
   assert.equal(harness.storageData.lastError, null);
 });
 
+test("popup does not clear a newer error that arrives during acknowledgement", async () => {
+  const oldError = { code: "provider-http", message: "Old error", at: 1000, source: "ai" };
+  const newError = { code: "provider-http", message: "New error", at: 2000, source: "ai" };
+  const harness = createHarness({
+    storage: { connectionState: "connected", lastError: oldError },
+    respond: (msg) => {
+      if (msg.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (msg.type === "ai-group-state") return { enabled: false, groupableCount: 0, proposal: null };
+      return {};
+    },
+  });
+
+  // The acknowledgement re-reads lastError before clearing; simulate a newer AI
+  // failure landing between the initial snapshot and that re-read.
+  const realGet = harness.browser.storage.local.get;
+  harness.browser.storage.local.get = async (keys) => {
+    if (keys === "lastError") {
+      harness.storageData.lastError = newError;
+      return { lastError: newError };
+    }
+    return realGet(keys);
+  };
+
+  await settle();
+  await openAi(harness);
+
+  // The newer error must survive (not be clobbered by the stale ack) and surface.
+  assert.deepEqual(harness.storageData.lastError, newError);
+  const connection = harness.document.getElementById("popup-connection");
+  assert.equal(connection.textContent, "New error");
+});
+
+test("persisted last error is preserved when reconnect banner is shown", async () => {
+  const message = "Provider returned HTTP 401. Check your API key.";
+  const storedError = { code: "provider-http", message, at: Date.now(), source: "ai" };
+  const harness = createHarness({
+    storage: {
+      connectionState: "reconnecting",
+      lastError: storedError,
+    },
+    respond: (msg) => {
+      if (msg.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (msg.type === "ai-group-state") return { enabled: false, groupableCount: 0, proposal: null };
+      return {};
+    },
+  });
+  await settle();
+  await openAi(harness);
+
+  const connection = harness.document.getElementById("popup-connection");
+  assert.equal(connection.textContent, "⚠ Not connected to mac-command-centre");
+  assert.deepEqual(harness.storageData.lastError, storedError);
+});
+
 test("disabled AI state renders toggle off and does not preview", async () => {
   const harness = createHarness({
     respond: (message) => {
@@ -486,6 +549,85 @@ test("toggling the AI checkbox writes the enabled flag to storage", async () => 
   await settle();
 
   assert.equal(harness.storageData.aiGroupingEnabled, true);
+});
+
+test("failed AI preference writes revert the checkbox and show an error", async () => {
+  const harness = createHarness({
+    respond: (message) => {
+      if (message.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (message.type === "ai-group-state") return { enabled: false, groupableCount: 0, proposal: null };
+      return {};
+    },
+    storageSet(values) {
+      if (values.aiGroupingEnabled !== undefined) {
+        throw new Error("storage unavailable");
+      }
+    },
+  });
+  await settle();
+  await openAi(harness);
+
+  const box = harness.document.getElementById("ai-enabled");
+  box.checked = true;
+  box.dispatchEvent(new harness.window.Event("change"));
+  await settle();
+
+  assert.equal(box.checked, false);
+  assert.equal(harness.storageData.aiGroupingEnabled, undefined);
+  assert.match(harness.document.getElementById("ai-status").textContent, /Could not save AI setting/);
+  assert.match(harness.document.getElementById("ai-status").className, /error/);
+});
+
+test("failed AI pin and auto-group writes revert their checkboxes", async () => {
+  const harness = createHarness({
+    respond: (message) => {
+      if (message.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (message.type === "ai-group-state") {
+        return { enabled: true, groupableCount: 2, proposal: null, pinToFocus: false, activeFocus: "Work" };
+      }
+      return {};
+    },
+    storageSet(values) {
+      if (values.aiPinToFocus !== undefined || values.aiAutoGroup !== undefined) {
+        throw new Error("storage unavailable");
+      }
+    },
+  });
+  await settle();
+  await openAi(harness);
+
+  for (const id of ["ai-pin", "ai-auto"]) {
+    const box = harness.document.getElementById(id);
+    box.checked = true;
+    box.dispatchEvent(new harness.window.Event("change"));
+    await settle();
+    assert.equal(box.checked, false, `${id} reverted`);
+  }
+  assert.equal(harness.storageData.aiPinToFocus, undefined);
+  assert.equal(harness.storageData.aiAutoGroup, undefined);
+  assert.match(harness.document.getElementById("ai-status").textContent, /Could not save AI setting/);
+});
+
+test("failed AI preference reads show a fallback auto-group state", async () => {
+  const harness = createHarness({
+    storage: { aiAutoGroup: true },
+    respond: (message) => {
+      if (message.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (message.type === "ai-group-state") return { enabled: true, groupableCount: 2, proposal: null };
+      return {};
+    },
+    storageGet(keys) {
+      if (keys === "aiAutoGroup") {
+        throw new Error("storage unavailable");
+      }
+    },
+  });
+  await settle();
+  await openAi(harness);
+
+  assert.equal(harness.document.getElementById("ai-auto").checked, false);
+  assert.match(harness.document.getElementById("ai-status").textContent, /Could not read AI preferences/);
+  assert.match(harness.document.getElementById("ai-status").className, /error/);
 });
 
 test("auto-group row is visible and checked when enabled and aiAutoGroup is stored", async () => {
@@ -594,4 +736,46 @@ test("AI pin row disables with a hint when no lens is active", async () => {
   const label = harness.document.getElementById("ai-pin-label");
   assert.equal(label.textContent, "Add new groups to current lens (none active)");
   assert.equal(harness.document.getElementById("ai-pin").disabled, true);
+});
+
+// ── Regression: stranded focus-tab-groups findings ────────────────────
+
+test("popup labels a scheduled activation as schedule, not Apple Focus", async () => {
+  const harness = createHarness({
+    respond: (message) =>
+      message.type === "lens-state"
+        ? defaultLensState({
+            activeView: { kind: "lens", lensId: "lens_work" },
+            lastActivation: { trigger: "schedule" },
+            lenses: [{ id: "lens_work", name: "Work", icon: "briefcase", color: "blue", active: true }],
+            hasGroups: true,
+            hasAppleBinding: true,
+          })
+        : {},
+  });
+  await settle();
+
+  const trigger = harness.document.getElementById("lens-trigger");
+  assert.equal(trigger.hidden, false);
+  assert.equal(trigger.textContent, "Switched by schedule");
+});
+
+test("popup still labels an Apple Focus activation as Apple Focus", async () => {
+  const harness = createHarness({
+    respond: (message) =>
+      message.type === "lens-state"
+        ? defaultLensState({
+            activeView: { kind: "lens", lensId: "lens_work" },
+            lastActivation: { trigger: "appleFocus" },
+            lenses: [{ id: "lens_work", name: "Work", icon: "briefcase", color: "blue", active: true }],
+            hasGroups: true,
+            hasAppleBinding: true,
+          })
+        : {},
+  });
+  await settle();
+
+  const trigger = harness.document.getElementById("lens-trigger");
+  assert.equal(trigger.hidden, false);
+  assert.equal(trigger.textContent, "Switched by Apple Focus");
 });

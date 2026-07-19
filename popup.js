@@ -49,6 +49,13 @@ function renderConnectionStatus(state = connectionStatus) {
   connection.className = "conn";
 }
 
+function sameLastError(a, b) {
+  if (!a || !b) {
+    return a === b;
+  }
+  return a.at === b.at && a.message === b.message;
+}
+
 async function initConnectionStatus() {
   const stored = await browser.storage.local.get(["connectionState", "lastError"]);
   connectionStatus = {
@@ -56,9 +63,23 @@ async function initConnectionStatus() {
     lastError: stored.lastError || null,
   };
   renderConnectionStatus();
-  if (connectionStatus.lastError) {
-    await browser.storage.local.set({ lastError: null });
-    connectionStatus.lastError = null;
+  const errorSurfaced =
+    connectionStatus.connectionState === "connected" &&
+    connectionStatus.lastError &&
+    connectionStatus.lastError.message;
+  if (errorSurfaced) {
+    // Acknowledge only the error we actually surfaced. A concurrent AI failure
+    // can write a newer lastError between our read and this clear; clobbering
+    // it would hide the new failure from all UI and drop its diagnostic.
+    const current = await browser.storage.local.get("lastError");
+    if (sameLastError(current.lastError || null, connectionStatus.lastError)) {
+      await browser.storage.local.set({ lastError: null });
+      connectionStatus.lastError = null;
+    } else {
+      // A newer error arrived mid-clear; surface it instead of the stale one.
+      connectionStatus.lastError = current.lastError || null;
+      renderConnectionStatus();
+    }
   }
 }
 
@@ -197,8 +218,15 @@ function renderTriggerLine(state) {
     trigger.hidden = false;
     return;
   }
-  if (lastActivation.trigger && lastActivation.trigger !== "manual") {
-    trigger.textContent = "Switched by Apple Focus";
+  const AUTOMATION_TRIGGER_LABELS = {
+    appleFocus: "Switched by Apple Focus",
+    schedule: "Switched by schedule",
+    calendar: "Switched by calendar event",
+    external: "Switched by automation",
+  };
+  const label = AUTOMATION_TRIGGER_LABELS[lastActivation.trigger];
+  if (label) {
+    trigger.textContent = label;
     trigger.hidden = false;
     return;
   }
@@ -513,7 +541,15 @@ async function refreshAi({ autoPreview = false } = {}) {
 
   el("ai-enabled").checked = state.enabled === true;
   renderPin(state);
-  const autoStored = await browser.storage.local.get("aiAutoGroup");
+  let autoStored;
+  try {
+    autoStored = await browser.storage.local.get("aiAutoGroup");
+  } catch (error) {
+    console.error("AI preferences failed:", error);
+    renderAuto(state, false);
+    setStatus("Could not read AI preferences.", "error");
+    return;
+  }
   renderAuto(state, autoStored.aiAutoGroup === true);
 
   if (state.enabled !== true) {
@@ -553,6 +589,20 @@ async function closeAiSubview() {
   await refreshLensState();
 }
 
+async function saveAiPreference(event, key) {
+  const checkbox = event.target;
+  const previousChecked = !checkbox.checked;
+  try {
+    await browser.storage.local.set({ [key]: checkbox.checked });
+    return true;
+  } catch (error) {
+    console.error("AI preference save failed:", error);
+    checkbox.checked = previousChecked;
+    setStatus("Could not save AI setting. Try again.", "error");
+    return false;
+  }
+}
+
 async function ensureAiInitialized() {
   if (aiInitialized) {
     return;
@@ -564,14 +614,15 @@ async function ensureAiInitialized() {
   }
 
   el("ai-enabled").addEventListener("change", async (event) => {
-    await browser.storage.local.set({ aiGroupingEnabled: event.target.checked });
-    await refreshAi({ autoPreview: false });
+    if (await saveAiPreference(event, "aiGroupingEnabled")) {
+      await refreshAi({ autoPreview: false });
+    }
   });
-  el("ai-pin").addEventListener("change", async (event) => {
-    await browser.storage.local.set({ aiPinToFocus: event.target.checked });
+  el("ai-pin").addEventListener("change", (event) => {
+    saveAiPreference(event, "aiPinToFocus");
   });
-  el("ai-auto").addEventListener("change", async (event) => {
-    await browser.storage.local.set({ aiAutoGroup: event.target.checked });
+  el("ai-auto").addEventListener("change", (event) => {
+    saveAiPreference(event, "aiAutoGroup");
   });
   el("ai-organize").addEventListener("click", runPreview);
   el("ai-regroup").addEventListener("click", runPreview);

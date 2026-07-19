@@ -150,6 +150,37 @@ function createHarness({ storage = {}, groups = [], grantPermission = true, plat
           storageData.lenses = msg.orderedIds.map((id) => byId.get(id)).filter(Boolean);
           return { ok: true };
         }
+        if (msg.type === "lens-import") {
+          let parsed;
+          try {
+            parsed = JSON.parse(String(msg.code).trim());
+          } catch (error) {
+            return { ok: false, error: "invalid_code" };
+          }
+          if (!parsed || typeof parsed !== "object" || parsed.tabloupeLens !== 1 || !parsed.lens || typeof parsed.lens !== "object") {
+            return { ok: false, error: "invalid_code" };
+          }
+          const name = typeof parsed.lens.name === "string" ? parsed.lens.name.trim() : "";
+          if (!name) {
+            return { ok: false, error: "invalid_code" };
+          }
+          const now = Date.now();
+          const existingIds = new Set((storageData.lenses || []).map((lens) => lens.id));
+          let id = "lens_import_" + ((storageData.lenses || []).length + 1);
+          while (existingIds.has(id)) id += "x";
+          const lens = {
+            id,
+            name,
+            icon: typeof parsed.lens.icon === "string" ? parsed.lens.icon : "circle",
+            color: typeof parsed.lens.color === "string" ? parsed.lens.color : null,
+            groupSelectors: Array.isArray(parsed.lens.groupSelectors) ? clone(parsed.lens.groupSelectors) : [],
+            triggers: { appleFocusIds: [], calendarPatterns: [] },
+            createdAt: now,
+            updatedAt: now,
+          };
+          storageData.lenses = [...(storageData.lenses || []), clone(lens)];
+          return { ok: true, lens: clone(lens) };
+        }
       }
     },
     permissions: {
@@ -562,6 +593,31 @@ test("Show all groups control activates the all-groups view", async () => {
   assert.equal(activate.windowId, 7);
   assert.deepEqual(clone(activate.view), { kind: "all" });
   assert.match(document.querySelector(".active-view-summary").textContent, /Showing: All groups/);
+});
+
+test("lens activation surfaces a structured failure instead of reporting success", async () => {
+  const harness = createHarness({
+    storage: {
+      activeView: { kind: "all" },
+      lenses: [lensFixture()],
+    },
+  });
+  await settle();
+
+  const sendMessage = harness.browser.runtime.sendMessage;
+  harness.browser.runtime.sendMessage = async (message) => {
+    if (message.type === "lens-activate") {
+      harness.messages.push(message);
+      return { ok: false };
+    }
+    return sendMessage(message);
+  };
+
+  lensCard(harness.document).querySelector(".lens-show-button").click();
+  await settle();
+
+  assert.match(harness.document.getElementById("status").textContent, /Switch failed/);
+  assert.match(harness.document.querySelector(".active-view-summary").textContent, /Showing: All groups/);
 });
 
 test("delete offers Undo and Undo restores through lens messages", async () => {
@@ -983,6 +1039,67 @@ test("the lens advanced panel toggles open and closed", async () => {
   assert.equal(card.querySelector(".icon-btn-options").getAttribute("aria-expanded"), "false");
 });
 
+test("editing a schedule preserves a schedule written outside the stale UI snapshot", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lensFixture()],
+      lensSchedules: [
+        { lensId: "lens_work", enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "17:00" },
+      ],
+    },
+  });
+  await settle();
+
+  // A schedule for another lens lands in storage without the Options page's
+  // change listener seeing it, so state.lensSchedules is now stale.
+  harness.storageData.lensSchedules = [
+    { lensId: "lens_work", enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "17:00" },
+    { lensId: "lens_play", enabled: true, days: [0, 6], start: "10:00", end: "12:00" },
+  ];
+
+  lensCard(harness.document).querySelector(".icon-btn-options").click();
+  await settle();
+  const toggle = lensCard(harness.document).querySelector(".schedule-editor .toggle input[type='checkbox']");
+  assert.ok(toggle, "schedule enable toggle is present");
+  toggle.checked = true;
+  toggle.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  await settle();
+
+  const written = harness.storageData.lensSchedules;
+  assert.equal(written.length, 2, "the concurrently-stored lens_play schedule must not be dropped");
+  assert.ok(written.find((schedule) => schedule.lensId === "lens_play"), "lens_play schedule preserved");
+  assert.equal(written.find((schedule) => schedule.lensId === "lens_work").enabled, true);
+});
+
+test("concurrent schedule edits preserve both lenses' changes", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lensFixture(), lensFixture({ id: "lens_play", name: "Play lens" })],
+      lensSchedules: [
+        { lensId: "lens_work", enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "17:00" },
+        { lensId: "lens_play", enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "17:00" },
+      ],
+    },
+  });
+  await settle();
+
+  lensCard(harness.document, "lens_work").querySelector(".icon-btn-options").click();
+  await settle();
+  lensCard(harness.document, "lens_play").querySelector(".icon-btn-options").click();
+  await settle();
+
+  const workToggle = lensCard(harness.document, "lens_work").querySelector(".schedule-editor .toggle input[type='checkbox']");
+  const playToggle = lensCard(harness.document, "lens_play").querySelector(".schedule-editor .toggle input[type='checkbox']");
+  workToggle.checked = true;
+  workToggle.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  playToggle.checked = true;
+  playToggle.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  await settle();
+
+  assert.equal(harness.storageData.lensSchedules.find((schedule) => schedule.lensId === "lens_work").enabled, true);
+  assert.equal(harness.storageData.lensSchedules.find((schedule) => schedule.lensId === "lens_play").enabled, true);
+});
+
 test("advanced panel shows glob help and icon color editors", async () => {
   const { document } = createHarness({
     storage: { lenses: [lensFixture()] },
@@ -1137,8 +1254,12 @@ test("saveProvider rejects a non-loopback http:// URL and stores nothing", async
   );
 });
 
-test("saveProvider accepts loopback http:// URLs", async () => {
-  for (const baseURL of ["http://localhost:11434/v1", "http://127.0.0.1:8080/v1"]) {
+test("saveProvider accepts loopback http:// URLs and requests a port-less host pattern", async () => {
+  const cases = [
+    { baseURL: "http://localhost:11434/v1", origin: "http://localhost/*" },
+    { baseURL: "http://127.0.0.1:8080/v1", origin: "http://127.0.0.1/*" },
+  ];
+  for (const { baseURL, origin } of cases) {
     const harness = createHarness();
     await settle();
 
@@ -1152,6 +1273,8 @@ test("saveProvider accepts loopback http:// URLs", async () => {
     await settle();
 
     assert.deepEqual(harness.storageData.aiProvider, { kind: "custom", baseURL, model: "m", apiKey: "k" });
+    assert.equal(harness.permissionRequests.length, 1);
+    assert.equal(harness.permissionRequests[0].origins[0], origin);
   }
 });
 
@@ -1191,6 +1314,13 @@ test("lens import appends a fresh lens and rejects malformed codes without writi
   const harness = createHarness({ storage: { lenses: [existing] } });
   await settle();
 
+  const setKeys = [];
+  const originalSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    setKeys.push(...Object.keys(values));
+    return originalSet(values);
+  };
+
   const importedCode = JSON.stringify({
     tabloupeLens: 1,
     lens: {
@@ -1207,8 +1337,13 @@ test("lens import appends a fresh lens and rejects malformed codes without writi
   harness.document.getElementById("lens-import-add").click();
   await settle();
 
+  const importMessage = lastMessageOfType(harness.messages, "lens-import");
+  assert.ok(importMessage, "sent a lens-import message");
+  assert.equal(importMessage.code, importedCode);
+  assert.ok(!setKeys.includes("lenses"), "did not write lenses via storage.local.set");
+
   assert.equal(harness.storageData.lenses.length, 2);
-  const imported = harness.storageData.lenses[1];
+  const imported = harness.state ? harness.state.lenses[1] : harness.storageData.lenses[1];
   assert.ok(imported.id.startsWith("lens_"));
   assert.notEqual(imported.id, "lens_stolen");
   assert.equal(imported.name, "Imported");
@@ -1217,14 +1352,149 @@ test("lens import appends a fresh lens and rejects malformed codes without writi
   assert.deepEqual(imported.groupSelectors, [{ type: "glob", value: "Client*" }]);
   assert.deepEqual(imported.triggers.appleFocusIds, []);
   assert.deepEqual(imported.triggers.calendarPatterns, []);
+  assert.equal(harness.document.getElementById("lens-import-code").value, "");
 
+  harness.messages.length = 0;
   const before = JSON.stringify(harness.storageData.lenses);
   harness.document.getElementById("lens-import-code").value = "{not json";
   harness.document.getElementById("lens-import-add").click();
   await settle();
 
   assert.equal(JSON.stringify(harness.storageData.lenses), before);
+  assert.equal(harness.document.getElementById("lens-import-code").value, "{not json");
+  assert.ok(!setKeys.includes("lenses"), "malformed import did not write lenses");
   assert.equal(harness.document.querySelector("#toast-host .toast").textContent, "Not a valid lens code.");
+});
+
+test("loadAll keeps a concurrent storage.onChanged update instead of reverting it", async () => {
+  const harness = createHarness({ storage: { aiGroupingPrompt: "OLD prompt from disk" } });
+  await settle();
+  assert.equal(harness.document.getElementById("ai-grouping-prompt").value, "OLD prompt from disk");
+
+  const oldSnapshot = clone(harness.storageData);
+  let resolveGet;
+  harness.browser.storage.local.get = () => new Promise((resolve) => {
+    resolveGet = () => resolve(clone(oldSnapshot));
+  });
+
+  const loadPromise = harness.window.loadAll();
+  await nextTick();
+
+  // A newer value arrives via storage.onChanged while loadAll's read is in flight.
+  await harness.browser.storage.local.set({ aiGroupingPrompt: "NEW prompt via onChanged" });
+  await nextTick();
+
+  // loadAll's stale read now resolves with the OLD value; it must not clobber the newer one.
+  resolveGet();
+  await loadPromise;
+  await settle();
+
+  assert.equal(
+    harness.document.getElementById("ai-grouping-prompt").value,
+    "NEW prompt via onChanged",
+  );
+});
+
+test("loadAll keeps active view and activation changes that arrive before its stale lens state", async () => {
+  const staleActivation = { trigger: "stale", triggerId: "stale-trigger", at: 1 };
+  const freshActivation = { trigger: "manual", triggerId: "fresh-trigger", at: 2 };
+  const harness = createHarness({
+    storage: {
+      activeView: { kind: "all" },
+      lastActivation: staleActivation,
+      lenses: [lensFixture()],
+    },
+  });
+  await settle();
+
+  const oldSnapshot = clone(harness.storageData);
+  let resolveGet;
+  let resolveLensState;
+  const sendMessage = harness.browser.runtime.sendMessage;
+  harness.browser.storage.local.get = () => new Promise((resolve) => {
+    resolveGet = () => resolve(clone(oldSnapshot));
+  });
+  harness.browser.runtime.sendMessage = (message) => {
+    if (message.type === "lens-state") {
+      harness.messages.push(message);
+      return new Promise((resolve) => {
+        resolveLensState = () => resolve({
+          activeView: { kind: "all" },
+          lastActivation: staleActivation,
+        });
+      });
+    }
+    return sendMessage(message);
+  };
+
+  const loadPromise = harness.window.loadAll();
+  await nextTick();
+  await harness.browser.storage.local.set({
+    activeView: { kind: "lens", lensId: "lens_work" },
+    lastActivation: freshActivation,
+  });
+  resolveGet();
+  resolveLensState();
+  await loadPromise;
+  await settle();
+
+  assert.match(harness.document.querySelector(".active-view-summary").textContent, /Showing: Work lens/);
+  assert.equal(harness.document.getElementById("diag-last-focus").textContent, "fresh-trigger");
+  assert.match(harness.document.getElementById("diag-last-action").textContent, /^manual/);
+});
+
+test("a superseded loadAll does not clobber a newer load's committed state", async () => {
+  const harness = createHarness({ storage: { aiGroupingPrompt: "disk value" } });
+  await settle();
+
+  let firstResolve;
+  let getCount = 0;
+  harness.browser.storage.local.get = (keys) => {
+    getCount += 1;
+    if (getCount === 1) {
+      return new Promise((resolve) => { firstResolve = () => resolve({ aiGroupingPrompt: "STALE" }); });
+    }
+    return Promise.resolve({ aiGroupingPrompt: "FRESH" });
+  };
+
+  const first = harness.window.loadAll();      // stale snapshot, read gated
+  await nextTick();
+  const second = harness.window.loadAll();     // newer load reads FRESH and commits
+  await second;
+  firstResolve();                              // the superseded load resolves late
+  await first;
+  await settle();
+
+  assert.equal(harness.document.getElementById("ai-grouping-prompt").value, "FRESH");
+});
+
+test("out-of-order group refreshes apply only the latest snapshot", async () => {
+  const harness = createHarness();
+  await settle();
+
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let queryCount = 0;
+  harness.browser.tabGroups.query = async () => {
+    queryCount += 1;
+    if (queryCount === 1) {
+      await firstGate;
+      return [{ id: 1, title: "Stale", windowId: 7 }];
+    }
+    return [{ id: 2, title: "Fresh", windowId: 7 }];
+  };
+
+  const first = harness.window.refreshFirefoxGroups();  // stale query, gated
+  await nextTick();
+  const second = harness.window.refreshFirefoxGroups(); // fresh query applies
+  await second;
+  releaseFirst();                                       // stale resolves late, dropped
+  await first;
+  await settle();
+
+  const diag = harness.document.getElementById("diag-current-groups").textContent;
+  assert.match(diag, /Fresh/);
+  assert.doesNotMatch(diag, /Stale/);
 });
 
 test("provider test connection lists models and persists successful diagnostics", async () => {
@@ -1255,6 +1525,7 @@ test("provider test connection lists models and persists successful diagnostics"
   assert.equal(harness.document.getElementById("provider-test-status").textContent, "Found 2 models.");
   assert.equal(harness.storageData.lastProviderCheck.ok, true);
   assert.equal(harness.storageData.lastProviderCheck.detail, "Found 2 models.");
+  assert.deepEqual(clone(harness.permissionRequests), [{ origins: ["https://api.example.com/*"] }]);
 });
 
 test("provider test connection falls back to completions and records HTTP failures", async () => {
@@ -1327,4 +1598,29 @@ test("pairing token field saves lowercase hex, rejects invalid input, and clears
   await settle();
   assert.equal(Object.prototype.hasOwnProperty.call(harness.storageData, "busToken"), false);
   assert.equal(harness.document.querySelector("#toast-host .toast").textContent, "Pairing token cleared.");
+});
+
+test("a rejected lens edit reverts the optimistic UI instead of reporting success", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lensFixture({ groupSelectors: [] })] },
+    groups: [{ id: 1, title: "Deep Work" }],
+  });
+  const { document, browser } = harness;
+  await settle();
+
+  // Force the background to reject the edit without persisting it.
+  const realSend = browser.runtime.sendMessage;
+  browser.runtime.sendMessage = async (msg) => {
+    if (msg.type === "lens-update") return { ok: false, error: "missing_lens" };
+    return realSend(msg);
+  };
+
+  const input = lensCard(document).querySelector(".group-chip-input");
+  input.value = "Deep Work";
+  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await settle();
+
+  const chipLabels = [...lensCard(document).querySelectorAll(".group-chip-label")].map((el) => el.textContent);
+  assert.ok(!chipLabels.includes("Deep Work"), "optimistic selector reverted after backend rejection");
+  assert.match(document.getElementById("status").textContent, /failed/i);
 });
