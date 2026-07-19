@@ -7,3 +7,6 @@ node_modules/
 .agents/
 .antigravitycli/
 .amo-upload-uuid
+
+# Scratch tier: throwaway dev artifacts (oracle one-shots, etc.)
+dev/scratch/
