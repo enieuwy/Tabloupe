@@ -35,13 +35,19 @@ function deferred() {
 
 async function waitFor(assertion) {
   let lastError;
-  for (let i = 0; i < 20; i += 1) {
+  // Some awaited assertions depend on genuinely wall-clock-async work
+  // (WebCrypto HMAC in the bus auth path runs on libuv's threadpool), so
+  // pump both microtasks (settle) and a real timer between polls. A
+  // setImmediate-only loop can drain in microseconds before the threadpool
+  // op resolves, which made the bus/calendar tests flaky under CI load.
+  for (let i = 0; i < 100; i += 1) {
     try {
       assertion();
       return;
     } catch (error) {
       lastError = error;
       await settle();
+      await new Promise((resolve) => setTimeout(resolve, 5));
     }
   }
   throw lastError;
