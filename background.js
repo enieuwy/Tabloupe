@@ -65,6 +65,7 @@ const TAB_GROUP_COLORS = ["blue", "cyan", "green", "orange", "pink", "purple", "
 const NOTIFICATION_LIST_MAX = 12;
 
 const LEGACY_MAP_KEY = "focus" + "Mappings";
+const LENS_MIGRATION_MAX_ATTEMPTS = 3;
 
 // Which Apple Focus id automation last applied. Persisted in storage.local
 // (not memory) so a focus-off arriving after the event page suspended, or a
@@ -137,6 +138,9 @@ const pendingLensSyncRemovedIds = new Set();
 // letting a push detect edits that landed while it was in flight.
 let lensSyncQueue = Promise.resolve();
 let lensSyncMutationSeq = 0;
+let lensSyncTimestampQueued = false;
+let pendingLensSyncTimestampOrder = false;
+let pendingLensSyncTimestampPrefs = false;
 
 function enqueueLensSync(task) {
   const queued = lensSyncQueue.then(task, task);
@@ -181,15 +185,11 @@ async function loadSessionWindowState() {
 }
 
 let sessionPersistQueue = Promise.resolve();
+let sessionPersistInFlight = false;
+let sessionPersistPending = null;
+let sessionPersistRetryTimer = null;
 
-function persistSessionWindowState() {
-  if (!sessionStore) {
-    return sessionPersistQueue;
-  }
-  // Snapshot the in-memory maps synchronously at call time, then serialize the
-  // async writes: without a queue two fire-and-forget writes can complete in
-  // reverse order, persisting an older snapshot that resurrects a cleared
-  // transient view or a stale window profile after event-page suspension.
+function snapshotSessionWindowState() {
   const state = { transientViews: {}, windowProfiles: {} };
   for (const [windowId, view] of transientViewsByWindow) {
     state.transientViews[windowId] = view;
@@ -197,12 +197,60 @@ function persistSessionWindowState() {
   for (const [windowId, profile] of windowProfileOverrides) {
     state.windowProfiles[windowId] = profile;
   }
-  sessionPersistQueue = sessionPersistQueue
-    .then(() => sessionStore.set({ [SESSION_WINDOW_STATE_KEY]: state }))
-    .catch((error) => {
+  return state;
+}
+
+function scheduleSessionWindowStateRetry() {
+  if (sessionPersistRetryTimer !== null) {
+    return;
+  }
+  sessionPersistRetryTimer = setTimeout(() => {
+    sessionPersistRetryTimer = null;
+    startSessionWindowStatePersist();
+  }, 1000);
+}
+
+async function drainSessionWindowStatePersist() {
+  while (sessionPersistPending !== null) {
+    const state = sessionPersistPending;
+    sessionPersistPending = null;
+    try {
+      await sessionStore.set({ [SESSION_WINDOW_STATE_KEY]: state });
+    } catch (error) {
       console.error("Session window state save error:", error);
-    });
+      // A newer snapshot wins over the failed one. If this is still the newest
+      // state, retain it for one bounded retry rather than growing a write chain.
+      if (sessionPersistPending === null) {
+        sessionPersistPending = state;
+      }
+      scheduleSessionWindowStateRetry();
+      break;
+    }
+  }
+  sessionPersistInFlight = false;
+}
+
+function startSessionWindowStatePersist() {
+  if (!sessionStore || sessionPersistInFlight || sessionPersistPending === null) {
+    return sessionPersistQueue;
+  }
+  if (sessionPersistRetryTimer !== null) {
+    clearTimeout(sessionPersistRetryTimer);
+    sessionPersistRetryTimer = null;
+  }
+  sessionPersistInFlight = true;
+  sessionPersistQueue = drainSessionWindowStatePersist();
   return sessionPersistQueue;
+}
+
+function persistSessionWindowState() {
+  if (!sessionStore) {
+    return sessionPersistQueue;
+  }
+  // Only the latest mirror is useful after event-page suspension. Replace a
+  // pending snapshot while an earlier storage.session write is in flight.
+  sessionPersistPending = snapshotSessionWindowState();
+  return startSessionWindowStatePersist();
 }
 
 const sessionStateReady = loadSessionWindowState();
@@ -219,6 +267,31 @@ function hasOwn(object, key) {
 // object keys in storage; never let them name prototype machinery.
 function isUnsafeKey(key) {
   return key === "__proto__" || key === "constructor" || key === "prototype";
+}
+const MAX_FOCUS_METADATA_ENTRIES = 200;
+const MAX_FOCUS_METADATA_ID_LENGTH = 256;
+const MAX_FOCUS_CATALOG_NAME_LENGTH = 160;
+const MAX_FOCUS_CATALOG_ICON_LENGTH = 64;
+const MAX_FOCUS_CATALOG_COLOR_LENGTH = 64;
+
+function isFocusMetadataId(id) {
+  return typeof id === "string" && id.length > 0 && id.length <= MAX_FOCUS_METADATA_ID_LENGTH && !isUnsafeKey(id);
+}
+
+function trimSeenFocusIds(seenFocusIds, currentId) {
+  const evictable = Object.keys(seenFocusIds)
+    .filter((id) => id !== currentId)
+    .sort((a, b) => {
+      const aLastSeen = isRecord(seenFocusIds[a]) && typeof seenFocusIds[a].lastSeen === "number" ? seenFocusIds[a].lastSeen : 0;
+      const bLastSeen = isRecord(seenFocusIds[b]) && typeof seenFocusIds[b].lastSeen === "number" ? seenFocusIds[b].lastSeen : 0;
+      return aLastSeen - bLastSeen;
+    });
+  let count = Object.keys(seenFocusIds).length;
+  for (const id of evictable) {
+    if (count <= MAX_FOCUS_METADATA_ENTRIES) break;
+    delete seenFocusIds[id];
+    count -= 1;
+  }
 }
 
 // A focus maps to a list of tab-group titles. An empty list means "seen but
@@ -240,10 +313,48 @@ function normalizeTitles(value) {
   return titles;
 }
 
-function enqueueFocusWork(task) {
+const MAX_PENDING_BUS_WORK = 100;
+let pendingBusWork = 0;
+const pendingBusStateWork = new Map();
+
+function enqueueFocusWork(task, { bus = false, coalesceKey = null } = {}) {
+  if (bus && coalesceKey) {
+    const existing = pendingBusStateWork.get(coalesceKey);
+    if (existing) {
+      // Focus, calendar, and catalog envelopes are state snapshots: while one
+      // waits, the newest snapshot supersedes all earlier queued snapshots.
+      existing.task = task;
+      return existing.promise;
+    }
+    if (pendingBusWork >= MAX_PENDING_BUS_WORK) {
+      return Promise.resolve({ dropped: true });
+    }
+    const slot = { task: null, promise: null };
+    pendingBusWork += 1;
+    const queued = messageQueue.then(
+      () => {
+        pendingBusStateWork.delete(coalesceKey);
+        return slot.task();
+      },
+      () => {
+        pendingBusStateWork.delete(coalesceKey);
+        return slot.task();
+      },
+    );
+    slot.task = task;
+    slot.promise = queued.finally(() => { pendingBusWork -= 1; });
+    messageQueue = slot.promise.catch(() => {});
+    pendingBusStateWork.set(coalesceKey, slot);
+    return slot.promise;
+  }
+  if (bus && pendingBusWork >= MAX_PENDING_BUS_WORK) {
+    return Promise.resolve({ dropped: true });
+  }
+  if (bus) pendingBusWork += 1;
   const queued = messageQueue.then(task, task);
-  messageQueue = queued.catch(() => {});
-  return queued;
+  const result = bus ? queued.finally(() => { pendingBusWork -= 1; }) : queued;
+  messageQueue = result.catch(() => {});
+  return result;
 }
 
 // Per-window serialization for tab-group create/merge transactions. Manual Tab
@@ -280,6 +391,11 @@ function withGroupingLock(windowId, task) {
   tail = released.catch(() => {});
   groupingLocks.set(key, tail);
   return run;
+}
+
+function withGroupingLocks(windowIds, task) {
+  const ids = [...new Set(windowIds.filter((windowId) => typeof windowId === "number"))].sort((a, b) => a - b);
+  return ids.reduceRight((next, windowId) => () => withGroupingLock(windowId, next), task)();
 }
 
 
@@ -564,7 +680,7 @@ async function recordSeen(rawId) {
     return;
   }
 
-  if (isUnsafeKey(rawId)) {
+  if (!isFocusMetadataId(rawId)) {
     return;
   }
 
@@ -576,6 +692,7 @@ async function recordSeen(rawId) {
     firstSeen: typeof previous.firstSeen === "number" ? previous.firstSeen : now,
     lastSeen: now,
   };
+  trimSeenFocusIds(seenFocusIds, rawId);
 
   await browser.storage.local.set({
     lastFocusSeen: rawId,
@@ -609,6 +726,7 @@ function normalizedSelectors(value) {
   }
   return selectors;
 }
+
 function normalizedTriggerStrings(value) {
   if (!Array.isArray(value)) {
     return [];
@@ -656,24 +774,19 @@ async function getContainers() {
     containersCache = [];
     return containersCache;
   }
-  // Capture the generation before the async query. If an onCreated/onRemoved/
-  // onUpdated invalidation fires while the query is in flight, the result is
-  // already stale: return it to this caller but don't cache it, so the next
-  // call re-queries fresh state instead of serving a repopulated stale cache.
   const gen = containersCacheGen;
-  let result;
   try {
     const identities = await api.query({});
-    result = (Array.isArray(identities) ? identities : [])
+    const result = (Array.isArray(identities) ? identities : [])
       .map(normalizeContainer)
       .filter(Boolean);
+    if (gen === containersCacheGen) {
+      containersCache = result;
+    }
+    return result;
   } catch (error) {
-    result = [];
+    return [];
   }
-  if (gen === containersCacheGen) {
-    containersCache = result;
-  }
-  return result;
 }
 
 function containersByCookieStore(containers) {
@@ -752,10 +865,16 @@ function viewKey(view) {
   return view.kind || "all";
 }
 
-async function recordActivationSession(view, lastActivation) {
+async function recordActivationSession(view, lastActivation, snapshot = null) {
   if (!isPersistedView(view)) return;
   const now = Date.now();
-  const stored = await browser.storage.local.get([FOCUS_SESSION_HISTORY_KEY, "activeView", "lastActivation", "expandedGroups", "collapsedGroups"]);
+  const stored = snapshot || await browser.storage.local.get([
+    FOCUS_SESSION_HISTORY_KEY,
+    "activeView",
+    "lastActivation",
+    "expandedGroups",
+    "collapsedGroups",
+  ]);
   const history = Array.isArray(stored[FOCUS_SESSION_HISTORY_KEY]) ? stored[FOCUS_SESSION_HISTORY_KEY].filter(isRecord) : [];
   const previousView = isPersistedView(stored.activeView) ? stored.activeView : null;
   const previousActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
@@ -870,9 +989,7 @@ async function safeSyncGet(keys) {
     return null;
   }
   return sync.get(keys).catch((error) => {
-    if (isQuotaExceeded(error)) {
-      setLensSyncLastError(syncErrorMessage(error, "Firefox Sync quota exceeded.")).catch(() => {});
-    }
+    setLensSyncLastError(syncErrorMessage(error, "Firefox Sync read failed.")).catch(() => {});
     return null;
   });
 }
@@ -885,9 +1002,7 @@ async function safeSyncSet(values) {
   return sync.set(values)
     .then(() => true)
     .catch((error) => {
-      if (isQuotaExceeded(error)) {
-        setLensSyncLastError(syncErrorMessage(error, "Firefox Sync quota exceeded.")).catch(() => {});
-      }
+      setLensSyncLastError(syncErrorMessage(error, "Firefox Sync write failed.")).catch(() => {});
       return false;
     });
 }
@@ -901,9 +1016,7 @@ async function safeSyncRemove(keys) {
   return sync.remove(list)
     .then(() => true)
     .catch((error) => {
-      if (isQuotaExceeded(error)) {
-        setLensSyncLastError(syncErrorMessage(error, "Firefox Sync quota exceeded.")).catch(() => {});
-      }
+      setLensSyncLastError(syncErrorMessage(error, "Firefox Sync removal failed.")).catch(() => {});
       return false;
     });
 }
@@ -1019,26 +1132,42 @@ function normalizeLensesFromStorageChange(value) {
   return Array.isArray(value) ? value.map(normalizeLens).filter(Boolean) : [];
 }
 
-async function recordLocalLensSyncTimestamps(changes) {
+function recordLocalLensSyncTimestamps(changes) {
   if (applyingInboundLensSync || (!changes.lenses && !changes.aiGroupingPrompt && !changes.tabSearchShortcut)) {
-    return;
+    return Promise.resolve();
   }
-  // Serialize the read-modify-write on lensSyncMeta: two concurrent local
-  // changes would otherwise both read the old meta and the later write would
-  // roll back the earlier field's timestamp.
-  return enqueueLensSync(async () => {
-    const stored = await browser.storage.local.get(LENS_SYNC_META_KEY);
-    const meta = normalizeLensSyncMeta(stored[LENS_SYNC_META_KEY]);
-    const now = Date.now();
-    const next = { ...meta };
-    if (changes.lenses) {
-      next.lensOrderUpdatedAt = now;
+  pendingLensSyncTimestampOrder ||= Boolean(changes.lenses);
+  pendingLensSyncTimestampPrefs ||= Boolean(changes.aiGroupingPrompt || changes.tabSearchShortcut);
+  if (lensSyncTimestampQueued) {
+    return lensSyncQueue;
+  }
+  lensSyncTimestampQueued = true;
+  const queued = enqueueLensSync(async () => {
+    while (pendingLensSyncTimestampOrder || pendingLensSyncTimestampPrefs) {
+      const updateOrder = pendingLensSyncTimestampOrder;
+      const updatePrefs = pendingLensSyncTimestampPrefs;
+      pendingLensSyncTimestampOrder = false;
+      pendingLensSyncTimestampPrefs = false;
+      const stored = await browser.storage.local.get(LENS_SYNC_META_KEY);
+      const meta = normalizeLensSyncMeta(stored[LENS_SYNC_META_KEY]);
+      const now = Date.now();
+      const next = {
+        ...meta,
+        ...(updateOrder ? { lensOrderUpdatedAt: now } : {}),
+        ...(updatePrefs ? { prefsUpdatedAt: now } : {}),
+      };
+      if (next.lensOrderUpdatedAt !== meta.lensOrderUpdatedAt || next.prefsUpdatedAt !== meta.prefsUpdatedAt) {
+        await browser.storage.local.set({ [LENS_SYNC_META_KEY]: next });
+      }
     }
-    if (changes.aiGroupingPrompt || changes.tabSearchShortcut) {
-      next.prefsUpdatedAt = now;
-    }
-    if (next.lensOrderUpdatedAt !== meta.lensOrderUpdatedAt || next.prefsUpdatedAt !== meta.prefsUpdatedAt) {
-      await browser.storage.local.set({ [LENS_SYNC_META_KEY]: next });
+  });
+  return queued.finally(() => {
+    lensSyncTimestampQueued = false;
+    if (pendingLensSyncTimestampOrder || pendingLensSyncTimestampPrefs) {
+      recordLocalLensSyncTimestamps({
+        ...(pendingLensSyncTimestampOrder ? { lenses: {} } : {}),
+        ...(pendingLensSyncTimestampPrefs ? { aiGroupingPrompt: {} } : {}),
+      });
     }
   });
 }
@@ -1409,12 +1538,12 @@ async function handleScheduleTick(now = new Date()) {
 // unconditional periodic alarm would wake the event page forever for a
 // feature most installs never opt into.
 let scheduleAlarmSyncQueue = Promise.resolve();
+let scheduleAlarmRetryTimer = null;
+let scheduleAlarmRetryAttempts = 0;
+const MAX_SCHEDULE_ALARM_RETRIES = 3;
+
 function syncScheduleAlarm() {
-  // Serialize reconciliation and re-read state inside the chain: overlapping
-  // lensSchedules changes must reconcile in commit order so the final
-  // create/clear reflects the latest stored schedules, never a stale read that
-  // lands after a newer one.
-  scheduleAlarmSyncQueue = scheduleAlarmSyncQueue.catch(() => {}).then(async () => {
+  const queued = scheduleAlarmSyncQueue.catch(() => {}).then(async () => {
     const schedules = await getLensSchedules();
     if (schedules.some((schedule) => schedule.enabled)) {
       await browser.alarms.create(SCHEDULE_ALARM_NAME, { periodInMinutes: 1 });
@@ -1422,7 +1551,28 @@ function syncScheduleAlarm() {
       await browser.alarms.clear(SCHEDULE_ALARM_NAME);
     }
   });
-  return scheduleAlarmSyncQueue;
+  scheduleAlarmSyncQueue = queued.catch(() => {});
+  queued.then(
+    () => {
+      scheduleAlarmRetryAttempts = 0;
+      if (scheduleAlarmRetryTimer !== null) {
+        clearTimeout(scheduleAlarmRetryTimer);
+        scheduleAlarmRetryTimer = null;
+      }
+    },
+    (error) => {
+      console.error("Schedule alarm reconciliation error:", error);
+      if (scheduleAlarmRetryAttempts >= MAX_SCHEDULE_ALARM_RETRIES || scheduleAlarmRetryTimer !== null) {
+        return;
+      }
+      scheduleAlarmRetryAttempts += 1;
+      scheduleAlarmRetryTimer = setTimeout(() => {
+        scheduleAlarmRetryTimer = null;
+        syncScheduleAlarm().catch(() => {});
+      }, 1000 * scheduleAlarmRetryAttempts);
+    },
+  );
+  return queued;
 }
 
 function titleSelectorMatcher(selectors) {
@@ -1523,6 +1673,21 @@ function readableFallbackName(id) {
 }
 
 async function migrateToLensesV2() {
+  let lastError;
+  for (let attempt = 1; attempt <= LENS_MIGRATION_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await migrateToLensesV2Once();
+    } catch (error) {
+      lastError = error;
+      if (attempt < LENS_MIGRATION_MAX_ATTEMPTS) {
+        console.warn(`Lens migration attempt ${attempt} failed; retrying.`, error);
+      }
+    }
+  }
+  throw lastError;
+}
+
+async function migrateToLensesV2Once() {
   const stored = await browser.storage.local.get(null);
   if (!hasOwn(stored, LEGACY_MAP_KEY) || stored.schemaVersion === 2) {
     return;
@@ -1609,18 +1774,35 @@ async function mergeFocusCatalog(entries) {
   if (!isRecord(entries)) {
     return;
   }
-  const stored = await browser.storage.local.get("focusCatalog");
+  const stored = await browser.storage.local.get(["focusCatalog", "lenses"]);
   const catalog = isRecord(stored.focusCatalog) ? { ...stored.focusCatalog } : {};
+  const linkedIds = new Set(
+    normalizeLensesFromStorageChange(stored.lenses)
+      .flatMap((lens) => lens.triggers.appleFocusIds)
+      .filter(isFocusMetadataId),
+  );
   let changed = false;
   for (const [id, entry] of Object.entries(entries)) {
-    if (typeof id === "string" && !isUnsafeKey(id) && isRecord(entry) && typeof entry.name === "string") {
-      catalog[id] = {
-        name: entry.name,
-        icon: typeof entry.icon === "string" ? entry.icon : "target",
-        color: typeof entry.color === "string" ? entry.color : null,
-      };
-      changed = true;
+    const name = isRecord(entry) && typeof entry.name === "string" ? entry.name : null;
+    const icon = isRecord(entry) && typeof entry.icon === "string" ? entry.icon : "target";
+    const color = isRecord(entry) && typeof entry.color === "string" ? entry.color : null;
+    if (!isFocusMetadataId(id) || name === null ||
+      name.length > MAX_FOCUS_CATALOG_NAME_LENGTH ||
+      icon.length > MAX_FOCUS_CATALOG_ICON_LENGTH ||
+      (color !== null && color.length > MAX_FOCUS_CATALOG_COLOR_LENGTH)) {
+      continue;
     }
+    catalog[id] = { name, icon, color };
+    linkedIds.add(id);
+    changed = true;
+  }
+  let count = Object.keys(catalog).length;
+  for (const id of Object.keys(catalog)) {
+    if (count <= MAX_FOCUS_METADATA_ENTRIES) break;
+    if (linkedIds.has(id)) continue;
+    delete catalog[id];
+    count -= 1;
+    changed = true;
   }
   if (changed) {
     await browser.storage.local.set({ focusCatalog: catalog });
@@ -1665,16 +1847,19 @@ async function getLastAppliedAppleFocusId() {
 
 async function handleAppleFocusOff() {
   const triggerId = await getLastAppliedAppleFocusId();
-  await browser.storage.local.set({ [LAST_APPLIED_APPLE_FOCUS_KEY]: null });
   if (typeof triggerId !== "string") {
     return;
   }
   const stored = await browser.storage.local.get(["activeView", "lastActivation"]);
   const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
   if (lastActivation.trigger !== "appleFocus" || lastActivation.triggerId !== triggerId) {
+    await browser.storage.local.set({ [LAST_APPLIED_APPLE_FOCUS_KEY]: null });
     return;
   }
-  await activateView(await getAutomationFallback(), { trigger: "appleFocus", triggerId });
+  const applied = await activateView(await getAutomationFallback(), { trigger: "appleFocus", triggerId });
+  if (applied !== false) {
+    await browser.storage.local.set({ [LAST_APPLIED_APPLE_FOCUS_KEY]: null });
+  }
 }
 
 async function handleAppleFocus(rawId) {
@@ -1769,16 +1954,21 @@ async function handleCalendarEvents(payload) {
   if (previousTriggerId === null || activeTriggerIds.has(previousTriggerId)) {
     return;
   }
-  await browser.storage.local.set({ [LAST_APPLIED_CALENDAR_TRIGGER_KEY]: null });
   if (lastActivation.trigger !== "calendar" || lastActivation.triggerId !== previousTriggerId) {
+    await browser.storage.local.set({ [LAST_APPLIED_CALENDAR_TRIGGER_KEY]: null });
     return;
   }
-  await activateView(await getAutomationFallback(), { trigger: "calendar", triggerId: previousTriggerId });
+  const applied = await activateView(
+    await getAutomationFallback(),
+    { trigger: "calendar", triggerId: previousTriggerId }
+  );
+  if (applied !== false) {
+    await browser.storage.local.set({ [LAST_APPLIED_CALENDAR_TRIGGER_KEY]: null });
+  }
 }
 
 
-async function handleMessage(event) {
-  const msg = isRecord(event) && hasOwn(event, "data") ? JSON.parse(event.data) : event;
+async function handleMessage(msg) {
   // MCC multiplexes several state subsystems on this socket (focus, bluetooth,
   // calendar, wireguard, ...), each wrapped in a StateEnvelope { type,
   // schemaVersion, ts, payload }. Apple Focus and Calendar envelopes optionally
@@ -1811,10 +2001,18 @@ async function handleMessage(event) {
   let rawId = null;
   if (isRecord(focus) && typeof focus.id === "string") {
     rawId = focus.id;
-    await mergeFocusCatalog({ [focus.id]: focus });
+    try {
+      await mergeFocusCatalog({ [focus.id]: focus });
+    } catch (error) {
+      console.error("Focus catalog cache error:", error);
+    }
   }
 
-  await recordSeen(rawId);
+  try {
+    await recordSeen(rawId);
+  } catch (error) {
+    console.error("Focus seen-state error:", error);
+  }
   await handleAppleFocus(rawId);
 }
 
@@ -1878,15 +2076,24 @@ async function handleAuthOk(ws, msg) {
   clearSocketAuthTimer();
   socketAuthState = BUS_AUTH_STATES.AUTHENTICATED;
   socketAuthContext = null;
+  reconnectDelay = MIN_RECONNECT_MS;
   await setPairingStatus(BUS_PAIRING_STATUSES.PAIRED);
   publishLensStateSoon();
 }
 
-function handleEstablishedFrame(msg) {
+function handleEstablishedFrame(ws, msg) {
   if (tryResolveGroupingResponse(msg)) {
     return;
   }
-  enqueueFocusWork(() => handleMessage(msg)).catch((error) => {
+  const coalesceKey = msg.type === "focus" || msg.type === "focusCatalog" || msg.type === "calendarEvents"
+    ? msg.type
+    : null;
+  enqueueFocusWork(() => {
+    if (socket === ws) {
+      return handleMessage(msg);
+    }
+    return undefined;
+  }, { bus: true, coalesceKey }).catch((error) => {
     console.error("Focus message error:", error);
   });
 }
@@ -1923,14 +2130,14 @@ async function handleSocketFrame(ws, event) {
     socketAuthState = BUS_AUTH_STATES.LEGACY;
     await setPairingStatus(BUS_PAIRING_STATUSES.LEGACY);
     publishLensStateSoon();
-    handleEstablishedFrame(msg);
+    handleEstablishedFrame(ws, msg);
     return;
   }
   if (socketAuthState === BUS_AUTH_STATES.AWAITING_AUTH_OK) {
     await handleAuthOk(ws, msg);
     return;
   }
-  handleEstablishedFrame(msg);
+  handleEstablishedFrame(ws, msg);
 }
 
 async function connect() {
@@ -1950,7 +2157,6 @@ async function connect() {
     if (socket !== ws) {
       return;
     }
-    reconnectDelay = MIN_RECONNECT_MS;
     clearReconnectTimer();
     setConnectionState("connected").catch((error) => {
       console.error("Connection state error:", error);
@@ -2093,6 +2299,16 @@ async function handleLensDelete(msg) {
   }
   const lenses = await getLenses();
   await saveLenses(lenses.filter((lens) => lens.id !== lensId));
+  let removedWindowOverride = false;
+  for (const [windowId, profile] of windowProfileOverrides) {
+    if (profile.kind === "lens" && profile.lensId === lensId) {
+      windowProfileOverrides.delete(windowId);
+      removedWindowOverride = true;
+    }
+  }
+  if (removedWindowOverride) {
+    await persistSessionWindowState();
+  }
   const activeView = await getActiveView();
   if (activeView.kind === "lens" && activeView.lensId === lensId) {
     await setActiveView({ kind: "all" }, { trigger: "manual" });
@@ -2337,7 +2553,7 @@ browser.runtime.onMessage.addListener((message) => {
 if (browser.windows && browser.windows.onRemoved) {
   browser.windows.onRemoved.addListener((windowId) => {
     lastProposalByWindow.delete(windowId);
-    bumpProposalGen(windowId);
+    proposalGenByWindow.delete(windowId);
     const removedTransient = transientViewsByWindow.delete(windowId);
     const removedProfile = windowProfileOverrides.delete(windowId);
     if (removedTransient || removedProfile) {
@@ -2535,7 +2751,16 @@ const CLEAR_ACTION_DIAGNOSTICS = Object.freeze({
   expandedGroups: [],
   collapsedGroups: [],
   updateFailures: [],
+  windowFailures: [],
 });
+
+async function persistActionDiagnostics(values) {
+  try {
+    await browser.storage.local.set(values);
+  } catch (error) {
+    console.error("Activation diagnostics error:", error);
+  }
+}
 
 function groupLabel(group) {
   const title = typeof group.title === "string" && group.title.length > 0 ? group.title : `#${group.id}`;
@@ -2783,27 +3008,29 @@ async function discardCollapsedGroupTabs(groups) {
   }));
 }
 
-async function applyResolvedToGroups(resolved, allGroups, activation, { persist = true } = {}) {
+async function applyResolvedToGroupsUnlocked(resolved, allGroups, activation, { persist = true } = {}) {
   if (resolved.view.kind === "all") {
     const updateFailures = await setGroupsCollapsed(allGroups, false);
-    await browser.storage.local.set({
+    if (persist) {
+      await rememberActivatedView(resolved.view, activation);
+    }
+    await persistActionDiagnostics({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: updateFailures.length === 0 ? "expanded_all" : "expanded_all_with_errors",
       updateFailures,
     });
     if (persist) {
       await setFocusBadge({ text: "", color: null, title: "Tabloupe" });
-      await rememberActivatedView(resolved.view, activation);
     }
     return { ok: true, expandedGroups: allGroups.map((group) => group.title), collapsedGroups: [], updateFailures };
   }
 
   if (allGroups.length === 0) {
-    await browser.storage.local.set({
+    if (persist) await rememberActivatedView(resolved.view, activation);
+    await persistActionDiagnostics({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "no_groups",
     });
-    if (persist) await rememberActivatedView(resolved.view, activation);
     return { ok: true, expandedGroups: [], collapsedGroups: [], updateFailures: [] };
   }
 
@@ -2814,7 +3041,10 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
 
   if (matching.length === 0) {
     const updateFailures = await setGroupsCollapsed(allGroups, false);
-    await browser.storage.local.set({
+    if (persist) {
+      await rememberActivatedView(resolved.view, activation);
+    }
+    await persistActionDiagnostics({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "no_matching_group",
       missingGroup: selectorText,
@@ -2822,14 +3052,13 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
     });
     if (persist) {
       await setFocusBadge({ text: "!", color: "#FF9800", title: `Tabloupe: ${resolved.name}` });
-      await rememberActivatedView(resolved.view, activation);
     }
     return { ok: true, expandedGroups: allGroups.map((group) => group.title), collapsedGroups: [], updateFailures };
   }
 
   const handoff = await activateMatchingGroups(matching, others);
   if (handoff.failures.length > 0) {
-    await browser.storage.local.set({
+    await persistActionDiagnostics({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "activation_failed",
       updateFailures: handoff.failures,
@@ -2838,12 +3067,12 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
   }
 
   if (!handoff.activated) {
-    await browser.storage.local.set({
+    if (persist) await rememberActivatedView(resolved.view, activation);
+    await persistActionDiagnostics({
       ...CLEAR_ACTION_DIAGNOSTICS,
       lastAction: "matching_group_empty",
       emptyGroup: selectorText,
     });
-    if (persist) await rememberActivatedView(resolved.view, activation);
     return { ok: true, expandedGroups: [], collapsedGroups: [], updateFailures: [] };
   }
 
@@ -2856,7 +3085,10 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
     setGroupsCollapsed(collapsible, true),
   ]);
   const updateFailures = expandFailures.concat(collapseFailures);
-  await browser.storage.local.set({
+  if (persist) {
+    await rememberActivatedView(resolved.view, activation);
+  }
+  await persistActionDiagnostics({
     ...CLEAR_ACTION_DIAGNOSTICS,
     lastAction: updateFailures.length === 0 ? "applied" : "applied_with_errors",
     expandedGroups: matching.map((group) => group.title),
@@ -2869,7 +3101,6 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
       color: updateFailures.length === 0 ? resolved.badgeColor : "#FF9800",
       title: `Tabloupe: ${resolved.name}`,
     });
-    await rememberActivatedView(resolved.view, activation);
   }
   const result = {
     ok: true,
@@ -2882,6 +3113,12 @@ async function applyResolvedToGroups(resolved, allGroups, activation, { persist 
   return result;
 }
 
+function applyResolvedToGroups(resolved, allGroups, activation, options) {
+  return withGroupingLocks(allGroups.map((group) => group.windowId), () =>
+    applyResolvedToGroupsUnlocked(resolved, allGroups, activation, options)
+  );
+}
+
 async function activateWithWindowProfiles(resolved, activation) {
   const allGroups = await browser.tabGroups.query({});
   const byWindow = new Map();
@@ -2890,33 +3127,55 @@ async function activateWithWindowProfiles(resolved, activation) {
     if (!byWindow.has(group.windowId)) byWindow.set(group.windowId, []);
     byWindow.get(group.windowId).push(group);
   }
-  const aggregate = { expandedGroups: [], collapsedGroups: [], updateFailures: [] };
+  const aggregate = { expandedGroups: [], collapsedGroups: [], updateFailures: [], windowFailures: [] };
+  let removedStaleProfile = false;
   for (const [windowId, groups] of byWindow.entries()) {
     const profile = getWindowProfile(windowId);
     if (profile.kind === "none") continue;
-    const windowResolved = profile.kind === "lens"
-      ? await resolveActivation({ kind: "lens", lensId: profile.lensId }, windowId)
-      : resolved;
-    if (!windowResolved.ok) continue;
+    let windowResolved = resolved;
+    if (profile.kind === "lens") {
+      const profileResolved = await resolveActivation({ kind: "lens", lensId: profile.lensId }, windowId);
+      if (profileResolved.ok) {
+        windowResolved = profileResolved;
+      } else {
+        // The lens was deleted after this session-scoped override was saved.
+        // Fall back to the requested automation view instead of skipping the
+        // physical window, and remove the stale mirror for future activations.
+        windowProfileOverrides.delete(windowId);
+        removedStaleProfile = true;
+      }
+    }
     const result = await applyResolvedToGroups(windowResolved, groups, activation, { persist: false });
-    if (result.ok === false) return false;
+    if (result.ok === false) {
+      aggregate.windowFailures.push(windowId);
+      aggregate.updateFailures.push(...result.updateFailures);
+      continue;
+    }
     aggregate.expandedGroups.push(...result.expandedGroups);
     aggregate.collapsedGroups.push(...result.collapsedGroups);
     aggregate.updateFailures.push(...result.updateFailures);
   }
-  await browser.storage.local.set({
+  if (removedStaleProfile) {
+    await persistSessionWindowState();
+  }
+  await rememberActivatedView(resolved.view, activation);
+  await persistActionDiagnostics({
+    ...CLEAR_ACTION_DIAGNOSTICS,
     groupTitles: allGroups.map((group) => group.title),
     expandedGroups: aggregate.expandedGroups,
     collapsedGroups: aggregate.collapsedGroups,
     updateFailures: aggregate.updateFailures,
+    windowFailures: aggregate.windowFailures,
+    lastAction: aggregate.windowFailures.length === 0
+      ? (aggregate.updateFailures.length === 0 ? "applied" : "applied_with_errors")
+      : "activation_partial",
   });
   await setFocusBadge({
-    text: aggregate.updateFailures.length === 0 ? resolved.badgeText : "!",
-    color: aggregate.updateFailures.length === 0 ? resolved.badgeColor : "#FF9800",
+    text: aggregate.updateFailures.length === 0 && aggregate.windowFailures.length === 0 ? resolved.badgeText : "!",
+    color: aggregate.updateFailures.length === 0 && aggregate.windowFailures.length === 0 ? resolved.badgeColor : "#FF9800",
     title: `Tabloupe: ${resolved.name}`,
   });
-  await rememberActivatedView(resolved.view, activation);
-  return true;
+  return aggregate.windowFailures.length === 0;
 }
 
 async function activateView(view, activation = {}) {
@@ -2925,14 +3184,24 @@ async function activateView(view, activation = {}) {
   if (!resolved.ok) {
     return false;
   }
-  if (isPersistedView(resolved.view)) {
-    await recordActivationSession(resolved.view, activation);
-  }
+  const sessionSnapshot = isPersistedView(resolved.view)
+    ? await browser.storage.local.get([
+      FOCUS_SESSION_HISTORY_KEY,
+      "activeView",
+      "lastActivation",
+      "expandedGroups",
+      "collapsedGroups",
+    ])
+    : null;
   const automationWithProfiles = activation.trigger !== "manual" &&
     resolved.view.kind !== "transient" &&
     windowProfileOverrides.size > 0;
   if (automationWithProfiles) {
-    return activateWithWindowProfiles(resolved, activation);
+    const applied = await activateWithWindowProfiles(resolved, activation);
+    if (applied && isPersistedView(resolved.view)) {
+      await recordActivationSession(resolved.view, activation, sessionSnapshot);
+    }
+    return applied;
   }
   const query = resolved.view.kind === "transient" && typeof activation.windowId === "number"
     ? { windowId: activation.windowId }
@@ -2942,6 +3211,9 @@ async function activateView(view, activation = {}) {
     groupTitles: allGroups.map((group) => group.title),
   });
   const result = await applyResolvedToGroups(resolved, allGroups, activation, { persist: true });
+  if (result.ok !== false && isPersistedView(resolved.view)) {
+    await recordActivationSession(resolved.view, activation, sessionSnapshot);
+  }
   return result.ok !== false;
 }
 
@@ -2954,17 +3226,7 @@ function nextGroupingRequestId() {
   return `g${groupingRequestSeq}-${Date.now()}`;
 }
 
-function tryResolveGroupingResponse(eventOrMessage) {
-  let msg;
-  if (isRecord(eventOrMessage) && hasOwn(eventOrMessage, "data")) {
-    try {
-      msg = JSON.parse(eventOrMessage.data);
-    } catch (error) {
-      return false;
-    }
-  } else {
-    msg = eventOrMessage;
-  }
+function tryResolveGroupingResponse(msg) {
   if (!isRecord(msg) || msg.type !== "groupTabsResult") {
     return false;
   }
@@ -3657,15 +3919,25 @@ async function pinTopicsToActiveFocus(topics) {
   }
 }
 
+let nextProposalGen = 0;
+
 function bumpProposalGen(windowId) {
   if (typeof windowId !== "number") {
     return;
   }
-  proposalGenByWindow.set(windowId, (proposalGenByWindow.get(windowId) || 0) + 1);
+  proposalGenByWindow.set(windowId, ++nextProposalGen);
 }
 
 function currentProposalGen(windowId) {
-  return typeof windowId === "number" ? (proposalGenByWindow.get(windowId) || 0) : 0;
+  if (typeof windowId !== "number") {
+    return 0;
+  }
+  let generation = proposalGenByWindow.get(windowId);
+  if (generation === undefined) {
+    generation = ++nextProposalGen;
+    proposalGenByWindow.set(windowId, generation);
+  }
+  return generation;
 }
 
 function cachedProposal(windowId) {
@@ -3749,7 +4021,7 @@ async function handleGroupPreview(windowId) {
       await clearLastError();
       // Only cache if no dismiss/apply/window-close invalidated this proposal
       // while it was computing.
-      if (typeof windowId === "number" && currentProposalGen(windowId) === gen) {
+      if (typeof windowId === "number" && proposalGenByWindow.get(windowId) === gen) {
         lastProposalByWindow.set(windowId, { groups: result.groups, ts: Date.now() });
       }
     } else {
@@ -4141,15 +4413,36 @@ async function moveTabsToNewWindow(tabIds) {
   if (validIds.length < 1) {
     return listTabsForSearch();
   }
+  const moved = [];
+  const failed = [];
+  let win;
   try {
-    const win = await browser.windows.create({ tabId: validIds[0] });
-    if (validIds.length > 1 && win && typeof win.id === "number") {
-      await browser.tabs.move(validIds.slice(1), { windowId: win.id, index: -1 });
-    }
+    win = await browser.windows.create({ tabId: validIds[0] });
+    moved.push(validIds[0]);
   } catch (error) {
-    // Keep the overlay responsive if one of the selected tabs no longer exists.
+    failed.push(...validIds);
   }
-  return listTabsForSearch();
+  if (failed.length === 0 && validIds.length > 1) {
+    try {
+      if (!win || typeof win.id !== "number") throw new Error("new window unavailable");
+      await browser.tabs.move(validIds.slice(1), { windowId: win.id, index: -1 });
+      moved.push(...validIds.slice(1));
+    } catch (error) {
+      failed.push(...validIds.slice(1));
+    }
+  }
+  const list = await listTabsForSearch();
+  if (failed.length > 0) {
+    return {
+      ok: false,
+      error: "move_failed",
+      message: moved.length > 0 ? "Moved some tabs, but could not move all of them." : "Could not move tabs to a new window.",
+      moved,
+      failed,
+      list,
+    };
+  }
+  return list;
 }
 
 async function moveTabsToContainerFromSearch(tabIds, cookieStoreId) {
@@ -4174,6 +4467,7 @@ async function moveTabsToContainerFromSearch(tabIds, cookieStoreId) {
       typeof tab.windowId === "number"
     )
     .sort((a, b) => (a.windowId - b.windowId) || ((a.index || 0) - (b.index || 0)));
+  const failed = [];
   for (const tab of tabs) {
     const createProperties = {
       url: tab.url,
@@ -4185,14 +4479,33 @@ async function moveTabsToContainerFromSearch(tabIds, cookieStoreId) {
     if (typeof tab.index === "number") {
       createProperties.index = tab.index + 1;
     }
+    let replacement;
     try {
-      await browser.tabs.create(createProperties);
+      replacement = await browser.tabs.create(createProperties);
       await browser.tabs.remove(tab.id);
     } catch (error) {
-      // Skip tabs that vanish or reject container moves; the refreshed list tells the truth.
+      failed.push(tab.id);
+      if (replacement && typeof replacement.id === "number") {
+        try {
+          await browser.tabs.remove(replacement.id);
+        } catch (cleanupError) {
+          // The result distinguishes a failed move even when Firefox cannot
+          // remove the replacement after the original remains open.
+        }
+      }
     }
   }
-  return listTabsForSearch();
+  const list = await listTabsForSearch();
+  if (failed.length > 0) {
+    return {
+      ok: false,
+      error: "container_move_failed",
+      message: "Could not move some tabs to that container.",
+      failed,
+      list,
+    };
+  }
+  return list;
 }
 
 async function moveTabsFromSearch(tabIds, windowId, anchorId, placeAfter, groupId) {
@@ -4200,6 +4513,7 @@ async function moveTabsFromSearch(tabIds, windowId, anchorId, placeAfter, groupI
   if (validIds.length < 1 || typeof windowId !== "number") {
     return listTabsForSearch();
   }
+  let moveCompleted = false;
   try {
     const winTabs = (await browser.tabs.query({ windowId }))
       .slice()
@@ -4213,6 +4527,7 @@ async function moveTabsFromSearch(tabIds, windowId, anchorId, placeAfter, groupI
     const movedBefore = winTabs.slice(0, target).filter((tab) => moveSet.has(tab.id)).length;
     target = Math.max(0, target - movedBefore);
     await browser.tabs.move(validIds, { windowId, index: target });
+    moveCompleted = true;
     // Group membership follows the drop position: join the target group, or drop
     // out of any group when the position isn't inside one.
     if (typeof groupId === "number" && groupId !== -1) {
@@ -4221,7 +4536,23 @@ async function moveTabsFromSearch(tabIds, windowId, anchorId, placeAfter, groupI
       await browser.tabs.ungroup(validIds);
     }
   } catch (error) {
-    // Keep the overlay responsive if a tab vanished mid-drag.
+    const list = await listTabsForSearch();
+    if (moveCompleted) {
+      return {
+        ok: false,
+        error: "membership_failed",
+        message: "Tabs moved, but their group could not be updated.",
+        failed: validIds,
+        list,
+      };
+    }
+    return {
+      ok: false,
+      error: "move_failed",
+      message: "Could not move tabs.",
+      failed: validIds,
+      list,
+    };
   }
   return listTabsForSearch();
 }

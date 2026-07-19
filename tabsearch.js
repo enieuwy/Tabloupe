@@ -32,6 +32,8 @@ let containerPickerOpen = false;
 let actionMessage = "";
 let previewState = null;
 const collapsedGroups = new Set();
+let aiPreviewInFlight = false;
+let listLoadError = "";
 let dragTabIds = [];
 let dropIndicator = null;
 let historyResults = [];
@@ -511,8 +513,18 @@ function buildOverlay() {
   document.documentElement.appendChild(host);
 }
 
+function pruneCollapsedGroups() {
+  const liveGroupIds = new Set(
+    allTabs.filter((tab) => tab.grouped && tab.groupId !== null && tab.groupId !== undefined).map((tab) => tab.groupId),
+  );
+  for (const groupId of collapsedGroups) {
+    if (!liveGroupIds.has(groupId)) collapsedGroups.delete(groupId);
+  }
+}
+
 function render(query) {
   pruneMarked();
+  pruneCollapsedGroups();
   if (previewState) {
     renderPreview();
     return;
@@ -539,6 +551,21 @@ function render(query) {
   }
   listEl.textContent = "";
   listEl.classList.toggle("has-marks", marked.size > 0);
+
+  if (listLoadError) {
+    const error = document.createElement("li");
+    error.className = "empty";
+    const errorText = document.createElement("span");
+    errorText.textContent = listLoadError;
+    error.appendChild(errorText);
+    listEl.appendChild(error);
+    filtered = [];
+    selectedIndex = 0;
+    footerEl.className = "actions";
+    footerEl.textContent = "";
+    footerEl.appendChild(makeActionButton("Retry", retryOverlayTabs));
+    return;
+  }
 
   if (renderedCount === 0 && actionRows.length === 0) {
     const empty = document.createElement("li");
@@ -911,6 +938,18 @@ function dropAtPosition(tabIds, index, placeAfter) {
   moveOntoPosition(tabIds, anchor.windowId, anchor.id, placeAfter, groupId);
 }
 
+function applyListActionResult(result, fallbackMessage) {
+  const list = Array.isArray(result) ? result : result && Array.isArray(result.list) ? result.list : null;
+  if (list) {
+    allTabs = prepareTabsForSearch(list);
+    clearMarks();
+    pruneMarked();
+  }
+  if (!Array.isArray(result) && result && typeof result === "object") {
+    actionMessage = result.message || result.error || fallbackMessage;
+  }
+}
+
 function moveOntoPosition(tabIds, windowId, anchorId, placeAfter, groupId) {
   if (!Array.isArray(tabIds) || tabIds.length === 0) return;
   return runGuardedListAction(
@@ -923,12 +962,8 @@ function moveOntoPosition(tabIds, windowId, anchorId, placeAfter, groupId) {
       groupId,
     }),
     {
-      onResult(refreshed) {
-        if (Array.isArray(refreshed)) {
-          allTabs = prepareTabsForSearch(refreshed);
-          clearMarks();
-          pruneMarked();
-        }
+      onResult(result) {
+        applyListActionResult(result, "Could not move tabs.");
       },
       onError() {
         actionMessage = "Could not move tabs.";
@@ -1189,8 +1224,9 @@ function renderFooter() {
   footerEl.appendChild(group);
 
   const ai = makeActionButton("AI group", () => previewAiGroups(windowId));
-  ai.disabled = !sameWindow;
+  ai.disabled = !sameWindow || aiPreviewInFlight;
   if (!sameWindow) ai.title = "select tabs from one window to group";
+  else if (aiPreviewInFlight) ai.title = "AI preview in progress";
   footerEl.appendChild(ai);
 
   footerEl.appendChild(makeActionButton("Close", () => runBulkListAction("tabsearch-close-many", { tabIds: tabs.map((tab) => tab.id) })));
@@ -1406,6 +1442,35 @@ function focusInput() {
   attempt(10);
 }
 
+async function loadOverlayTabs(gen) {
+  try {
+    const [tabs, containersResult] = await Promise.all([
+      browser.runtime.sendMessage({ type: "tabsearch-list" }),
+      browser.runtime.sendMessage({ type: "tabsearch-containers" }).catch(() => ({ ok: false, containers: [] })),
+    ]);
+    if (gen !== overlayGen || !isOpen()) return false;
+    allTabs = prepareTabsForSearch(tabs || []);
+    tabContainers = containersResult && containersResult.ok && Array.isArray(containersResult.containers)
+      ? containersResult.containers
+      : [];
+    listLoadError = "";
+    return true;
+  } catch (error) {
+    if (gen !== overlayGen || !isOpen()) return false;
+    allTabs = [];
+    tabContainers = [];
+    listLoadError = "Could not load tabs. Try again.";
+    return false;
+  }
+}
+
+async function retryOverlayTabs() {
+  const gen = overlayGen;
+  await loadOverlayTabs(gen);
+  if (gen !== overlayGen || !isOpen()) return;
+  render(inputEl.value);
+}
+
 async function openOverlay() {
   if (isOpen()) {
     closeOverlay();
@@ -1414,22 +1479,9 @@ async function openOverlay() {
   buildOverlay();
   const gen = overlayGen;
   selectedIndex = 0;
+  listLoadError = "";
   focusInput();
-  try {
-    const [tabs, containersResult] = await Promise.all([
-      browser.runtime.sendMessage({ type: "tabsearch-list" }),
-      browser.runtime.sendMessage({ type: "tabsearch-containers" }).catch(() => ({ ok: false, containers: [] })),
-    ]);
-    if (gen !== overlayGen || !isOpen()) return; // closed or reopened while awaiting
-    allTabs = prepareTabsForSearch(tabs || []);
-    tabContainers = containersResult && containersResult.ok && Array.isArray(containersResult.containers)
-      ? containersResult.containers
-      : [];
-  } catch (error) {
-    if (gen !== overlayGen || !isOpen()) return;
-    allTabs = [];
-    tabContainers = [];
-  }
+  await loadOverlayTabs(gen);
   if (gen !== overlayGen || !isOpen()) return; // closed or reopened while awaiting
   render(inputEl.value);
 }
@@ -1448,6 +1500,7 @@ function closeOverlay() {
   clearMarks();
   previewState = null;
   tabContainers = [];
+  listLoadError = "";
   dropIndicator = null;
   // When we are the extension-hosted new-tab page (not an in-page overlay),
   // removing the host leaves a blank extension tab behind. Close the tab instead.
@@ -1536,12 +1589,8 @@ function runBulkListAction(type, payload) {
   return runGuardedListAction(
     () => browser.runtime.sendMessage({ type, ...payload }),
     {
-      onResult(refreshed) {
-        if (Array.isArray(refreshed)) {
-          allTabs = prepareTabsForSearch(refreshed);
-          clearMarks();
-          pruneMarked();
-        }
+      onResult(result) {
+        applyListActionResult(result, "Action failed.");
       },
       onError() {
         actionMessage = "Action failed.";
@@ -1576,6 +1625,9 @@ function submitManualGroup(tabIds, title, windowId) {
 }
 
 function previewAiGroups(windowId) {
+  if (aiPreviewInFlight) return;
+  aiPreviewInFlight = true;
+  if (isOpen()) render(inputEl.value);
   const tabIds = markedTabs().map((tab) => tab.id);
   return runGuardedListAction(
     () => browser.runtime.sendMessage({ type: "tabsearch-ai-preview", windowId, tabIds }),
@@ -1592,7 +1644,10 @@ function previewAiGroups(windowId) {
         actionMessage = "Could not preview AI groups.";
       },
     },
-  );
+  ).finally(() => {
+    aiPreviewInFlight = false;
+    if (isOpen()) render(inputEl.value);
+  });
 }
 
 async function applyAiPreview() {

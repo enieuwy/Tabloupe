@@ -595,6 +595,31 @@ test("Show all groups control activates the all-groups view", async () => {
   assert.match(document.querySelector(".active-view-summary").textContent, /Showing: All groups/);
 });
 
+test("lens activation surfaces a structured failure instead of reporting success", async () => {
+  const harness = createHarness({
+    storage: {
+      activeView: { kind: "all" },
+      lenses: [lensFixture()],
+    },
+  });
+  await settle();
+
+  const sendMessage = harness.browser.runtime.sendMessage;
+  harness.browser.runtime.sendMessage = async (message) => {
+    if (message.type === "lens-activate") {
+      harness.messages.push(message);
+      return { ok: false };
+    }
+    return sendMessage(message);
+  };
+
+  lensCard(harness.document).querySelector(".lens-show-button").click();
+  await settle();
+
+  assert.match(harness.document.getElementById("status").textContent, /Switch failed/);
+  assert.match(harness.document.querySelector(".active-view-summary").textContent, /Showing: All groups/);
+});
+
 test("delete offers Undo and Undo restores through lens messages", async () => {
   const { document, messages } = createHarness({
     storage: {
@@ -1046,6 +1071,35 @@ test("editing a schedule preserves a schedule written outside the stale UI snaps
   assert.equal(written.find((schedule) => schedule.lensId === "lens_work").enabled, true);
 });
 
+test("concurrent schedule edits preserve both lenses' changes", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lensFixture(), lensFixture({ id: "lens_play", name: "Play lens" })],
+      lensSchedules: [
+        { lensId: "lens_work", enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "17:00" },
+        { lensId: "lens_play", enabled: false, days: [1, 2, 3, 4, 5], start: "09:00", end: "17:00" },
+      ],
+    },
+  });
+  await settle();
+
+  lensCard(harness.document, "lens_work").querySelector(".icon-btn-options").click();
+  await settle();
+  lensCard(harness.document, "lens_play").querySelector(".icon-btn-options").click();
+  await settle();
+
+  const workToggle = lensCard(harness.document, "lens_work").querySelector(".schedule-editor .toggle input[type='checkbox']");
+  const playToggle = lensCard(harness.document, "lens_play").querySelector(".schedule-editor .toggle input[type='checkbox']");
+  workToggle.checked = true;
+  workToggle.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  playToggle.checked = true;
+  playToggle.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  await settle();
+
+  assert.equal(harness.storageData.lensSchedules.find((schedule) => schedule.lensId === "lens_work").enabled, true);
+  assert.equal(harness.storageData.lensSchedules.find((schedule) => schedule.lensId === "lens_play").enabled, true);
+});
+
 test("advanced panel shows glob help and icon color editors", async () => {
   const { document } = createHarness({
     storage: { lenses: [lensFixture()] },
@@ -1341,6 +1395,54 @@ test("loadAll keeps a concurrent storage.onChanged update instead of reverting i
   );
 });
 
+test("loadAll keeps active view and activation changes that arrive before its stale lens state", async () => {
+  const staleActivation = { trigger: "stale", triggerId: "stale-trigger", at: 1 };
+  const freshActivation = { trigger: "manual", triggerId: "fresh-trigger", at: 2 };
+  const harness = createHarness({
+    storage: {
+      activeView: { kind: "all" },
+      lastActivation: staleActivation,
+      lenses: [lensFixture()],
+    },
+  });
+  await settle();
+
+  const oldSnapshot = clone(harness.storageData);
+  let resolveGet;
+  let resolveLensState;
+  const sendMessage = harness.browser.runtime.sendMessage;
+  harness.browser.storage.local.get = () => new Promise((resolve) => {
+    resolveGet = () => resolve(clone(oldSnapshot));
+  });
+  harness.browser.runtime.sendMessage = (message) => {
+    if (message.type === "lens-state") {
+      harness.messages.push(message);
+      return new Promise((resolve) => {
+        resolveLensState = () => resolve({
+          activeView: { kind: "all" },
+          lastActivation: staleActivation,
+        });
+      });
+    }
+    return sendMessage(message);
+  };
+
+  const loadPromise = harness.window.loadAll();
+  await nextTick();
+  await harness.browser.storage.local.set({
+    activeView: { kind: "lens", lensId: "lens_work" },
+    lastActivation: freshActivation,
+  });
+  resolveGet();
+  resolveLensState();
+  await loadPromise;
+  await settle();
+
+  assert.match(harness.document.querySelector(".active-view-summary").textContent, /Showing: Work lens/);
+  assert.equal(harness.document.getElementById("diag-last-focus").textContent, "fresh-trigger");
+  assert.match(harness.document.getElementById("diag-last-action").textContent, /^manual/);
+});
+
 test("a superseded loadAll does not clobber a newer load's committed state", async () => {
   const harness = createHarness({ storage: { aiGroupingPrompt: "disk value" } });
   await settle();
@@ -1423,6 +1525,7 @@ test("provider test connection lists models and persists successful diagnostics"
   assert.equal(harness.document.getElementById("provider-test-status").textContent, "Found 2 models.");
   assert.equal(harness.storageData.lastProviderCheck.ok, true);
   assert.equal(harness.storageData.lastProviderCheck.detail, "Found 2 models.");
+  assert.deepEqual(clone(harness.permissionRequests), [{ origins: ["https://api.example.com/*"] }]);
 });
 
 test("provider test connection falls back to completions and records HTTP failures", async () => {

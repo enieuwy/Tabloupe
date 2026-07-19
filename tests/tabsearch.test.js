@@ -507,6 +507,43 @@ test("AI preview renders topic sections and apply sends reduced groups", async (
   assert.equal(overlayRoot(harness), null);
 });
 
+test("AI preview ignores re-entry until the in-flight request settles", async () => {
+  let previewCalls = 0;
+  let resolvePreview;
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-ai-preview") {
+        previewCalls += 1;
+        if (previewCalls === 1) return new Promise((resolve) => { resolvePreview = resolve; });
+        return { ok: false, message: "AI preview failed." };
+      }
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  rows(harness)[0].querySelector(".mark").click();
+  rows(harness)[1].querySelector(".mark").click();
+  let aiButton = Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "AI group");
+  aiButton.click();
+  assert.equal(harness.sent.filter((message) => message.type === "tabsearch-ai-preview").length, 1);
+  aiButton = Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "AI group");
+  assert.equal(aiButton.disabled, true);
+
+  harness.window.previewAiGroups(1);
+  assert.equal(harness.sent.filter((message) => message.type === "tabsearch-ai-preview").length, 1);
+
+  resolvePreview({ ok: false, message: "AI preview failed." });
+  await settle();
+  aiButton = Array.from(overlayRoot(harness).querySelectorAll(".actions button")).find((button) => button.textContent === "AI group");
+  assert.equal(aiButton.disabled, false);
+  aiButton.click();
+  await settle();
+  assert.equal(harness.sent.filter((message) => message.type === "tabsearch-ai-preview").length, 2);
+});
+
 test("bulk close sends tabsearch-close-many and refreshes the list", async () => {
   const harness = createHarness({
     respond(message) {
@@ -649,6 +686,35 @@ test("browse mode renders a collapsible group section and collapsing hides its m
   assert.equal(rows(harness).length, 1);
 });
 
+test("a refreshed tab list prunes collapsed groups that no longer exist", async () => {
+  const initialTabs = [
+    { id: 1, windowId: 1, title: "Docs", url: "https://docs.example.com", favIconUrl: "", active: true, currentWindow: true, pinned: false, grouped: false, groupId: -1 },
+    { id: 2, windowId: 1, title: "HN", url: "https://news.ycombinator.com", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "Read", groupColor: "green" },
+    { id: 3, windowId: 1, title: "Lobsters", url: "https://lobste.rs", favIconUrl: "", active: false, currentWindow: true, pinned: false, grouped: true, groupId: 5, groupTitle: "Read", groupColor: "green" },
+  ];
+  const refreshedTabs = initialTabs.map((tab) =>
+    tab.groupId === 5 ? { ...tab, groupId: 6, groupTitle: "Later" } : tab,
+  );
+  const harness = createHarness({
+    tabs: initialTabs,
+    respond(message) {
+      if (message.type === "tabsearch-list") return initialTabs.slice();
+      if (message.type === "refresh") return refreshedTabs;
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  overlayRoot(harness).querySelector(".group-header").click();
+  assert.equal(rows(harness).length, 1);
+  harness.window.runBulkListAction("refresh", {});
+  await settle();
+
+  assert.equal(overlayRoot(harness).querySelector(".group-header").classList.contains("collapsed"), false);
+  assert.equal(rows(harness).length, 3);
+});
+
 test("dragging a row onto a group header groups it via the target groupId", async () => {
   const tabs = [
     { id: 1, windowId: 1, title: "Docs", url: "https://docs.example.com", favIconUrl: "", active: true, currentWindow: true, pinned: false, grouped: false, groupId: -1 },
@@ -708,6 +774,27 @@ test("dropping a row inside a group (between two members) moves it into that gro
   assert.equal(sent.anchorId, 2);
   assert.equal(sent.placeAfter, true);
   assert.equal(sent.groupId, 5);
+});
+
+test("a partial tab-search move refreshes the list and surfaces its failure", async () => {
+  const refreshed = [{ ...SAMPLE_TABS[0], title: "Moved Docs" }];
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-move") {
+        return { ok: false, error: "group_update_failed", message: "Moved tabs, but could not update the group.", list: refreshed };
+      }
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  harness.window.moveOntoPosition([20], 1, 30, true, -1);
+  await settle();
+
+  assert.deepEqual(rowTitles(harness), ["Moved Docs"]);
+  assert.equal(overlayRoot(harness).querySelector(".message").textContent, "Moved tabs, but could not update the group.");
 });
 
 test("dropping a grouped row among ungrouped rows drags it out of the group", async () => {
@@ -1364,6 +1451,32 @@ test("the browser command echo does not close the overlay the keydown just opene
 });
 
 // ── Regression: stale async work vs. reopen / out-of-order / silent failures ──
+
+test("a failed tab list shows a retryable load error instead of the empty-tab copy", async () => {
+  let listAttempts = 0;
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") {
+        listAttempts += 1;
+        if (listAttempts === 1) throw new Error("background unavailable");
+        return SAMPLE_TABS.slice();
+      }
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  const root = overlayRoot(harness);
+  assert.ok(root, "the overlay remains open after a list failure");
+  assert.equal(root.querySelector(".empty").textContent, "Could not load tabs. Try again.");
+  assert.equal(root.textContent.includes("No matching tabs"), false);
+
+  Array.from(root.querySelectorAll(".actions button")).find((button) => button.textContent === "Retry").click();
+  await settle();
+  assert.deepEqual(rowTitles(harness), ["Docs", "GitHub", "Mozilla"]);
+  assert.equal(listAttempts, 2);
+});
 
 test("a stale in-flight list does not repaint a reopened overlay", async () => {
   const listResolvers = [];

@@ -8,6 +8,8 @@ PROFILES_INI="$HOME/Library/Application Support/Firefox/profiles.ini"
 STATE_ROOT="$HOME/.local/state/tabloupe"
 BACKUP_ROOT="$STATE_ROOT/session-backups"
 VENV_DIR="$STATE_ROOT/lz4-venv"
+# Keep only the newest complete session snapshots.
+BACKUP_RETENTION_COUNT=10
 LZ4_VERSION="4.4.5"
 XPI_DIR="$REPO_DIR/web-ext-artifacts"
 
@@ -191,6 +193,25 @@ SNAPSHOT_DIR=""
 PRE_WINDOWS=0
 PRE_TABS=0
 
+prune_session_backups() {
+  local snapshots=()
+  local snapshot
+  for snapshot in "$BACKUP_ROOT"/*; do
+    [[ -d "$snapshot" ]] && snapshots+=("$snapshot")
+  done
+
+  local stale_count=$((${#snapshots[@]} - BACKUP_RETENTION_COUNT))
+  if ((stale_count <= 0)); then
+    return
+  fi
+
+  local index
+  for ((index = 0; index < stale_count; index += 1)); do
+    rm -rf -- "${snapshots[index]}"
+  done
+  info "  Pruned $stale_count old session backup(s)"
+}
+
 snapshot_session() {
   header "Snapshot Firefox session"
 
@@ -199,6 +220,8 @@ snapshot_session() {
   SNAPSHOT_DIR="$BACKUP_ROOT/$timestamp"
   mkdir -p "$STATE_ROOT"
   chmod 700 "$STATE_ROOT"
+  mkdir -p "$BACKUP_ROOT"
+  chmod 700 "$BACKUP_ROOT"
   mkdir -p "$SNAPSHOT_DIR"
 
   if [[ ! -d "$SESSION_DIR" ]]; then
@@ -221,6 +244,7 @@ for child in source.iterdir():
         shutil.copy2(child, target)
 PY
   success "  ✓ Session files copied to $SNAPSHOT_DIR"
+  prune_session_backups
 
   local recovery_file="$SNAPSHOT_DIR/recovery.jsonlz4"
   if [[ ! -f "$recovery_file" ]]; then

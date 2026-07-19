@@ -581,10 +581,10 @@ async function commitLoadedState({ stored, firefoxSnapshot, lensState, container
   applyStored("busToken", normalizeBusToken(stored.busToken));
   applyStored("busPairingStatus", normalizeBusPairingStatus(stored.busPairingStatus));
   if (isRecord(lensState)) {
-    if (isRecord(lensState.activeView)) {
+    if (!changedKeys.has("activeView") && isRecord(lensState.activeView)) {
       state.activeView = lensState.activeView;
     }
-    if (isRecord(lensState.lastActivation)) {
+    if (!changedKeys.has("lastActivation") && isRecord(lensState.lastActivation)) {
       state.lastActivation = lensState.lastActivation;
     }
     if (Array.isArray(lensState.currentGroups)) {
@@ -2089,7 +2089,11 @@ async function activateLensView(view) {
   state.windowId = windowId;
   state.activeView = view;
   render();
-  await browser.runtime.sendMessage({ type: "lens-activate", windowId, view });
+  const result = await browser.runtime.sendMessage({ type: "lens-activate", windowId, view });
+  if (!result || result.ok !== true) {
+    await refreshLensState(windowId);
+    throw new Error("Lens activation was not applied.");
+  }
   await refreshLensState(windowId);
   setStatus(view.kind === "all" ? "Showing all groups." : "Showing lens.", "ok");
 }
@@ -3122,7 +3126,7 @@ async function testProviderConnection() {
 
     let granted;
     try {
-      granted = await requestProviderOriginPermission(validation.origin);
+      granted = await requestProviderOriginPermission(validation.parsed);
     } catch (error) {
       await rememberProviderCheck(false, "Could not request permission for that domain.");
       return;

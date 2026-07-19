@@ -541,7 +541,15 @@ async function refreshAi({ autoPreview = false } = {}) {
 
   el("ai-enabled").checked = state.enabled === true;
   renderPin(state);
-  const autoStored = await browser.storage.local.get("aiAutoGroup");
+  let autoStored;
+  try {
+    autoStored = await browser.storage.local.get("aiAutoGroup");
+  } catch (error) {
+    console.error("AI preferences failed:", error);
+    renderAuto(state, false);
+    setStatus("Could not read AI preferences.", "error");
+    return;
+  }
   renderAuto(state, autoStored.aiAutoGroup === true);
 
   if (state.enabled !== true) {
@@ -581,6 +589,20 @@ async function closeAiSubview() {
   await refreshLensState();
 }
 
+async function saveAiPreference(event, key) {
+  const checkbox = event.target;
+  const previousChecked = !checkbox.checked;
+  try {
+    await browser.storage.local.set({ [key]: checkbox.checked });
+    return true;
+  } catch (error) {
+    console.error("AI preference save failed:", error);
+    checkbox.checked = previousChecked;
+    setStatus("Could not save AI setting. Try again.", "error");
+    return false;
+  }
+}
+
 async function ensureAiInitialized() {
   if (aiInitialized) {
     return;
@@ -592,14 +614,15 @@ async function ensureAiInitialized() {
   }
 
   el("ai-enabled").addEventListener("change", async (event) => {
-    await browser.storage.local.set({ aiGroupingEnabled: event.target.checked });
-    await refreshAi({ autoPreview: false });
+    if (await saveAiPreference(event, "aiGroupingEnabled")) {
+      await refreshAi({ autoPreview: false });
+    }
   });
-  el("ai-pin").addEventListener("change", async (event) => {
-    await browser.storage.local.set({ aiPinToFocus: event.target.checked });
+  el("ai-pin").addEventListener("change", (event) => {
+    saveAiPreference(event, "aiPinToFocus");
   });
-  el("ai-auto").addEventListener("change", async (event) => {
-    await browser.storage.local.set({ aiAutoGroup: event.target.checked });
+  el("ai-auto").addEventListener("change", (event) => {
+    saveAiPreference(event, "aiAutoGroup");
   });
   el("ai-organize").addEventListener("click", runPreview);
   el("ai-regroup").addEventListener("click", runPreview);

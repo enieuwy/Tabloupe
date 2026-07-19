@@ -31,7 +31,7 @@ function defaultLensState(overrides = {}) {
   };
 }
 
-function createHarness({ windowId = 7, respond = () => ({}), storage = {} } = {}) {
+function createHarness({ windowId = 7, respond = () => ({}), storage = {}, storageGet, storageSet } = {}) {
   const sent = [];
   const storageData = { ...storage };
   const optionsOpened = [];
@@ -47,6 +47,12 @@ function createHarness({ windowId = 7, respond = () => ({}), storage = {} } = {}
     storage: {
       local: {
         async get(keys) {
+          if (storageGet) {
+            const result = await storageGet(keys, storageData);
+            if (result !== undefined) {
+              return result;
+            }
+          }
           if (typeof keys === "string") {
             return { [keys]: storageData[keys] };
           }
@@ -56,6 +62,9 @@ function createHarness({ windowId = 7, respond = () => ({}), storage = {} } = {}
           return { ...storageData };
         },
         async set(values) {
+          if (storageSet) {
+            await storageSet(values, storageData);
+          }
           const changes = Object.fromEntries(
             Object.entries(values).map(([key, value]) => [key, { oldValue: storageData[key], newValue: value }]),
           );
@@ -540,6 +549,85 @@ test("toggling the AI checkbox writes the enabled flag to storage", async () => 
   await settle();
 
   assert.equal(harness.storageData.aiGroupingEnabled, true);
+});
+
+test("failed AI preference writes revert the checkbox and show an error", async () => {
+  const harness = createHarness({
+    respond: (message) => {
+      if (message.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (message.type === "ai-group-state") return { enabled: false, groupableCount: 0, proposal: null };
+      return {};
+    },
+    storageSet(values) {
+      if (values.aiGroupingEnabled !== undefined) {
+        throw new Error("storage unavailable");
+      }
+    },
+  });
+  await settle();
+  await openAi(harness);
+
+  const box = harness.document.getElementById("ai-enabled");
+  box.checked = true;
+  box.dispatchEvent(new harness.window.Event("change"));
+  await settle();
+
+  assert.equal(box.checked, false);
+  assert.equal(harness.storageData.aiGroupingEnabled, undefined);
+  assert.match(harness.document.getElementById("ai-status").textContent, /Could not save AI setting/);
+  assert.match(harness.document.getElementById("ai-status").className, /error/);
+});
+
+test("failed AI pin and auto-group writes revert their checkboxes", async () => {
+  const harness = createHarness({
+    respond: (message) => {
+      if (message.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (message.type === "ai-group-state") {
+        return { enabled: true, groupableCount: 2, proposal: null, pinToFocus: false, activeFocus: "Work" };
+      }
+      return {};
+    },
+    storageSet(values) {
+      if (values.aiPinToFocus !== undefined || values.aiAutoGroup !== undefined) {
+        throw new Error("storage unavailable");
+      }
+    },
+  });
+  await settle();
+  await openAi(harness);
+
+  for (const id of ["ai-pin", "ai-auto"]) {
+    const box = harness.document.getElementById(id);
+    box.checked = true;
+    box.dispatchEvent(new harness.window.Event("change"));
+    await settle();
+    assert.equal(box.checked, false, `${id} reverted`);
+  }
+  assert.equal(harness.storageData.aiPinToFocus, undefined);
+  assert.equal(harness.storageData.aiAutoGroup, undefined);
+  assert.match(harness.document.getElementById("ai-status").textContent, /Could not save AI setting/);
+});
+
+test("failed AI preference reads show a fallback auto-group state", async () => {
+  const harness = createHarness({
+    storage: { aiAutoGroup: true },
+    respond: (message) => {
+      if (message.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (message.type === "ai-group-state") return { enabled: true, groupableCount: 2, proposal: null };
+      return {};
+    },
+    storageGet(keys) {
+      if (keys === "aiAutoGroup") {
+        throw new Error("storage unavailable");
+      }
+    },
+  });
+  await settle();
+  await openAi(harness);
+
+  assert.equal(harness.document.getElementById("ai-auto").checked, false);
+  assert.match(harness.document.getElementById("ai-status").textContent, /Could not read AI preferences/);
+  assert.match(harness.document.getElementById("ai-status").className, /error/);
 });
 
 test("auto-group row is visible and checked when enabled and aiAutoGroup is stored", async () => {
