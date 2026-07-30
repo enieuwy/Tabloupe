@@ -1,0 +1,92 @@
+/* First-run welcome page. Reuses options.css for tokens, cards, and buttons;
+   only the few onboarding-specific pieces live here. */
+
+.subtitle {
+  margin: 6px 0 0;
+  max-width: 60ch;
+  color: var(--muted);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.onboarding-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* An explicit `display` overrides the UA [hidden] rule, so restore it. */
+.onboarding-groups[hidden],
+.onboarding-save[hidden] {
+  display: none;
+}
+
+.onboarding-groups li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 550;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.onboarding-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.onboarding-save {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.onboarding-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.onboarding-field input {
+  min-width: 220px;
+}
+
+.onboarding-empty p {
+  max-width: 66ch;
+}
+
+.onboarding-tips {
+  margin: 8px 0 0;
+  padding-left: 20px;
+}
+
+.onboarding-tips li + li {
+  margin-top: 8px;
+}
+
+.onboarding-tips kbd {
+  padding: 1px 6px;
+  font: 500 12px/1.6 var(--mono);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.onboarding-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+}

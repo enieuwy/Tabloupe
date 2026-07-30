@@ -6124,3 +6124,48 @@ test("a blank tab that cannot be closed is reported, not hidden (898caf40)", asy
   await waitFor(() => assert.ok(harness.tabCreations.some((created) => String(created.url).includes("tabsearch.html"))));
   await waitFor(() => assert.ok(harness.consoleErrors.some((args) => String(args[0]).includes("left the original blank tab open"))));
 });
+
+test("a fresh install opens the welcome page exactly once (f0333b03)", async () => {
+  const harness = createHarness({ storage: {} });
+  await settle();
+
+  for (const listener of harness.installedListeners) {
+    listener({ reason: "install" });
+  }
+  await waitFor(() => assert.ok(harness.tabCreations.some((created) => String(created.url).includes("onboarding.html"))));
+  assert.equal(harness.storageData.onboardingSeen, true);
+
+  // A second install event (event-page re-evaluation, reinstall race) must not
+  // reopen the welcome tab.
+  harness.tabCreations.length = 0;
+  for (const listener of harness.installedListeners) {
+    listener({ reason: "install" });
+  }
+  await settle();
+  assert.deepEqual(harness.tabCreations, []);
+});
+
+test("an update never opens the welcome page (f0333b03)", async () => {
+  const harness = createHarness({ storage: {} });
+  await settle();
+
+  for (const listener of harness.installedListeners) {
+    listener({ reason: "update", previousVersion: "1.0.0" });
+  }
+  await settle();
+
+  assert.deepEqual(harness.tabCreations, []);
+  assert.equal(harness.storageData.onboardingSeen, undefined);
+});
+
+test("a failed welcome-page open does not retry forever (f0333b03)", async () => {
+  const harness = createHarness({ storage: {} });
+  await settle();
+  harness.browser.tabs.create = async () => { throw new Error("no tab for you"); };
+
+  for (const listener of harness.installedListeners) {
+    listener({ reason: "install" });
+  }
+  await waitFor(() => assert.equal(harness.storageData.onboardingSeen, true));
+  assert.ok(harness.consoleErrors.some((args) => String(args[0]).includes("Opening the welcome page failed")));
+});

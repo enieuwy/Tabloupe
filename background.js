@@ -5159,6 +5159,38 @@ if (browser.commands && browser.commands.onCommand) {
   });
 }
 
+// First run: a fresh install has zero lenses, so nothing happens until the user
+// discovers the popup and hand-builds one. Offer to turn the tab groups they
+// already have into their first lens instead.
+const ONBOARDING_SEEN_KEY = "onboardingSeen";
+
+async function openOnboardingOnce() {
+  const stored = await browser.storage.local.get(ONBOARDING_SEEN_KEY);
+  if (stored[ONBOARDING_SEEN_KEY] === true) {
+    return false;
+  }
+  // Mark before opening: if tabs.create fails (or the event page dies mid-flight)
+  // a retry on the next wake must not reopen the welcome tab forever.
+  await browser.storage.local.set({ [ONBOARDING_SEEN_KEY]: true });
+  try {
+    await browser.tabs.create({ url: browser.runtime.getURL("onboarding.html"), active: true });
+    return true;
+  } catch (error) {
+    console.error("Opening the welcome page failed:", error);
+    return false;
+  }
+}
+
+if (browser.runtime.onInstalled && browser.runtime.onInstalled.addListener) {
+  browser.runtime.onInstalled.addListener((details) => {
+    // Only a genuine install: an update must never hijack a tab.
+    if (!details || details.reason !== "install") {
+      return;
+    }
+    openOnboardingOnce().catch((error) => console.error("Onboarding failed:", error));
+  });
+}
+
 browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "reconnect") {
     connect();

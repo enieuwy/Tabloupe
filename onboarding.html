@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Welcome to Tabloupe</title>
+  <link rel="icon" href="icons/icon.svg">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="options.css">
+  <link rel="stylesheet" href="onboarding.css">
+  <script defer src="onboarding.js"></script>
+</head>
+<body>
+  <main>
+    <header class="page-header">
+      <div>
+        <h1>Welcome to Tabloupe</h1>
+        <p class="subtitle">A <strong>lens</strong> is a saved view of your tab groups. Switching one expands the groups you named and collapses the rest — your tabs stay open.</p>
+      </div>
+    </header>
+
+    <section class="card" id="groups-card" aria-labelledby="groups-heading">
+      <h2 id="groups-heading">Start from the groups you already have</h2>
+      <p id="groups-summary" class="muted">Looking for tab groups in this window…</p>
+      <ul id="groups-list" class="onboarding-groups" hidden></ul>
+
+      <div class="onboarding-save" id="save-row" hidden>
+        <label class="onboarding-field">
+          <span>Lens name</span>
+          <input id="lens-name" type="text" value="My lens" maxlength="60" autocomplete="off">
+        </label>
+        <button id="save-lens" type="button">Save as lens</button>
+      </div>
+
+      <div id="groups-empty" class="onboarding-empty" hidden>
+        <p>This window has no tab groups yet. In Firefox, right-click a tab and choose <strong>Add tab to new group</strong> — then come back and save that set as a lens.</p>
+        <p class="muted">Prefer a shortcut? Open the Tabloupe toolbar popup and use <strong>Organize tabs…</strong> to cluster your open tabs into groups first.</p>
+      </div>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="card" aria-labelledby="tips-heading">
+      <h2 id="tips-heading">Two things worth knowing</h2>
+      <ul class="onboarding-tips">
+        <li><strong>Nothing is ever closed.</strong> Switching a lens only collapses and expands groups. <strong>Show all groups</strong> in the popup brings everything back.</li>
+        <li><strong>Search every open tab</strong> with <kbd id="search-shortcut">Ctrl + S</kbd> on any web page — then group, close, or move the results in bulk.</li>
+      </ul>
+      <div class="onboarding-actions">
+        <button id="open-options" type="button" class="secondary">Open settings</button>
+        <button id="done" type="button" class="secondary">Done</button>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
