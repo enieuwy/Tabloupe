@@ -23,6 +23,8 @@ async function settle() {
 }
 
 function createHarness({ storage = {}, groups = [], grantPermission = true, platform = "MacIntel", fetchHandler = null } = {}) {
+  const commandUpdates = [];
+  const commandResets = [];
   const storageData = clone(storage) || {};
   const groupState = clone(groups);
   const storageListeners = [];
@@ -183,6 +185,22 @@ function createHarness({ storage = {}, groups = [], grantPermission = true, plat
         }
       }
     },
+    commands: {
+      async getAll() {
+        return [{ name: "search-tabs", shortcut: "Ctrl+S" }];
+      },
+      async update(details) {
+        commandUpdates.push(details);
+      },
+      async reset(name) {
+        commandResets.push(name);
+      },
+    },
+    tabGroups: {
+      async query() {
+        return clone(groupState);
+      },
+    },
     permissions: {
       async request(request) {
         permissionRequests.push(request);
@@ -234,6 +252,8 @@ function createHarness({ storage = {}, groups = [], grantPermission = true, plat
     groupState,
     messages,
     permissionRequests,
+    commandUpdates,
+    commandResets,
     fetchCalls,
     clipboardWrites,
     prompts,
@@ -1623,4 +1643,173 @@ test("a rejected lens edit reverts the optimistic UI instead of reporting succes
   const chipLabels = [...lensCard(document).querySelectorAll(".group-chip-label")].map((el) => el.textContent);
   assert.ok(!chipLabels.includes("Deep Work"), "optimistic selector reverted after backend rejection");
   assert.match(document.getElementById("status").textContent, /failed/i);
+});
+
+test("a failed tab-group query shows an error instead of an empty workspace (ac9b7ecf)", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lensFixture({ groupSelectors: [{ type: "title", value: "Deep Work" }] })] },
+    groups: [{ id: 1, title: "Deep Work" }],
+  });
+  await settle();
+  const groupsLine = () => harness.document.getElementById("diag-current-groups").textContent;
+  assert.match(groupsLine(), /Deep Work/);
+
+  harness.browser.tabGroups.query = async () => { throw new Error("tabGroups unavailable"); };
+  await harness.window.loadAll();
+  await settle();
+
+  assert.match(groupsLine(), /Deep Work/, "the last known snapshot is kept");
+  assert.match(harness.document.getElementById("status").textContent, /Could not read your Firefox tab groups/);
+});
+
+test("a failed schedule write leaves the stored schedule and state untouched (c373e09c)", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lensFixture({ groupSelectors: [{ type: "title", value: "Deep Work" }] })],
+      lensSchedules: [],
+    },
+  });
+  await settle();
+
+  const realSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "lensSchedules")) {
+      throw new Error("storage full");
+    }
+    return realSet(values);
+  };
+
+  const toggle = lensCard(harness.document).querySelector(".schedule-editor input[type=checkbox]");
+  assert.ok(toggle, "the schedule toggle is rendered");
+  toggle.checked = true;
+  toggle.dispatchEvent(new harness.document.defaultView.Event("change"));
+  await settle();
+
+  assert.deepEqual(harness.storageData.lensSchedules, []);
+  assert.match(harness.document.getElementById("status").textContent, /Schedule save failed/);
+});
+
+test("a failed pairing-token write keeps the previous token visible (b9558d51)", async () => {
+  const token = "a".repeat(64);
+  const harness = createHarness({ storage: { busToken: token } });
+  await settle();
+
+  const realSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "busToken")) {
+      throw new Error("storage full");
+    }
+    return realSet(values);
+  };
+
+  const input = harness.document.getElementById("bus-token");
+  input.value = "b".repeat(64);
+  harness.document.getElementById("bus-token-save").click();
+  await settle();
+
+  assert.equal(harness.storageData.busToken, token, "storage is unchanged");
+  assert.equal(input.value, token, "the field returns to the stored token");
+  assert.equal(harness.document.getElementById("bus-token").value, token);
+  assert.match(harness.document.querySelector("#toast-host .toast").textContent, /Could not save the pairing token/);
+});
+
+test("a rejected background message reverts the optimistic edit (c629248)", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lensFixture({ groupSelectors: [] })] },
+    groups: [{ id: 1, title: "Deep Work" }],
+  });
+  const { document, browser } = harness;
+  await settle();
+
+  const realSend = browser.runtime.sendMessage;
+  browser.runtime.sendMessage = async (msg) => {
+    // A restarting background rejects rather than answering.
+    if (msg.type === "lens-update") throw new Error("could not establish connection");
+    return realSend(msg);
+  };
+
+  const input = lensCard(document).querySelector(".group-chip-input");
+  input.value = "Deep Work";
+  input.dispatchEvent(new document.defaultView.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await settle();
+
+  const chipLabels = [...lensCard(document).querySelectorAll(".group-chip-label")].map((el) => el.textContent);
+  assert.ok(!chipLabels.includes("Deep Work"), "the optimistic selector is reverted");
+  assert.match(document.getElementById("status").textContent, /failed/i);
+});
+
+test("import normalizes views that reference a missing lens (ed6c7108)", async () => {
+  const harness = createHarness({ storage: { lenses: [] } });
+  await settle();
+
+  const payload = JSON.stringify({
+    lenses: [lensFixture({ id: "lens_a", name: "A" })],
+    activeView: { kind: "lens", lensId: "lens_missing" },
+    automationFallback: { kind: "lens", lensId: "lens_missing" },
+  });
+  await harness.window.importSettingsFile({ async text() { return payload; } });
+  await settle();
+
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+  assert.deepEqual(harness.storageData.automationFallback, { kind: "all" });
+});
+
+test("provider base URLs reject query strings and IPv6 loopback with an actionable error (94e5e2df, 1b6c6bb6)", async () => {
+  const harness = createHarness();
+  await settle();
+
+  const withQuery = harness.window.validateProviderBaseURL("https://api.example/v1?tenant=a");
+  assert.match(withQuery.error, /query string or #fragment/);
+  const withHash = harness.window.validateProviderBaseURL("https://api.example/v1#x");
+  assert.match(withHash.error, /query string or #fragment/);
+  const withCredentials = harness.window.validateProviderBaseURL("https://user:pw@api.example/v1");
+  assert.match(withCredentials.error, /username\/password/);
+
+  const ipv6 = harness.window.validateProviderBaseURL("http://[::1]:11434/v1");
+  assert.match(ipv6.error, /IPv6/);
+  assert.match(ipv6.error, /127\.0\.0\.1/);
+
+  // Loopback http and plain https still validate.
+  assert.ok(harness.window.validateProviderBaseURL("http://127.0.0.1:11434/v1").parsed);
+  assert.ok(harness.window.validateProviderBaseURL("https://api.example/v1").parsed);
+  assert.match(harness.window.validateProviderBaseURL("http://192.0.2.1:11434").error, /https/);
+});
+
+test("a failed Search tabs storage write rolls the command binding back (376b9246)", async () => {
+  const harness = createHarness({ storage: {} });
+  await settle();
+
+  const realSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "tabSearchShortcut")) {
+      throw new Error("storage full");
+    }
+    return realSet(values);
+  };
+
+  await harness.window.applySearchTabsShortcut({ ctrl: true, alt: false, shift: true, meta: false, key: "k" }, "Ctrl+Shift+K");
+  await settle();
+
+  assert.equal(Object.prototype.hasOwnProperty.call(harness.storageData, "tabSearchShortcut"), false);
+  // The command was updated first, so it must be restored to its prior binding.
+  const lastUpdate = harness.commandUpdates[harness.commandUpdates.length - 1] || {};
+  assert.equal(lastUpdate.name, "search-tabs");
+  assert.equal(lastUpdate.shortcut, "Ctrl+S", "the command binding is reverted");
+  assert.match(harness.document.getElementById("shortcut-status").textContent, /Save failed/);
+});
+
+test("a failed commands.reset surfaces the partial clear (eb9668cf)", async () => {
+  const harness = createHarness({ storage: { tabSearchShortcut: { ctrl: true, alt: false, shift: false, meta: false, key: "s" } } });
+  await settle();
+
+  harness.browser.commands.reset = async () => { throw new Error("reset refused"); };
+
+  harness.window.clearShortcutRow("search-tabs");
+  await settle();
+
+  assert.equal(harness.storageData.tabSearchShortcut, null, "the in-page trigger is disabled");
+  assert.match(
+    harness.document.getElementById("shortcut-status").textContent,
+    /browser shortcut could not be reset/,
+  );
 });

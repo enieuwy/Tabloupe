@@ -190,6 +190,7 @@ preflight_checks() {
 # ─── Step 2: Snapshot Firefox session ───────────────────────────────────────────
 
 SNAPSHOT_DIR=""
+SNAPSHOT_TMP_DIR=""
 PRE_WINDOWS=0
 PRE_TABS=0
 
@@ -197,7 +198,14 @@ prune_session_backups() {
   local snapshots=()
   local snapshot
   for snapshot in "$BACKUP_ROOT"/*; do
-    [[ -d "$snapshot" ]] && snapshots+=("$snapshot")
+    [[ -d "$snapshot" ]] || continue
+    case "$(basename "$snapshot")" in
+      # Leftover staging dirs from an interrupted run are never valid snapshots.
+      # A dot-prefixed name would be invisible to this glob, so staging dirs are
+      # named "partial-*" and swept here.
+      partial-*) rm -rf -- "$snapshot" ;;
+      *) snapshots+=("$snapshot") ;;
+    esac
   done
 
   local stale_count=$((${#snapshots[@]} - BACKUP_RETENTION_COUNT))
@@ -212,23 +220,15 @@ prune_session_backups() {
   info "  Pruned $stale_count old session backup(s)"
 }
 
-snapshot_session() {
-  header "Snapshot Firefox session"
-
-  local timestamp
-  timestamp="$(date +%Y%m%d_%H%M%S)"
-  SNAPSHOT_DIR="$BACKUP_ROOT/$timestamp"
-  mkdir -p "$STATE_ROOT"
-  chmod 700 "$STATE_ROOT"
-  mkdir -p "$BACKUP_ROOT"
-  chmod 700 "$BACKUP_ROOT"
-  mkdir -p "$SNAPSHOT_DIR"
-
-  if [[ ! -d "$SESSION_DIR" ]]; then
-    die "Session backup dir not found: $SESSION_DIR"
+cleanup_snapshot_staging() {
+  if [[ -n "$SNAPSHOT_TMP_DIR" && -d "$SNAPSHOT_TMP_DIR" ]]; then
+    rm -rf -- "$SNAPSHOT_TMP_DIR"
   fi
+  SNAPSHOT_TMP_DIR=""
+}
 
-  python3 - "$SESSION_DIR" "$SNAPSHOT_DIR" <<'PY'
+copy_session_files() {
+  python3 - "$SESSION_DIR" "$SNAPSHOT_TMP_DIR" <<'PY'
 import shutil
 import sys
 from pathlib import Path
@@ -243,19 +243,78 @@ for child in source.iterdir():
     else:
         shutil.copy2(child, target)
 PY
+}
+
+abandon_snapshot() {
+  cleanup_snapshot_staging
+  # Retention must run even on a failed attempt, or a persistently failing
+  # snapshot grows the private state directory without bound.
+  prune_session_backups
+  die "$*"
+}
+
+snapshot_session() {
+  header "Snapshot Firefox session"
+
+  local timestamp
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "$STATE_ROOT"
+  chmod 700 "$STATE_ROOT"
+  mkdir -p "$BACKUP_ROOT"
+  chmod 700 "$BACKUP_ROOT"
+
+  if [[ ! -d "$SESSION_DIR" ]]; then
+    die "Session backup dir not found: $SESSION_DIR"
+  fi
+
+  # Stage into a temp dir, validate the recovery payload, then rename into place:
+  # a timestamped snapshot directory therefore only ever exists if it is complete
+  # and its session data actually parsed. Firefox rewrites these files while it
+  # runs, so a torn copy is expected occasionally — retry once before failing.
+  SNAPSHOT_TMP_DIR="$BACKUP_ROOT/partial-$timestamp.$$"
+  rm -rf -- "$SNAPSHOT_TMP_DIR"
+  mkdir -p "$SNAPSHOT_TMP_DIR"
+  chmod 700 "$SNAPSHOT_TMP_DIR"
+  trap cleanup_snapshot_staging EXIT
+
+  if ! copy_session_files; then
+    abandon_snapshot "Could not copy the Firefox session files from $SESSION_DIR"
+  fi
+
+  local recovery_file="$SNAPSHOT_TMP_DIR/recovery.jsonlz4"
+  local counts=""
+  if [[ -f "$recovery_file" ]]; then
+    if ! counts="$(count_session_tabs "$recovery_file" 2>/dev/null)"; then
+      warn "  ⚠ Snapshot session data did not parse (Firefox rewrote it mid-copy) — retrying once…"
+      rm -rf -- "$SNAPSHOT_TMP_DIR"
+      mkdir -p "$SNAPSHOT_TMP_DIR"
+      chmod 700 "$SNAPSHOT_TMP_DIR"
+      if ! copy_session_files; then
+        abandon_snapshot "Could not copy the Firefox session files from $SESSION_DIR"
+      fi
+      if ! counts="$(count_session_tabs "$recovery_file" 2>/dev/null)"; then
+        abandon_snapshot "Firefox session snapshot is unreadable (corrupt recovery.jsonlz4). Quit Firefox and retry."
+      fi
+    fi
+  else
+    warn "  ⚠ recovery.jsonlz4 not found in snapshot — Firefox may not be running"
+  fi
+
+  SNAPSHOT_DIR="$BACKUP_ROOT/$timestamp"
+  rm -rf -- "$SNAPSHOT_DIR"
+  if ! mv "$SNAPSHOT_TMP_DIR" "$SNAPSHOT_DIR"; then
+    abandon_snapshot "Could not finalize the session snapshot at $SNAPSHOT_DIR"
+  fi
+  SNAPSHOT_TMP_DIR=""
+  trap - EXIT
   success "  ✓ Session files copied to $SNAPSHOT_DIR"
   prune_session_backups
 
-  local recovery_file="$SNAPSHOT_DIR/recovery.jsonlz4"
-  if [[ ! -f "$recovery_file" ]]; then
-    warn "  ⚠ recovery.jsonlz4 not found in snapshot — Firefox may not be running"
+  if [[ -z "$counts" ]]; then
     PRE_WINDOWS=0
     PRE_TABS=0
     return
   fi
-
-  local counts
-  counts="$(count_session_tabs "$recovery_file")"
   read -r PRE_WINDOWS PRE_TABS <<< "$counts"
 
   info "  Snapshot: ${PRE_WINDOWS} window(s), ${PRE_TABS} tab(s)"

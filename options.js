@@ -388,6 +388,10 @@ function uniqueSortedTitlesFromValues(titles) {
 }
 
 async function queryFirefoxGroupSnapshot() {
+  if (!browser.tabGroups || typeof browser.tabGroups.query !== "function") {
+    // No tabGroups API at all: genuinely nothing to show, not a read failure.
+    return { ok: true, titles: [], counts: {}, currentGroups: [] };
+  }
   try {
     const groups = await browser.tabGroups.query({});
     const counts = {};
@@ -403,13 +407,16 @@ async function queryFirefoxGroupSnapshot() {
       });
     }
     return {
+      ok: true,
       titles: uniqueSortedTitlesFromValues(Object.keys(counts)),
       counts,
       currentGroups,
     };
   } catch (error) {
     console.error("Firefox tab group query failed:", error);
-    return { titles: [], counts: {}, currentGroups: [] };
+    // Discriminated failure: an empty snapshot here would look like an empty
+    // workspace and invite the user to save an empty lens.
+    return { ok: false, titles: [], counts: {}, currentGroups: [] };
   }
 }
 
@@ -459,6 +466,18 @@ async function requestLensState(windowId) {
   } catch (error) {
     console.error("Lens state request failed:", error);
     return null;
+  }
+}
+
+// A rejected sendMessage (background restarting, port closed) must take the same
+// rollback path as a structured failure. Without this the optimistic UI keeps
+// claiming an edit the background never applied, and the rejection is unhandled.
+async function sendToBackground(message) {
+  try {
+    return await browser.runtime.sendMessage(message);
+  } catch (error) {
+    console.error("Background message failed:", message && message.type, error);
+    return { ok: false, error: "message_failed" };
   }
 }
 
@@ -554,9 +573,14 @@ async function commitLoadedState({ stored, firefoxSnapshot, lensState, container
   applyStored("lastFocusSeen", typeof stored.lastFocusSeen === "string" ? stored.lastFocusSeen : null);
   applyStored("lastAction", typeof stored.lastAction === "string" ? stored.lastAction : null);
   applyStored("groupTitles", normalizeStringArray(stored.groupTitles));
-  state.firefoxGroupTitles = firefoxSnapshot.titles;
-  state.firefoxGroupTitleCounts = firefoxSnapshot.counts;
-  state.currentGroups = firefoxSnapshot.currentGroups;
+  if (firefoxSnapshot.ok === false) {
+    // Keep the last known group snapshot rather than replacing it with "none".
+    setStatus("Could not read your Firefox tab groups. Reload the page to try again.", "error");
+  } else {
+    state.firefoxGroupTitles = firefoxSnapshot.titles;
+    state.firefoxGroupTitleCounts = firefoxSnapshot.counts;
+    state.currentGroups = firefoxSnapshot.currentGroups;
+  }
   state.containers = containers;
   state.containerNames = uniqueSortedTitlesFromValues(containers.map((container) => container.name));
   applyStored("unmappedFocusId", typeof stored.unmappedFocusId === "string" ? stored.unmappedFocusId : null);
@@ -832,7 +856,7 @@ function closeLensImport() {
 async function addLensFromCode() {
   const input = document.getElementById("lens-import-code");
   const code = input ? input.value : "";
-  const result = await browser.runtime.sendMessage({ type: "lens-import", code });
+  const result = await sendToBackground({ type: "lens-import", code });
   if (!result || result.ok !== true) {
     showToast("Not a valid lens code.", "error");
     return;
@@ -911,7 +935,7 @@ async function persistLensPatch(lensId, patch, statusMessage = "Saved") {
     return null;
   }
   render();
-  const result = await browser.runtime.sendMessage({ type: "lens-update", lensId, patch });
+  const result = await sendToBackground({ type: "lens-update", lensId, patch });
   if (!result || result.ok !== true) {
     // The background rejected the edit; revert the optimistic UI to the
     // authoritative stored state instead of falsely reporting success.
@@ -1315,14 +1339,14 @@ async function linkFocusToLens(lensId, focusId) {
   if (lensId) {
     message.lensId = lensId;
   }
-  const linkResult = await browser.runtime.sendMessage(message);
+  const linkResult = await sendToBackground(message);
   if (!linkResult || linkResult.ok !== true) {
     await reloadLensesFromStorage();
     setStatus("Save failed. Please try again.", "error");
     return;
   }
   if (lensId && namePatch.name) {
-    const nameResult = await browser.runtime.sendMessage({ type: "lens-update", lensId, patch: namePatch });
+    const nameResult = await sendToBackground({ type: "lens-update", lensId, patch: namePatch });
     if (!nameResult || nameResult.ok !== true) {
       await reloadLensesFromStorage();
       setStatus("Save failed. Please try again.", "error");
@@ -1474,21 +1498,31 @@ async function saveBusToken() {
     showToast("Pairing token must be 64 lowercase hex characters.", "error");
     return;
   }
+  const previous = state.busToken;
+  // Persist first: committing the field and in-memory state before the write
+  // would show a token the background never received.
+  try {
+    if (token) {
+      await browser.storage.local.set({ busToken: token });
+    } else if (browser.storage.local.remove) {
+      await browser.storage.local.remove("busToken");
+    } else {
+      await browser.storage.local.set({ busToken: null });
+    }
+  } catch (error) {
+    console.error("Pairing token save failed:", error);
+    state.busToken = previous;
+    if (input) {
+      input.value = previous || "";
+    }
+    showToast("Could not save the pairing token. Nothing changed.", "error");
+    return;
+  }
   state.busToken = token;
   if (input) {
     input.value = token;
   }
-  if (token) {
-    await browser.storage.local.set({ busToken: token });
-    showToast("Pairing token saved.", "ok");
-    return;
-  }
-  if (browser.storage.local.remove) {
-    await browser.storage.local.remove("busToken");
-  } else {
-    await browser.storage.local.set({ busToken: null });
-  }
-  showToast("Pairing token cleared.", "ok");
+  showToast(token ? "Pairing token saved." : "Pairing token cleared.", "ok");
 }
 
 function commitLensName(lens, input) {
@@ -1601,8 +1635,10 @@ function persistLensSchedule(lensId, patch) {
       schedules[index] = next;
     }
     const normalized = normalizeLensSchedules(schedules);
-    state.lensSchedules = normalized;
+    // Persist before committing to state: a rejected write must leave the page
+    // showing the schedule automation still uses.
     await browser.storage.local.set({ lensSchedules: normalized });
+    state.lensSchedules = normalized;
     render();
   });
   return scheduleWriteQueue;
@@ -2089,7 +2125,7 @@ async function activateLensView(view) {
   state.windowId = windowId;
   state.activeView = view;
   render();
-  const result = await browser.runtime.sendMessage({ type: "lens-activate", windowId, view });
+  const result = await sendToBackground({ type: "lens-activate", windowId, view });
   if (!result || result.ok !== true) {
     await refreshLensState(windowId);
     throw new Error("Lens activation was not applied.");
@@ -2335,9 +2371,26 @@ async function importSettingsFile(file) {
   const parsed = JSON.parse(text);
   if (!isRecord(parsed)) throw new Error("Invalid settings file");
   const values = {};
-  if (hasOwn(parsed, "lenses")) values.lenses = normalizeLenses(parsed.lenses);
-  if (hasOwn(parsed, "activeView") && isRecord(parsed.activeView)) values.activeView = parsed.activeView;
-  if (hasOwn(parsed, "automationFallback") && isRecord(parsed.automationFallback)) values.automationFallback = parsed.automationFallback;
+  const importedLenses = hasOwn(parsed, "lenses") ? normalizeLenses(parsed.lenses) : null;
+  if (importedLenses) values.lenses = importedLenses;
+  // A view referencing a lens the backup does not contain would leave Tabloupe
+  // stuck on a phantom lens whose activation always fails.
+  const lensIds = new Set((importedLenses || state.lenses).map((lens) => lens.id));
+  const importedView = (view) => {
+    if (!isRecord(view)) return null;
+    if (view.kind === "lens" && typeof view.lensId === "string" && lensIds.has(view.lensId)) {
+      return { kind: "lens", lensId: view.lensId };
+    }
+    return { kind: "all" };
+  };
+  if (hasOwn(parsed, "activeView")) {
+    const view = importedView(parsed.activeView);
+    if (view) values.activeView = view;
+  }
+  if (hasOwn(parsed, "automationFallback")) {
+    const view = importedView(parsed.automationFallback);
+    if (view) values.automationFallback = view;
+  }
   if (hasOwn(parsed, "lensSchedules")) values.lensSchedules = normalizeLensSchedules(parsed.lensSchedules);
   if (hasOwn(parsed, "tabSearchShortcut")) values.tabSearchShortcut = normalizeShortcut(parsed.tabSearchShortcut);
   if (hasOwn(parsed, "aiGroupingPrompt")) values.aiGroupingPrompt = normalizeGroupingPrompt(parsed.aiGroupingPrompt);
@@ -2690,16 +2743,37 @@ function handleRecorderKeydown(event, commandName) {
   }
 }
 
-function applySearchTabsShortcut(combo, commandShortcut) {
-  persistShortcut(combo).catch((error) => {
-    console.error("Tab search shortcut save failed:", error);
-    setShortcutStatus("Save failed. See extension console.", "error");
-  });
+async function applySearchTabsShortcut(combo, commandShortcut) {
+  // One logical preference lives in two stores (storage.local for the in-page
+  // trigger, browser.commands for chrome/new-tab pages). Sequence them and undo
+  // the committed side on failure so they can never disagree.
+  const previousCommand = state.commandShortcuts ? state.commandShortcuts["search-tabs"] : "";
   if (hasCommandsApi()) {
-    updateCommandShortcut("search-tabs", commandShortcut).catch((error) => {
+    try {
+      await updateCommandShortcut("search-tabs", commandShortcut);
+    } catch (error) {
       console.error("search-tabs command update failed:", error);
       showRowError("search-tabs", commandUpdateErrorText(error));
-    });
+      return;
+    }
+  }
+  try {
+    await persistShortcut(combo);
+  } catch (error) {
+    console.error("Tab search shortcut save failed:", error);
+    if (hasCommandsApi()) {
+      try {
+        if (previousCommand) {
+          await browser.commands.update({ name: "search-tabs", shortcut: previousCommand });
+        } else {
+          await browser.commands.reset("search-tabs");
+        }
+        await refreshCommandShortcuts();
+      } catch (rollbackError) {
+        console.error("search-tabs command rollback failed:", rollbackError);
+      }
+    }
+    setShortcutStatus("Save failed. See extension console.", "error");
   }
 }
 
@@ -2725,15 +2799,30 @@ function clearShortcutRow(commandName) {
   if (recordingCommand === commandName) stopRecording();
   clearRowError(commandName);
   if (commandName === "search-tabs") {
-    persistShortcut(null).catch((error) => {
-      console.error("Tab search shortcut disable failed:", error);
-      setShortcutStatus("Save failed. See extension console.", "error");
-    });
-    if (hasCommandsApi()) {
-      browser.commands.reset("search-tabs")
-        .then(() => refreshCommandShortcuts())
-        .catch((error) => console.error("search-tabs command reset failed:", error));
-    }
+    (async () => {
+      let commandCleared = true;
+      if (hasCommandsApi()) {
+        try {
+          await browser.commands.reset("search-tabs");
+          await refreshCommandShortcuts();
+        } catch (error) {
+          commandCleared = false;
+          console.error("search-tabs command reset failed:", error);
+        }
+      }
+      try {
+        await persistShortcut(null);
+      } catch (error) {
+        console.error("Tab search shortcut disable failed:", error);
+        setShortcutStatus("Save failed. See extension console.", "error");
+        return;
+      }
+      if (!commandCleared) {
+        // Storage is clear but Firefox still holds the old command binding: say so
+        // instead of rendering a clean "disabled" state that is only half true.
+        setShortcutStatus("In-page shortcut disabled, but the browser shortcut could not be reset — clear it in about:addons.", "error");
+      }
+    })();
     return;
   }
   if (hasCommandsApi()) {
@@ -2973,12 +3062,30 @@ function normalizeProviderCheck(value) {
   return null;
 }
 
+// Firefox host match patterns have no syntax for IPv6 literal hosts, so an
+// extension can never be granted access to http://[::1]:port — accepting it here
+// would only produce fetches that fail later. Reject it with the workaround
+// instead of the misleading "use https" error.
+const IPV6_LOOPBACK_HOSTS = ["::1", "[::1]"];
+
 function validateProviderBaseURL(baseURL) {
   let parsed;
   try {
     parsed = new URL(baseURL);
   } catch (error) {
     return { error: "That base URL is not valid." };
+  }
+  if (parsed.username || parsed.password) {
+    return { error: "Remove the username/password from the base URL." };
+  }
+  // /models and /chat/completions are appended to this URL, so a query string or
+  // fragment would silently move the suffix out of the path and every request
+  // would hit the wrong endpoint.
+  if (parsed.search || parsed.hash) {
+    return { error: "Remove the query string or #fragment from the base URL." };
+  }
+  if (IPV6_LOOPBACK_HOSTS.includes(parsed.hostname)) {
+    return { error: "Firefox extensions cannot be granted IPv6 hosts. Use http://127.0.0.1:port or http://localhost:port." };
   }
   const loopbackHosts = ["localhost", "127.0.0.1"];
   if (parsed.protocol !== "https:" && !loopbackHosts.includes(parsed.hostname)) {

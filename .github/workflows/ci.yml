@@ -4,6 +4,10 @@ on:
   push:
     branches: [ "main" ]
   pull_request:
+  # Dependency advisories land without any commit to this repo, so the audit has
+  # to re-run on a clock, not only when something is pushed.
+  schedule:
+    - cron: "23 6 * * 1"
 
 permissions:
   contents: read
@@ -38,3 +42,18 @@ jobs:
           echo "${BL_SHA256}  $TMP/bl.tar.gz" | sha256sum -c -
           tar -xzf "$TMP/bl.tar.gz" -C "$TMP" betterleaks
           "$TMP/betterleaks" git . --no-banner --redact
+
+  audit:
+    # Weekly drift check only: the push/PR `verify` job already audits on change.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install deps
+        run: npm ci --ignore-scripts
+      - name: npm audit
+        run: npm run audit

@@ -808,7 +808,9 @@ function makeSectionHeader(label) {
 function readableUrlLabel(rawUrl) {
   try {
     const url = new URL(rawUrl);
-    const host = url.hostname.replace(/^www\./, "");
+    // url.host keeps a non-default port: "localhost:3000/app" and "localhost/app"
+    // are different destinations and must not render identically.
+    const host = url.host.replace(/^www\./, "");
     const path = url.pathname.replace(/\/+$/, "");
     return `${host}${path}`;
   } catch (error) {
@@ -846,11 +848,18 @@ function parseQueryAsUrl(query) {
   const hostPart = q.split(/[/?#]/)[0];
   const isLocalhost = /^localhost(:\d+)?$/i.test(hostPart);
   const isIpv4 = /^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(hostPart);
+  // A single-label host with an explicit port is unambiguous (devbox:3000), but
+  // an all-numeric label would swallow ordinary queries like "12:30".
+  const hostPort = /^([a-z0-9](?:[a-z0-9-]*[a-z0-9])?):(\d{1,5})$/i.exec(hostPart);
+  const isHostPort = Boolean(hostPort) &&
+    !/^\d+$/.test(hostPort[1]) &&
+    Number(hostPort[2]) >= 1 &&
+    Number(hostPort[2]) <= 65535;
   const hostNoPort = hostPart.replace(/:\d+$/, "");
   const labels = hostNoPort.split(".");
   const tld = labels.length >= 2 ? labels[labels.length - 1].toLowerCase() : "";
   const looksDomain = labels.length >= 2 && labels.every((l) => /^[a-z0-9-]+$/i.test(l) && l.length > 0) && KNOWN_TLDS.has(tld);
-  if (isLocalhost || isIpv4 || looksDomain) {
+  if (isLocalhost || isIpv4 || isHostPort || looksDomain) {
     try {
       return new URL(`https://${q}`).href;
     } catch (error) {
@@ -926,6 +935,22 @@ function hideDropIndicator() {
 function dropAtPosition(tabIds, index, placeAfter) {
   const anchor = filtered[index];
   if (!anchor) return;
+  // Tab groups are window-scoped and a marked selection may span windows.
+  // Dragging only reorders within the anchor's window, so drop the outsiders
+  // instead of relocating them across windows behind the user's back.
+  const byId = new Map(allTabs.map((tab) => [tab.id, tab]));
+  const sameWindowIds = tabIds.filter((id) => {
+    const tab = byId.get(id);
+    return tab && tab.windowId === anchor.windowId;
+  });
+  if (sameWindowIds.length === 0) {
+    actionMessage = "Drag only works within one window.";
+    if (isOpen()) render(inputEl.value);
+    return;
+  }
+  if (sameWindowIds.length !== tabIds.length) {
+    actionMessage = "Only tabs in that window were moved.";
+  }
   const prev = placeAfter ? anchor : filtered[index - 1];
   const next = placeAfter ? filtered[index + 1] : anchor;
   const inWindow = (tab) => tab && tab.windowId === anchor.windowId;
@@ -935,14 +960,16 @@ function dropAtPosition(tabIds, index, placeAfter) {
   if (inWindow(prev) && inWindow(next) && prev.grouped && next.grouped && prev.groupId === next.groupId) {
     groupId = prev.groupId;
   }
-  moveOntoPosition(tabIds, anchor.windowId, anchor.id, placeAfter, groupId);
+  moveOntoPosition(sameWindowIds, anchor.windowId, anchor.id, placeAfter, groupId);
 }
 
 function applyListActionResult(result, fallbackMessage) {
   const list = Array.isArray(result) ? result : result && Array.isArray(result.list) ? result.list : null;
+  const failed = !Array.isArray(result) && result && typeof result === "object" && result.ok === false;
   if (list) {
     allTabs = prepareTabsForSearch(list);
-    clearMarks();
+    // Keep the selection when the action failed so the user can retry it.
+    if (!failed) clearMarks();
     pruneMarked();
   }
   if (!Array.isArray(result) && result && typeof result === "object") {
@@ -1576,10 +1603,12 @@ function closeTab(tab) {
     () => browser.runtime.sendMessage({ type: "tabsearch-close", tabId: tab.id }),
     {
       onResult(refreshed) {
-        if (Array.isArray(refreshed)) allTabs = prepareTabsForSearch(refreshed);
+        applyListActionResult(refreshed, "Could not close that tab.");
       },
       onError() {
-        allTabs = allTabs.filter((candidate) => candidate.id !== tab.id);
+        // The request itself failed, so the tab is almost certainly still open:
+        // never fake the removal locally — surface the failure and keep the row.
+        actionMessage = "Could not close that tab.";
       },
     },
   );

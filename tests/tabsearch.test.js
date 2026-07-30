@@ -1638,3 +1638,47 @@ test("a resolved ok:false action keeps the overlay open and surfaces the failure
   assert.ok(message, "a failure message is rendered rather than closing as success");
   assert.equal(message.textContent, "Action failed.");
 });
+
+test("a failed close keeps the row and surfaces the failure (a48fdc5f)", async () => {
+  const respond = (message) => {
+    if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+    if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+    if (message.type === "tabsearch-close") return Promise.reject(new Error("boom"));
+    return undefined;
+  };
+  const harness = createHarness({ respond });
+  pressCtrlS(harness);
+  await settle();
+
+  const closeButton = overlayRoot(harness).querySelector(".row .close");
+  assert.ok(closeButton, "a close button is rendered");
+  closeButton.dispatchEvent(new harness.window.MouseEvent("click", { bubbles: true }));
+  await settle();
+
+  const rows = [...overlayRoot(harness).querySelectorAll(".row")];
+  assert.equal(rows.length, SAMPLE_TABS.length, "the tab that failed to close stays listed");
+  const message = overlayRoot(harness).querySelector(".message");
+  assert.ok(message, "the failure is visible");
+  assert.equal(message.textContent, "Could not close that tab.");
+});
+
+test("titleless history labels keep a non-default port (f67545b7)", () => {
+  const { window } = createHarness();
+
+  assert.equal(window.readableUrlLabel("http://localhost:3000/app"), "localhost:3000/app");
+  assert.equal(window.readableUrlLabel("https://youtube.com/"), "youtube.com");
+  assert.equal(window.readableUrlLabel("https://www.example.com/docs/"), "example.com/docs");
+});
+
+test("a bare host:port query is a direct URL, ordinary colon queries are not (23896378)", () => {
+  const { window } = createHarness();
+
+  assert.equal(window.parseQueryAsUrl("devbox:3000"), "https://devbox:3000/");
+  assert.equal(window.parseQueryAsUrl("localhost:8080"), "https://localhost:8080/");
+  // A time, an all-numeric label, an out-of-range port, and a non-numeric
+  // "port" all stay web searches.
+  assert.equal(window.parseQueryAsUrl("12:30"), null);
+  assert.equal(window.parseQueryAsUrl("devbox:99999"), null);
+  assert.equal(window.parseQueryAsUrl("note:todo"), null);
+  assert.equal(window.parseQueryAsUrl("test.foo"), null);
+});

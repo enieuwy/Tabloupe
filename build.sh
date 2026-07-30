@@ -80,11 +80,19 @@ SIGN_SUCCEEDED=true
 
 # Keep only the newest signed artifacts; old XPIs accumulate a full copy of
 # the extension per build and deploy only ever needs the latest one.
+# Retention is optional cleanup, so it must never fail the run: a listed
+# submission can return no .xpi at all, and under `set -euo pipefail` a globbing
+# `ls` with no matches would abort the script *after* signing succeeded.
 KEEP_ARTIFACTS=5
 if [[ -d web-ext-artifacts ]]; then
-  ls -t web-ext-artifacts/*.xpi 2>/dev/null | tail -n +$((KEEP_ARTIFACTS + 1)) | while IFS= read -r old_xpi; do
-    rm -f "$old_xpi"
-  done
+  shopt -s nullglob
+  artifacts=(web-ext-artifacts/*.xpi)
+  shopt -u nullglob
+  if ((${#artifacts[@]} > KEEP_ARTIFACTS)); then
+    while IFS= read -r old_xpi; do
+      rm -f "$old_xpi"
+    done < <(ls -t "${artifacts[@]}" | tail -n +$((KEEP_ARTIFACTS + 1)))
+  fi
 fi
 
 echo "Done! You can install the new .xpi from ./web-ext-artifacts/ via about:addons"

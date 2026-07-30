@@ -89,7 +89,7 @@ Request:
 {"type":"createTabGroup","schemaVersion":1,"payload":{"requestId":"0123456789abcdef0123456789abcdef","title":"zotio staging","color":"blue","match":{"urls":["https://example.com/a","https://example.com/b#notes"]},"windowId":null}}
 ```
 
-`payload.requestId` is a 32-character lowercase hex string echoed in the result. `title` is required, trimmed, and capped at 128 characters. `color` is optional; when present it must be one of Firefox's tab-group color names (`blue`, `cyan`, `green`, `orange`, `pink`, `purple`, `red`, `yellow`). Invalid or absent colors are omitted from the tab-group update. `match.urls` is required and must contain 1 to 64 URL strings. `windowId` is optional; `null` or absence means Tabloupe uses the window of the first matched tab.
+`payload.requestId` is an opaque non-empty string of up to 128 characters (no control characters), echoed verbatim in the result; the daemon uses a 32-character lowercase hex id. `title` is required, trimmed, and capped at 128 characters. `color` is optional; when present it must be one of Firefox's tab-group color names (`blue`, `cyan`, `green`, `orange`, `pink`, `purple`, `red`, `yellow`). Invalid or absent colors are omitted from the tab-group update. `match.urls` is required and must contain 1 to 64 URL strings. `windowId` is optional; `null` or absence means Tabloupe uses the window of the first matched tab.
 
 Matching is against normal browser windows only. Tabloupe first matches tabs by exact `tab.url` string. For request URLs with no exact match, it retries with URL fragments stripped from both the requested URL and open tab URLs. If several tabs match one requested URL, all matching tabs are considered. The target window is the supplied `windowId`, or otherwise the window of the first matched tab. Matched tabs in other windows are skipped with `cross_window`; v1 never moves tabs across windows. Pinned tabs are skipped with `pinned`. Tabs already in a different group in the target window are skipped with `already_grouped_elsewhere`.
 
@@ -107,17 +107,24 @@ Stable `error` codes:
 
 - `invalid_payload`: the frame had a usable `requestId` but failed validation.
 - `no_tabs_matched`: no requested tab could be placed in the target group.
-- `group_failed`: Firefox rejected the tab-group operation.
+- `group_failed`: Firefox rejected the tab-group operation (including a failure to enumerate normal windows or existing groups — Tabloupe fails closed rather than widening the search).
+- `busy`: Tabloupe's inbound bus queue was saturated and the request was not run. Safe to retry.
 
 ## `calendarEvents`
 
-Phase 4 consumers use daemon-published active calendar events. Tabloupe ignores this frame in the current phase.
+Tabloupe consumes this frame: an active event whose title matches a lens's **Calendar events** pattern activates that lens.
 
 ```json
 {"type":"calendarEvents","schemaVersion":1,"payload":{"events":[{"id":"event-123","title":"Planning","calendar":"Work","start":"2026-07-07T09:00:00Z","end":"2026-07-07T09:30:00Z"}]}}
 ```
 
 `events` is the set of currently active events (`start <= now < end`) and is pushed after auth/connect and whenever the set changes.
+
+Matching semantics: patterns are compared against the full event title, case-insensitively, with the same glob rules as lens `glob` group selectors (`*` = any run of characters, `?` = exactly one; a pattern without a wildcard is an exact full-title match, never a substring). When several active events match, the earliest `start` wins; ties are broken by the stored lens order.
+
+Ownership: activation uses `trigger:"calendar"` and `triggerId:"<event id>|<start>"`, and Tabloupe persists that trigger id. A repeated frame carrying the same owning event is a no-op, and a manual switch after activation wins — Tabloupe never overrides it. When nothing matches any more (the owning event ended, or its title was edited out of the pattern) Tabloupe applies the configured automation fallback, but only while that trigger id still owns the current view, and then clears the ownership marker.
+
+A frame whose `payload.events` is missing or not an array is ignored entirely: only an explicit empty array means "no events are active" and can trigger the fallback.
 
 ## Legacy behavior
 

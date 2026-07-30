@@ -31,7 +31,7 @@ function defaultLensState(overrides = {}) {
   };
 }
 
-function createHarness({ windowId = 7, respond = () => ({}), storage = {}, storageGet, storageSet } = {}) {
+function createHarness({ windowId = 7, respond = () => ({}), storage = {}, storageGet, storageSet, failWindowLookup = false } = {}) {
   const sent = [];
   const storageData = { ...storage };
   const optionsOpened = [];
@@ -41,6 +41,9 @@ function createHarness({ windowId = 7, respond = () => ({}), storage = {}, stora
   const browser = {
     windows: {
       async getCurrent() {
+        if (failWindowLookup) {
+          throw new Error("no current window");
+        }
         return { id: windowId };
       },
     },
@@ -778,4 +781,86 @@ test("popup still labels an Apple Focus activation as Apple Focus", async () => 
   const trigger = harness.document.getElementById("lens-trigger");
   assert.equal(trigger.hidden, false);
   assert.equal(trigger.textContent, "Switched by Apple Focus");
+});
+
+test("a failed window lookup disables window-scoped actions (f11b0c3c)", async () => {
+  const harness = createHarness({
+    failWindowLookup: true,
+    respond: (message) => (message.type === "lens-state" ? defaultLensState({ hasGroups: true }) : {}),
+  });
+  await settle();
+
+  for (const id of ["lens-save-window", "window-profile", "open-ai"]) {
+    assert.equal(harness.document.getElementById(id).disabled, true, `${id} is disabled`);
+  }
+  const status = harness.document.getElementById("lens-status");
+  assert.match(status.textContent, /Could not identify this window/);
+
+  // Even if a window-scoped message is attempted, it must not reach the
+  // background without a window id.
+  harness.document.getElementById("lens-save-window").click();
+  await settle();
+  assert.equal(harness.sent.some((message) => message.type === "lens-save"), false);
+});
+
+test("a failed AI initialization shows a retryable error, not a blank pane (f4b0b2f3)", async () => {
+  const harness = createHarness({
+    respond: (message) => (message.type === "lens-state" ? defaultLensState() : {}),
+    storageGet: async (keys) => {
+      if (Array.isArray(keys) && keys.includes("connectionState")) {
+        throw new Error("storage unavailable");
+      }
+      return undefined;
+    },
+  });
+  await settle();
+
+  await openAi(harness);
+
+  assert.equal(harness.document.getElementById("ai-view").hidden, false);
+  const status = harness.document.getElementById("ai-status");
+  assert.match(status.textContent, /Could not load AI grouping/);
+});
+
+test("a failed window-profile save rolls the selector back (9e829756)", async () => {
+  const harness = createHarness({
+    respond: (message) => {
+      if (message.type === "lens-state") {
+        return defaultLensState({
+          windowProfile: { kind: "default" },
+          lenses: [{ id: "lens_work", name: "Work", icon: "briefcase", color: null, active: false }],
+        });
+      }
+      if (message.type === "window-profile-set") {
+        return { ok: false, error: "storage_failed" };
+      }
+      return {};
+    },
+  });
+  await settle();
+
+  const select = harness.document.getElementById("window-profile");
+  select.value = "none";
+  select.dispatchEvent(new harness.window.Event("change"));
+  await settle();
+
+  assert.equal(select.value, "default", "the control returns to the stored profile");
+  assert.match(harness.document.getElementById("lens-status").textContent, /Could not save this window's automation setting/);
+});
+
+test("a failed tab-search open keeps the popup open with an error (4e115a7f)", async () => {
+  const harness = createHarness({
+    respond: (message) => {
+      if (message.type === "lens-state") return defaultLensState({ hasGroups: true });
+      if (message.type === "open-tab-search") return { ok: false, error: "unsupported_page" };
+      return {};
+    },
+  });
+  await settle();
+
+  harness.document.getElementById("open-search").click();
+  await settle();
+
+  assert.equal(harness.closed, 0, "the popup stays open when the overlay could not open");
+  assert.match(harness.document.getElementById("lens-status").textContent, /Tab search can't open on this page/);
 });

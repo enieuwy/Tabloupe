@@ -189,7 +189,30 @@ function renderAuto(state, checked) {
   box.checked = checked === true;
 }
 
+// Actions that only make sense for one concrete window. If the popup could not
+// resolve its own window, they must fail closed: passing a missing windowId
+// makes the background operate across every window (e.g. saving a lens from
+// unrelated groups) with no warning.
+const WINDOW_SCOPED_MESSAGES = new Set([
+  "lens-save",
+  "window-profile-set",
+  "ai-group-state",
+  "ai-group-preview",
+  "ai-group-apply",
+  "ai-group-clear",
+]);
+
+function isWindowScoped(message) {
+  if (WINDOW_SCOPED_MESSAGES.has(message.type)) {
+    return true;
+  }
+  return message.type === "lens-activate" && message.view && message.view.kind === "transient";
+}
+
 async function send(message) {
+  if (typeof windowId !== "number" && isWindowScoped(message)) {
+    return { ok: false, error: "no_window" };
+  }
   return browser.runtime.sendMessage({ ...message, windowId });
 }
 
@@ -349,7 +372,12 @@ function renderWindowProfile(state) {
     node.textContent = option.label;
     select.appendChild(node);
   }
-  select.value = profile.kind === "lens" ? `lens:${profile.lensId}` : profile.kind;
+  select.value = windowProfileSelectValue(profile);
+}
+
+function windowProfileSelectValue(profile) {
+  const value = profile || { kind: "default" };
+  return value.kind === "lens" ? `lens:${value.lensId}` : value.kind;
 }
 
 async function setWindowProfile(value) {
@@ -575,12 +603,35 @@ async function refreshAi({ autoPreview = false } = {}) {
 async function openAiSubview() {
   el("lens-view").hidden = true;
   el("ai-view").hidden = false;
-  await ensureAiInitialized();
-  await refreshAi({ autoPreview: false });
+  try {
+    await ensureAiInitialized();
+    await refreshAi({ autoPreview: false });
+  } catch (error) {
+    console.error("AI view init failed:", error);
+    // Allow a retry: the listeners bound before the failure are idempotent.
+    aiInitialized = false;
+    setStatus("Could not load AI grouping. Try again.", "error");
+  }
 }
 
-function openTabSearch() {
-  browser.runtime.sendMessage({ type: "open-tab-search" }).finally(() => window.close());
+async function openTabSearch() {
+  try {
+    const result = await browser.runtime.sendMessage({ type: "open-tab-search" });
+    if (result && result.ok === false) {
+      setLensStatus(
+        result.error === "unsupported_page"
+          ? "Tab search can't open on this page. Switch to a normal web page."
+          : "Could not open tab search.",
+        "error",
+      );
+      return;
+    }
+  } catch (error) {
+    console.error("Open tab search failed:", error);
+    setLensStatus("Could not open tab search.", "error");
+    return;
+  }
+  window.close();
 }
 
 async function closeAiSubview() {
@@ -647,8 +698,12 @@ async function init() {
   el("lens-show-all").addEventListener("click", () => activateView({ kind: "all" }));
   el("lens-save-window").addEventListener("click", saveWindowAsLens);
   el("window-profile").addEventListener("change", (event) => {
-    setWindowProfile(event.target.value).catch((error) => {
+    const select = event.target;
+    const previous = windowProfileSelectValue(lensState && lensState.windowProfile);
+    setWindowProfile(select.value).catch((error) => {
       console.error("Window profile save failed:", error);
+      // The stored profile never changed, so the control must not keep claiming it did.
+      select.value = previous;
       setLensStatus("Could not save this window's automation setting.", "error");
     });
   });
@@ -662,6 +717,17 @@ async function init() {
   });
 
   await refreshLensState();
+
+  if (typeof windowId !== "number") {
+    // Window-scoped actions would silently span every window; disable them and
+    // say so instead of producing a lens from unrelated groups. Runs after the
+    // first render, which clears the status line.
+    for (const id of ["lens-save-window", "window-profile", "open-ai", "empty-organize"]) {
+      const node = el(id);
+      if (node) node.disabled = true;
+    }
+    setLensStatus("Could not identify this window. Reopen the popup to save or organize groups.", "error");
+  }
 }
 
 document.addEventListener("DOMContentLoaded", init);
