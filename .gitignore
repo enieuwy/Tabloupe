@@ -2,6 +2,7 @@
 web-ext-artifacts/
 .build.lock/
 node_modules/
+.web-ext-profile/
 
 .DS_Store
 .agents/

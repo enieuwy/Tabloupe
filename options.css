@@ -414,6 +414,12 @@ label span {
   color: var(--danger);
 }
 
+.shortcut-reserved-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--warn-text);
+}
+
 .lens-shortcut-list {
   display: grid;
 }

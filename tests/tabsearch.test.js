@@ -324,6 +324,54 @@ test("close button removes a tab and keeps the overlay open", async () => {
   assert.ok(overlayRoot(harness), "overlay stays open after closing a tab");
 });
 
+test("recently closed sessions render in browse mode and restore by session id", async () => {
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+      if (message.type === "tabsearch-recently-closed") {
+        return {
+          ok: true,
+          sessions: [{ kind: "closed-tab", sessionId: "closed-1", title: "Closed docs", url: "https://closed.example", favIconUrl: "", tabCount: 0, closedAt: 1 }],
+        };
+      }
+      if (message.type === "tabsearch-restore-session") return { ok: true, list: SAMPLE_TABS.slice() };
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  assert.ok(Array.from(overlayRoot(harness).querySelectorAll(".divider")).some((node) => node.textContent === "Recently closed"));
+  Array.from(overlayRoot(harness).querySelectorAll(".action-row")).find((node) => node.textContent.includes("Closed docs")).click();
+  await settle();
+
+  assert.ok(harness.sent.some((message) => message.type === "tabsearch-restore-session" && message.sessionId === "closed-1"));
+});
+
+test("recently closed access is requested only from its footer action", async () => {
+  const harness = createHarness({
+    respond(message) {
+      if (message.type === "tabsearch-list") return SAMPLE_TABS.slice();
+      if (message.type === "tabsearch-containers") return { ok: false, containers: [] };
+      if (message.type === "tabsearch-recently-closed") return { ok: false, error: "sessions_unavailable", sessions: [] };
+      if (message.type === "tabsearch-enable-recently-closed") return { ok: true, sessions: [] };
+      return undefined;
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+
+  const enable = Array.from(overlayRoot(harness).querySelectorAll("button"))
+    .find((button) => button.textContent === "Show recently closed");
+  assert.ok(enable);
+  enable.click();
+  await settle();
+
+  assert.ok(harness.sent.some((message) => message.type === "tabsearch-enable-recently-closed"));
+  assert.ok(Array.from(overlayRoot(harness).querySelectorAll(".divider")).some((node) => node.textContent === "Recently closed"));
+});
+
 test("Ctrl+S toggles the overlay closed when already open", async () => {
   const harness = createHarness();
   pressCtrlS(harness);

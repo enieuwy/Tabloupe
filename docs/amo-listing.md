@@ -56,6 +56,7 @@ The optional macOS helper uses a local WebSocket connection at ws://127.0.0.1:87
 | `alarms` | Required permission | Runs opt-in lens schedules and backs off reconnect attempts to the optional local helper without keeping the event page awake continuously. |
 | `history` | Required permission | Adds optional history suggestions to the Tab Search overlay when the user types a query, after open-tab matches. |
 | `search` | Required permission | Lets the Tab Search overlay run a normal web search for the current query when the user chooses the search action row. |
+| `sessions` | Optional API permission | Requested only when the user selects “Show recently closed” in Tab Search. Lists and restores Firefox’s native, current-session closed-tab/window entries; no session data leaves Firefox. |
 | `contextualIdentities` | Required permission | Reads container names/colors to badge tabs and scope lenses; moves tabs between containers only when the user requests it. |
 | `cookies` | Required permission | Enables Firefox cookieStoreId container semantics so Tabloupe can badge tabs by container and move tabs into the selected container on request. |
 | `ws://127.0.0.1/*` | Required host permission | Connects only to the optional local macOS helper on loopback, primarily at `ws://127.0.0.1:8767`, for Focus automation and on-device AI grouping. Manual use does not require a helper to be running. |

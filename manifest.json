@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Tabloupe",
-  "version": "1.2.5",
+  "version": "1.2.7",
   "description": "Save and switch views of your Firefox tab groups. Collapse the groups you don't need; tabs stay open. Optional macOS Focus automation.",
   "browser_specific_settings": {
     "gecko": {
@@ -27,6 +27,7 @@
     "ws://127.0.0.1/*"
   ],
   "optional_permissions": [
+    "sessions",
     "https://*/*",
     "http://localhost/*",
     "http://127.0.0.1/*"

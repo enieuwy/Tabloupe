@@ -2791,6 +2791,15 @@ browser.runtime.onMessage.addListener((message) => {
   if (message && message.type === "tabsearch-close-many") {
     return closeManyTabsFromSearch(message.tabIds);
   }
+  if (message && message.type === "tabsearch-recently-closed") {
+    return recentlyClosedFromSearch();
+  }
+  if (message && message.type === "tabsearch-enable-recently-closed") {
+    return enableRecentlyClosedFromSearch();
+  }
+  if (message && message.type === "tabsearch-restore-session") {
+    return restoreSessionFromSearch(message.sessionId);
+  }
   if (message && message.type === "tabsearch-group") {
     return groupTabsFromSearch(message.tabIds, message.title, message.windowId, message.groupId);
   }
@@ -4617,6 +4626,74 @@ async function closeTabFromSearch(tabId) {
   return listTabsForSearch();
 }
 
+function sessionSummary(session) {
+  if (!isRecord(session)) {
+    return null;
+  }
+  const item = isRecord(session.tab) ? session.tab : isRecord(session.window) ? session.window : null;
+  const sessionId = item && typeof item.sessionId === "string" ? item.sessionId : "";
+  if (!item || !sessionId) {
+    return null;
+  }
+  const isWindow = isRecord(session.window);
+  const title = typeof item.title === "string" ? item.title : "";
+  const url = typeof item.url === "string" ? item.url : "";
+  const favIconUrl = typeof item.favIconUrl === "string" ? item.favIconUrl : "";
+  const tabCount = isWindow && Array.isArray(item.tabs) ? item.tabs.length : 0;
+  return {
+    sessionId,
+    kind: isWindow ? "closed-window" : "closed-tab",
+    title,
+    url,
+    favIconUrl,
+    tabCount,
+    closedAt: typeof session.lastModified === "number" ? session.lastModified : 0,
+  };
+}
+
+async function recentlyClosedFromSearch() {
+  if (!browser.sessions || typeof browser.sessions.getRecentlyClosed !== "function") {
+    return { ok: false, error: "sessions_unavailable", sessions: [] };
+  }
+  try {
+    const sessions = await browser.sessions.getRecentlyClosed({ maxResults: 10 });
+    return {
+      ok: true,
+      sessions: (Array.isArray(sessions) ? sessions : []).map(sessionSummary).filter(Boolean),
+    };
+  } catch (error) {
+    return { ok: false, error: "recently_closed_failed", sessions: [] };
+  }
+}
+
+async function enableRecentlyClosedFromSearch() {
+  if (!browser.permissions || typeof browser.permissions.request !== "function") {
+    return { ok: false, error: "sessions_unavailable", sessions: [] };
+  }
+  try {
+    const granted = await browser.permissions.request({ permissions: ["sessions"] });
+    if (!granted) {
+      return { ok: false, error: "sessions_denied", sessions: [] };
+    }
+    return recentlyClosedFromSearch();
+  } catch (error) {
+    return { ok: false, error: "sessions_denied", sessions: [] };
+  }
+}
+
+async function restoreSessionFromSearch(sessionId) {
+  if (typeof sessionId !== "string" || sessionId.length === 0 ||
+      !browser.sessions || typeof browser.sessions.restore !== "function") {
+    return { ok: false, error: "restore_failed", list: await listTabsForSearch() };
+  }
+  try {
+    await browser.sessions.restore(sessionId);
+    return { ok: true, list: await listTabsForSearch() };
+  } catch (error) {
+    return { ok: false, error: "restore_failed", list: await listTabsForSearch() };
+  }
+}
+
 // Collapse near-duplicate history URLs (scheme, www., trailing slash, and
 // tracking/session params) so "https://youtube.com/", "http://youtube.com/",
 // and "...?themeRefresh=1" don't each take a row.
@@ -5071,6 +5148,11 @@ function isNewTabPage(tab) {
   return tab && typeof tab.url === "string" && /^(about:newtab|about:home)(?:[?#]|$)/.test(tab.url);
 }
 
+async function openStandaloneTabSearch() {
+  await browser.tabs.create({ url: TAB_SEARCH_HOST_URL, active: true });
+  return { ok: true };
+}
+
 async function openTabSearchOverlay() {
   const [active] = await browser.tabs.query({ active: true, currentWindow: true });
   if (!active || typeof active.id !== "number") {
@@ -5085,7 +5167,7 @@ async function openTabSearchOverlay() {
       // stuck in the address bar (Firefox bug 1411465 / 1415860), so typed text
       // lands in the URL bar. Opening a *fresh* tab instead lands focus in the
       // content area like a link click; then discard the blank new-tab.
-      await browser.tabs.create({ url: TAB_SEARCH_HOST_URL, active: true });
+      await openStandaloneTabSearch();
       let cleanupPending = false;
       try {
         await browser.tabs.remove(active.id);
@@ -5102,13 +5184,20 @@ async function openTabSearchOverlay() {
       }
       return cleanupPending ? { ok: true, cleanupPending: true } : { ok: true };
     }
-    // No content script on this page (e.g. about:, addons, PDF viewer).
-    await notify({
-      type: "basic",
-      title: "Tab Search",
-      message: "Tab search can't open on this page. Switch to a normal web page and try again.",
-    });
-    return { ok: false, error: "unsupported_page" };
+    // No content script on this page (e.g. about:, addons, PDF viewer). Keep
+    // the original page intact and open the extension-hosted search page in a
+    // fresh tab instead.
+    try {
+      return await openStandaloneTabSearch();
+    } catch (error) {
+      console.error("Opening standalone Tab Search failed:", error);
+      await notify({
+        type: "basic",
+        title: "Tab Search",
+        message: "Tab Search could not open a new tab.",
+      });
+      return { ok: false, error: "open_failed" };
+    }
   }
 }
 

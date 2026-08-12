@@ -1813,3 +1813,82 @@ test("a failed commands.reset surfaces the partial clear (eb9668cf)", async () =
     /browser shortcut could not be reset/,
   );
 });
+
+test("recording a shortcut that duplicates another Tabloupe command is blocked", async () => {
+  const harness = createHarness({ storage: {} });
+  harness.browser.commands.getAll = async () => [
+    { name: "search-tabs", shortcut: "Ctrl+S" },
+    { name: "show-all-groups", shortcut: "Ctrl+Shift+K" },
+  ];
+  await settle();
+
+  const button = harness.document.getElementById("shortcut-record");
+  button.click();
+  pressKeyOn(harness, button, { key: "k", metaKey: true, shiftKey: true });
+  await settle();
+
+  assert.ok(!("tabSearchShortcut" in harness.storageData), "nothing written to storage");
+  assert.equal(harness.commandUpdates.length, 0, "no command update sent for the rejected duplicate");
+  assert.match(
+    harness.document.getElementById("shortcut-status").textContent,
+    /Already used by "Show all groups"/,
+  );
+});
+
+test("recording a lens shortcut that duplicates Search tabs is blocked and names it", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [{ id: "lens_a", name: "Work", icon: "circle", color: null, groupSelectors: [], triggers: { appleFocusIds: [] }, createdAt: 1, updatedAt: 1 }],
+    },
+  });
+  harness.browser.commands.getAll = async () => [{ name: "search-tabs", shortcut: "Ctrl+S" }];
+  await settle();
+
+  const row = harness.document.querySelector('.shortcut-binding[data-command="activate-lens-1"]');
+  const button = row.querySelector(".shortcut-input");
+  button.click();
+  pressKeyOn(harness, button, { key: "s", metaKey: true });
+  await settle();
+
+  assert.equal(harness.commandUpdates.length, 0, "no command update sent for the rejected duplicate");
+  assert.match(row.querySelector(".shortcut-error").textContent, /Already used by "Search tabs"/);
+});
+
+test("a commonly reserved shortcut still saves but shows a persistent warning hint", async () => {
+  const harness = createHarness({ storage: {} });
+  await settle();
+
+  const button = harness.document.getElementById("shortcut-record");
+  button.click();
+  // Physical Cmd+T on the mac test platform normalizes to commands-format
+  // "Ctrl+T" — Firefox's own New Tab shortcut.
+  pressKeyOn(harness, button, { key: "t", metaKey: true });
+  await settle();
+
+  assert.deepEqual({ ...harness.storageData.tabSearchShortcut }, {
+    ctrl: false,
+    alt: false,
+    shift: false,
+    meta: true,
+    key: "t",
+  }, "the shortcut still saves despite the heuristic conflict");
+  const hint = harness.document.getElementById("shortcut-reserved-hint");
+  assert.equal(hint.hidden, false);
+  assert.match(hint.textContent, /commonly reserved/i);
+});
+
+test("a non-conflicting shortcut clears any stale reserved-hint text", async () => {
+  const harness = createHarness({
+    storage: { tabSearchShortcut: { ctrl: false, alt: false, shift: false, meta: true, key: "t" } },
+  });
+  await settle();
+
+  assert.equal(harness.document.getElementById("shortcut-reserved-hint").hidden, false, "starts flagged");
+
+  const button = harness.document.getElementById("shortcut-record");
+  button.click();
+  pressKeyOn(harness, button, { key: "j", ctrlKey: true, shiftKey: true });
+  await settle();
+
+  assert.equal(harness.document.getElementById("shortcut-reserved-hint").hidden, true);
+});

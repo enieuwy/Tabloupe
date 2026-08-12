@@ -2280,6 +2280,60 @@ test("tabsearch-close-many removes all listed tabs and returns the refreshed lis
   assert.deepEqual(list.map((tab) => tab.id), [20]);
 });
 
+test("tabsearch-recently-closed projects native tab and window sessions", async () => {
+  const harness = createHarness();
+  let request;
+  harness.browser.sessions = {
+    async getRecentlyClosed(query) {
+      request = query;
+      return [
+        { lastModified: 12, tab: { sessionId: "tab-1", title: "Docs", url: "https://docs.example", favIconUrl: "https://docs.example/icon" } },
+        { lastModified: 11, window: { sessionId: "window-1", tabs: [{}, {}] } },
+        { tab: { title: "Missing session id" } },
+      ];
+    },
+  };
+
+  const result = await harness.request({ type: "tabsearch-recently-closed" });
+
+  assert.deepEqual(clone(request), { maxResults: 10 });
+  assert.deepEqual(clone(result), {
+    ok: true,
+    sessions: [
+      { sessionId: "tab-1", kind: "closed-tab", title: "Docs", url: "https://docs.example", favIconUrl: "https://docs.example/icon", tabCount: 0, closedAt: 12 },
+      { sessionId: "window-1", kind: "closed-window", title: "", url: "", favIconUrl: "", tabCount: 2, closedAt: 11 },
+    ],
+  });
+});
+
+test("tabsearch restores the selected native session and refreshes open tabs", async () => {
+  const harness = createHarness({
+    tabs: [{ id: 20, windowId: 1, title: "Docs", url: "https://docs.example", active: true }],
+  });
+  const restored = [];
+  harness.browser.sessions = {
+    async restore(sessionId) {
+      restored.push(sessionId);
+    },
+  };
+
+  const result = await harness.request({ type: "tabsearch-restore-session", sessionId: "tab-1" });
+
+  assert.deepEqual(restored, ["tab-1"]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.list.map((tab) => tab.id), [20]);
+});
+
+test("tabsearch recently closed degrades cleanly without sessions access", async () => {
+  const harness = createHarness();
+
+  assert.deepEqual(clone(await harness.request({ type: "tabsearch-recently-closed" })), {
+    ok: false,
+    error: "sessions_unavailable",
+    sessions: [],
+  });
+});
+
 test("tabsearch-group creates a titled group and merges into an existing same-title group", async () => {
   const harness = createHarness({
     currentWindowId: 1,
@@ -2627,7 +2681,7 @@ test("search-tabs command retries blank-tab cleanup after a transient removal fa
   assert.equal(harness.tabState.some((tab) => tab.id === 20), false);
 });
 
-test("search-tabs command notifies when the page has no content script", async () => {
+test("search-tabs command opens extension search page when the page has no content script", async () => {
   const harness = createHarness({
     currentWindowId: 1,
     failTabMessage: true,
@@ -2638,8 +2692,11 @@ test("search-tabs command notifies when the page has no content script", async (
   await harness.runCommand("search-tabs");
   await settle();
 
-  const fired = harness.notifications.map((args) => (args.length === 2 ? args[1] : args[0]));
-  assert.ok(fired.some((options) => options.title === "Tab Search"));
+  assert.deepEqual(harness.tabCreations, [
+    { url: "moz-extension://tab-lens/tabsearch.html?tabsearchOpen=1", active: true },
+  ]);
+  assert.deepEqual(harness.removedTabs, []);
+  assert.equal(harness.notifications.length, 0);
 });
 
 function chatCompletion(groups, { ok = true, status = 200 } = {}) {
@@ -4778,7 +4835,7 @@ test("tabsearch-activate returns a structured error when the tab was already clo
   assert.equal(result.error, "tab_not_found");
 });
 
-test("open-tab-search reports failure when the overlay cannot open", async () => {
+test("open-tab-search opens a standalone page when the overlay cannot reach the active tab", async () => {
   const noTab = createHarness({ tabs: [] });
   await settle();
   const noResult = await noTab.request({ type: "open-tab-search" });
@@ -4791,9 +4848,12 @@ test("open-tab-search reports failure when the overlay cannot open", async () =>
   });
   await settle();
   const privResult = await privileged.request({ type: "open-tab-search" });
-  assert.equal(privResult.ok, false);
-  assert.equal(privResult.error, "unsupported_page");
-  assert.equal(privileged.notifications.length, 1);
+  assert.equal(privResult.ok, true);
+  assert.deepEqual(privileged.tabCreations, [
+    { url: "moz-extension://tab-lens/tabsearch.html?tabsearchOpen=1", active: true },
+  ]);
+  assert.equal(privileged.removedTabs.length, 0);
+  assert.equal(privileged.notifications.length, 0);
 });
 
 test("concurrent local changes record both lens and prefs sync timestamps without clobbering", async () => {

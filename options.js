@@ -359,6 +359,70 @@ function shortcutToCommandFormat(combo, isMac) {
   return [...modifiers, mappedKey].join("+");
 }
 
+// Commands-format tokens (post shortcutToCommandFormat) that commonly collide
+// with a shortcut Firefox itself already owns. "Ctrl" here means whichever
+// physical key shortcutToCommandFormat already normalized to the primary
+// modifier (Cmd on macOS, physical Ctrl elsewhere) — the same normalization
+// Firefox's own chrome shortcuts use, so one list covers every platform.
+// This is a heuristic, not a guarantee: browser.commands.update() accepting a
+// shortcut never proves Firefox will deliver it (MDN commands.json; Mozilla
+// bug 1272198). Extension-vs-extension conflicts are unobservable here too.
+const RESERVED_BROWSER_SHORTCUTS = new Set([
+  "Ctrl+S", "Ctrl+T", "Ctrl+W", "Ctrl+N", "Ctrl+L", "Ctrl+F", "Ctrl+R", "Ctrl+D", "Ctrl+H", "Ctrl+J", "Ctrl+P",
+  "Ctrl+Shift+T", "Ctrl+Shift+N", "Ctrl+Shift+P", "Ctrl+Shift+Delete",
+  "Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5", "Ctrl+6", "Ctrl+7", "Ctrl+8", "Ctrl+9",
+]);
+
+// Non-blocking: a heuristic hint, not proof either way. Empty string means no
+// known collision.
+function reservedShortcutWarning(commandShortcut) {
+  if (typeof commandShortcut !== "string" || commandShortcut.length === 0) return "";
+  return RESERVED_BROWSER_SHORTCUTS.has(commandShortcut)
+    ? "This combination is commonly reserved by the browser and may not always trigger."
+    : "";
+}
+
+function commandDisplayLabel(commandName) {
+  if (commandName === "search-tabs") return "Search tabs";
+  if (commandName === "show-all-groups") return "Show all groups";
+  if (commandName === "cycle-lens-next") return "Cycle to next lens";
+  if (commandName === "cycle-lens-prev") return "Cycle to previous lens";
+  const lensSlot = /^activate-lens-([1-9])$/.exec(commandName);
+  if (lensSlot) {
+    const lens = state.lenses[Number(lensSlot[1]) - 1];
+    return lens ? `Activate "${lens.name}"` : `Activate lens ${lensSlot[1]}`;
+  }
+  return commandName;
+}
+
+// Every currently-bound command as {commandName, commandShortcut}, used to
+// block a new binding that would silently steal an existing one out from
+// under it. state.commandShortcuts (from commands.getAll()) is the source of
+// truth once it has been populated; the in-page-only fallback covers the
+// narrow window before that first sync when browser.commands is unavailable.
+function allCommandShortcutEntries() {
+  const entries = [];
+  const seen = new Set();
+  for (const [commandName, commandShortcut] of Object.entries(state.commandShortcuts || {})) {
+    if (typeof commandShortcut === "string" && commandShortcut.length > 0) {
+      entries.push({ commandName, commandShortcut });
+      seen.add(commandName);
+    }
+  }
+  if (!seen.has("search-tabs") && state.tabSearchShortcut) {
+    const format = shortcutToCommandFormat(state.tabSearchShortcut, IS_MAC);
+    if (format) entries.push({ commandName: "search-tabs", commandShortcut: format });
+  }
+  return entries;
+}
+
+function findDuplicateCommand(commandShortcut, excludeCommandName) {
+  const match = allCommandShortcutEntries().find(
+    (entry) => entry.commandName !== excludeCommandName && entry.commandShortcut === commandShortcut,
+  );
+  return match ? match.commandName : null;
+}
+
 // Present a stored commands-format string ("MacCtrl+Shift+K") for display,
 // mirroring formatShortcut's plain-text style. Empty string -> "Not set".
 function formatCommandShortcut(shortcut, isMac) {
@@ -2483,6 +2547,18 @@ function render() {
   applyPendingFocus();
 }
 
+function reservedHintEl(commandName) {
+  if (commandName === "search-tabs") return document.getElementById("shortcut-reserved-hint");
+  return document.querySelector(`.shortcut-binding[data-command="${commandName}"] .shortcut-reserved-hint`);
+}
+
+function updateReservedHint(el, commandShortcut) {
+  if (!el) return;
+  const warning = reservedShortcutWarning(commandShortcut);
+  el.textContent = warning;
+  el.hidden = !warning;
+}
+
 function renderShortcut() {
   const button = document.getElementById("shortcut-record");
   if (!button) return;
@@ -2493,6 +2569,8 @@ function renderShortcut() {
   }
   button.classList.remove("recording");
   button.textContent = formatShortcut(state.tabSearchShortcut);
+  const commandShortcut = state.tabSearchShortcut ? shortcutToCommandFormat(state.tabSearchShortcut, IS_MAC) : "";
+  updateReservedHint(reservedHintEl("search-tabs"), commandShortcut || "");
 }
 
 function recorderButtonFor(commandName) {
@@ -2508,7 +2586,9 @@ function renderCommandRow(commandName) {
     return;
   }
   button.classList.remove("recording");
-  button.textContent = formatCommandShortcut(state.commandShortcuts[commandName] || "", IS_MAC);
+  const commandShortcut = state.commandShortcuts[commandName] || "";
+  button.textContent = formatCommandShortcut(commandShortcut, IS_MAC);
+  updateReservedHint(reservedHintEl(commandName), commandShortcut);
 }
 
 function buildLensShortcutRow(lens, index) {
@@ -2551,7 +2631,12 @@ function buildLensShortcutRow(lens, index) {
   error.setAttribute("role", "status");
   error.setAttribute("aria-live", "polite");
 
-  binding.append(row, error);
+  const hint = document.createElement("p");
+  hint.className = "shortcut-reserved-hint";
+  hint.hidden = true;
+  updateReservedHint(hint, state.commandShortcuts[commandName] || "");
+
+  binding.append(row, error, hint);
   return binding;
 }
 
@@ -2732,6 +2817,11 @@ function handleRecorderKeydown(event, commandName) {
   const commandShortcut = shortcutToCommandFormat(combo, IS_MAC);
   if (commandShortcut === null) {
     showRowError(commandName, "Add at least one modifier (Ctrl, Alt, or Cmd).");
+    return; // stay recording so the user can try again
+  }
+  const duplicateCommand = findDuplicateCommand(commandShortcut, commandName);
+  if (duplicateCommand) {
+    showRowError(commandName, `Already used by "${commandDisplayLabel(duplicateCommand)}". Choose a different shortcut.`);
     return; // stay recording so the user can try again
   }
   stopRecording();

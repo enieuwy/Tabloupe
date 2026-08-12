@@ -40,6 +40,8 @@ let historyResults = [];
 let historyQuery = "";
 let historyDebounceTimer = null;
 let tabContainers = [];
+let recentlyClosed = [];
+let recentlyClosedAvailable = false;
 // Guards against stale async work repainting a reopened overlay: bumped on every
 // open (buildOverlay) and every close (closeOverlay). In-flight open/refresh work
 // captures the value and bails when it no longer matches.
@@ -382,6 +384,13 @@ function buildOverlay() {
       background: var(--surface-2); color: var(--text);
       border-radius: 5px; box-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
     }
+    .hint button {
+      white-space: nowrap; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 7px;
+      padding: 5px 9px; background: var(--surface-2); color: var(--text);
+      font: inherit; font-size: 12px; cursor: pointer;
+    }
+    .hint button:hover { background: rgba(255, 255, 255, 0.10); }
+    .hint .message { color: var(--faint); }
     .actions {
       display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
       padding: 9px 16px; font-size: 12px; color: var(--muted);
@@ -534,6 +543,7 @@ function render(query) {
   const renderedCount = Math.min(matches.length, MAX_RENDERED_RESULTS);
   const actionRows = [];
   const historyRows = [];
+  const recentRows = trimmed === "" ? recentlyClosed : [];
   if (trimmed !== "") {
     // Drop history entries whose URL is already an open tab (matched or not) so
     // the same page never shows twice; require >=2 chars so single-letter
@@ -641,6 +651,21 @@ function render(query) {
     if (row.kind === "web") {
       listEl.appendChild(makeSectionHeader("Search"));
     }
+    const idx = visible.length;
+    visible.push(row);
+    listEl.appendChild(makeActionRow(row, idx));
+  }
+
+  if (browse && recentlyClosedAvailable) {
+    listEl.appendChild(makeSectionHeader("Recently closed"));
+    if (recentRows.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "empty-inline";
+      empty.textContent = "No recently closed tabs";
+      listEl.appendChild(empty);
+    }
+  }
+  for (const row of recentRows) {
     const idx = visible.length;
     visible.push(row);
     listEl.appendChild(makeActionRow(row, idx));
@@ -879,7 +904,7 @@ function makeActionRow(row, index) {
 
   const icon = document.createElement("span");
   icon.className = "action-icon";
-  replaceChildrenWithTrustedHTML(icon, row.kind === "history" ? ICON_CLOCK : ICON_GLOBE);
+  replaceChildrenWithTrustedHTML(icon, row.kind === "web" ? ICON_GLOBE : ICON_CLOCK);
   item.appendChild(icon);
 
   const text = document.createElement("div");
@@ -888,23 +913,28 @@ function makeActionRow(row, index) {
   title.className = "title";
   const name = document.createElement("span");
   name.className = "name";
-  // History with a real title -> title line + url subtitle. Title-less history
-  // -> a single readable label line, never the raw URL printed twice. A web row
-  // whose query is a URL becomes a "Go to <host+path>" direct-open row.
-  const hasTitle = row.kind === "history" && row.title && row.title.trim();
+  const hasTitle = (row.kind === "history" || row.kind === "closed-tab") && row.title && row.title.trim();
   const isGoTo = row.kind === "web" && row.url;
   name.textContent =
-    row.kind === "web"
-      ? isGoTo
-        ? `Go to ${readableUrlLabel(row.url)}`
-        : "Search the web"
-      : hasTitle
-        ? row.title
-        : readableUrlLabel(row.url);
+    row.kind === "recent-enable"
+      ? "Show recently closed tabs"
+      : row.kind === "closed-window"
+        ? `Restore window — ${row.tabCount} tabs`
+        : row.kind === "web"
+          ? isGoTo
+            ? `Go to ${readableUrlLabel(row.url)}`
+            : "Search the web"
+          : hasTitle
+            ? row.title
+            : readableUrlLabel(row.url);
   title.appendChild(name);
   text.appendChild(title);
   const subtitleText =
-    row.kind === "web" ? (isGoTo ? row.url : `\u201c${row.query}\u201d`) : hasTitle ? row.url : "";
+    row.kind === "recent-enable"
+      ? "Allow Tabloupe to restore closed tabs from this Firefox session"
+      : row.kind === "web"
+        ? (isGoTo ? row.url : `\u201c${row.query}\u201d`)
+        : hasTitle ? row.url : "";
   if (subtitleText) {
     const subtitle = document.createElement("div");
     subtitle.className = "url";
@@ -1217,6 +1247,9 @@ function renderFooter() {
     if (duplicateTabIds.length > 0) {
       footerEl.appendChild(makeActionButton(`Select ${duplicateTabIds.length} duplicates`, markDuplicateTabs));
     }
+    if (browseMode() && !recentlyClosedAvailable) {
+      footerEl.appendChild(makeActionButton("Show recently closed", () => activate({ kind: "recent-enable" })));
+    }
     if (actionMessage) {
       const message = document.createElement("span");
       message.className = "message";
@@ -1469,11 +1502,31 @@ function focusInput() {
   attempt(10);
 }
 
+async function loadRecentlyClosed(gen) {
+  try {
+    const result = await browser.runtime.sendMessage({ type: "tabsearch-recently-closed" });
+    if (gen !== overlayGen || !isOpen()) return;
+    recentlyClosedAvailable = Boolean(result && result.ok);
+    recentlyClosed = result && result.ok && Array.isArray(result.sessions) ? result.sessions : [];
+  } catch (error) {
+    if (gen !== overlayGen || !isOpen()) return;
+    recentlyClosedAvailable = false;
+    recentlyClosed = [];
+  }
+}
+
+async function refreshRecentlyClosed() {
+  const gen = overlayGen;
+  await loadRecentlyClosed(gen);
+  if (gen === overlayGen && isOpen()) render(inputEl.value);
+}
+
 async function loadOverlayTabs(gen) {
   try {
     const [tabs, containersResult] = await Promise.all([
       browser.runtime.sendMessage({ type: "tabsearch-list" }),
       browser.runtime.sendMessage({ type: "tabsearch-containers" }).catch(() => ({ ok: false, containers: [] })),
+      loadRecentlyClosed(gen),
     ]);
     if (gen !== overlayGen || !isOpen()) return false;
     allTabs = prepareTabsForSearch(tabs || []);
@@ -1486,6 +1539,8 @@ async function loadOverlayTabs(gen) {
     if (gen !== overlayGen || !isOpen()) return false;
     allTabs = [];
     tabContainers = [];
+    recentlyClosed = [];
+    recentlyClosedAvailable = false;
     listLoadError = "Could not load tabs. Try again.";
     return false;
   }
@@ -1527,6 +1582,8 @@ function closeOverlay() {
   clearMarks();
   previewState = null;
   tabContainers = [];
+  recentlyClosed = [];
+  recentlyClosedAvailable = false;
   listLoadError = "";
   dropIndicator = null;
   // When we are the extension-hosted new-tab page (not an in-page overlay),
@@ -1546,9 +1603,37 @@ function closeOverlay() {
 // surfaced as a visible failure message with the overlay kept open, instead of
 // being swallowed by a bare empty catch.
 function activate(item) {
+  if (item.kind === "recent-enable") {
+    return runGuardedListAction(
+      () => browser.runtime.sendMessage({ type: "tabsearch-enable-recently-closed" }),
+      {
+        onResult(result) {
+          recentlyClosedAvailable = Boolean(result && result.ok);
+          recentlyClosed = result && result.ok && Array.isArray(result.sessions) ? result.sessions : [];
+          if (!recentlyClosedAvailable) actionMessage = "Recently closed tabs permission was not granted.";
+        },
+        onError() {
+          actionMessage = "Could not enable recently closed tabs.";
+        },
+      },
+    );
+  }
+  if (item.kind === "closed-tab" || item.kind === "closed-window") {
+    return runGuardedListAction(
+      () => browser.runtime.sendMessage({ type: "tabsearch-restore-session", sessionId: item.sessionId }),
+      {
+        onResult(result) {
+          applyListActionResult(result, "Could not restore that session.");
+          if (result && result.ok) refreshRecentlyClosed();
+        },
+        onError() {
+          actionMessage = "Could not restore that session.";
+        },
+      },
+    );
+  }
   let message;
   if (item.kind === "web") {
-    // A URL-shaped query opens directly; anything else is a web search.
     message = item.url
       ? { type: "tabsearch-open-url", url: item.url }
       : { type: "tabsearch-web-search", query: item.query };
@@ -1604,6 +1689,7 @@ function closeTab(tab) {
     {
       onResult(refreshed) {
         applyListActionResult(refreshed, "Could not close that tab.");
+        refreshRecentlyClosed();
       },
       onError() {
         // The request itself failed, so the tab is almost certainly still open:
@@ -1620,12 +1706,14 @@ function runBulkListAction(type, payload) {
     {
       onResult(result) {
         applyListActionResult(result, "Action failed.");
+        if (type === "tabsearch-close-many") refreshRecentlyClosed();
       },
       onError() {
         actionMessage = "Action failed.";
       },
     },
   );
+
 }
 
 function submitManualGroup(tabIds, title, windowId) {
