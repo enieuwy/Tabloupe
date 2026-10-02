@@ -61,11 +61,14 @@ Everything else — selector editing, schedules, calendar patterns, container ru
 Untitled groups appear as **Untitled group** during onboarding and in Options. Saving them creates an empty-title selector, which matches untitled groups without matching named groups.
 
 Tab Search browse mode includes every open tab; only ranked search results have a display cap. Dragging onto a row or group header affects only tabs in the target window.
+Selector and calendar-pattern edits commit in order. A failed write leaves the last saved values in place.
+
+For **Include existing groups**, Apply requires the reviewed preview. If it expires or another preview replaces it, run Preview again.
 ### Calendar subscriptions
 
 In Options → Automation, enter up to five HTTPS or `webcal` ICS URLs, one per line. Save grants access only to their hosts. Loopback HTTP URLs also work for local feeds. Add calendar-title patterns to the desired lens. The browser checks active events every minute and fetches feeds every 15 minutes; **Refresh calendars** fetches immediately. Configured subscriptions replace the daemon's calendar source, not its Focus source.
 
-Feeds must include `VTIMEZONE` definitions for named time zones. Invalid feeds show an error instead of acting as an empty calendar. A failed refresh retains known events only until their recorded end. Subscription URLs can contain private tokens; the extension stores them locally.
+Feeds must include `VTIMEZONE` definitions for named time zones. A failed source shows an error while other sources continue. Known events expire at their recorded end, even when a feed remains unavailable. Editing subscriptions drops queued events from the old sources and refreshes the current sources. Subscription URLs can contain private tokens; the extension stores them locally.
 
 ### Isolated overnight demo
 

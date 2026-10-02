@@ -1,5 +1,5 @@
-// Chromium 123+ supplies promise APIs. Only namespace and event-reply differences
-// need adaptation; Firefox keeps its native browser object unchanged.
+// Chromium 123+ supplies promise APIs. Adapt namespace, event replies, and bulk
+// tab discard; Firefox keeps its native browser object unchanged.
 (() => {
   if (typeof globalThis.browser !== "undefined" || typeof globalThis.chrome === "undefined") return;
   const api = globalThis.chrome;
@@ -14,7 +14,7 @@
           result.then(sendResponse, (error) => sendResponse({ ok: false, error: error.message }));
           return true;
         }
-        if (result !== undefined) sendResponse(result);
+        if (result !== false && result !== undefined) sendResponse(result);
         return false;
       };
       listeners.set(listener, wrapped);
@@ -34,9 +34,24 @@
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+  async function discard(tabIds) {
+    if (Array.isArray(tabIds)) {
+      // Start every scalar request in input order, without hiding any failure.
+      return Promise.all(tabIds.map(async (tabId) => api.tabs.discard(tabId)));
+    }
+    return api.tabs.discard(tabIds);
+  }
+  const tabs = new Proxy(api.tabs, {
+    get(target, key) {
+      if (key === "discard") return discard;
+      const value = target[key];
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
   globalThis.browser = new Proxy(api, {
     get(target, key) {
       if (key === "runtime") return runtime;
+      if (key === "tabs") return tabs;
       if (key === "browserAction") return target.action;
       return target[key];
     },

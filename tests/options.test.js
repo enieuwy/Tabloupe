@@ -1958,3 +1958,60 @@ test("new selectors preserve explicit types and reject unsafe regular expression
   assert.equal(harness.window.selectorFromTypedInput("regex", "x".repeat(129)), null);
   harness.window.close();
 });
+
+test("rapid selector and calendar edits preserve every confirmed change", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lensFixture({ triggers: { appleFocusIds: ["work"], calendarPatterns: ["Daily"] } })] },
+  });
+  await settle();
+  const realSend = harness.browser.runtime.sendMessage;
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let first = true;
+  harness.browser.runtime.sendMessage = async (message) => {
+    if (message.type === "lens-update" && first) {
+      first = false;
+      await held;
+    }
+    return realSend(message);
+  };
+  harness.window.addSelectorToLens("lens_work", { type: "color", value: "purple" });
+  harness.window.addSelectorToLens("lens_work", { type: "urlHost", value: "github.com" });
+  harness.window.removeSelectorFromLens("lens_work", { type: "title", value: "Work" });
+  harness.window.addCalendarPatternToLens("lens_work", "Client *");
+  harness.window.addCalendarPatternToLens("lens_work", "Project *");
+  harness.window.removeCalendarPatternFromLens("lens_work", "Daily");
+  await settle();
+  release();
+  await settle();
+  assert.deepEqual(harness.storageData.lenses[0].groupSelectors, [
+    { type: "color", value: "purple" }, { type: "urlHost", value: "github.com" },
+  ]);
+  assert.deepEqual(harness.storageData.lenses[0].triggers, {
+    appleFocusIds: ["work"], calendarPatterns: ["Client *", "Project *"],
+  });
+  assert.equal(lensCard(harness.document).querySelectorAll(".calendar-editor .group-chip").length, 2);
+  harness.window.close();
+});
+
+test("a failed queued selector edit does not leak into the next successful edit", async () => {
+  const harness = createHarness({ storage: { lenses: [lensFixture()] } });
+  await settle();
+  const realSend = harness.browser.runtime.sendMessage;
+  let first = true;
+  harness.browser.runtime.sendMessage = async (message) => {
+    if (message.type === "lens-update" && first) {
+      first = false;
+      throw new Error("background restarted");
+    }
+    return realSend(message);
+  };
+  harness.window.addSelectorToLens("lens_work", { type: "color", value: "purple" });
+  harness.window.addSelectorToLens("lens_work", { type: "urlHost", value: "github.com" });
+  await settle();
+  assert.deepEqual(harness.storageData.lenses[0].groupSelectors, [
+    { type: "title", value: "Work" }, { type: "urlHost", value: "github.com" },
+  ]);
+  assert.ok(!lensCard(harness.document).textContent.includes("purple"));
+  harness.window.close();
+});

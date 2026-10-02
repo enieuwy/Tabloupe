@@ -1141,21 +1141,30 @@ function replaceLensInState(lensId, patch) {
   return next;
 }
 
-async function persistLensPatch(lensId, patch, statusMessage = "Saved") {
-  if (!findLens(lensId)) {
-    setStatus("Lens not found.", "error");
-    return null;
-  }
-  const result = await sendToBackground({ type: "lens-update", lensId, patch });
-  if (!result || result.ok !== true) {
-    await reloadLensesFromStorage();
-    setStatus("Save failed. Please try again.", "error");
-    return null;
-  }
-  const next = replaceLensInState(lensId, patch);
-  render();
-  setStatus(statusMessage, "ok");
-  return next;
+// Serialize edits and build list patches from committed storage, never a pending UI snapshot.
+let lensWriteQueue = Promise.resolve();
+function persistLensPatch(lensId, patchOrUpdate, statusMessage = "Saved") {
+  lensWriteQueue = lensWriteQueue.catch(() => {}).then(async () => {
+    const stored = await browser.storage.local.get("lenses");
+    const lens = normalizeLenses(stored.lenses).find((entry) => entry.id === lensId);
+    if (!lens) {
+      setStatus("Lens not found.", "error");
+      return null;
+    }
+    const patch = typeof patchOrUpdate === "function" ? patchOrUpdate(lens) : patchOrUpdate;
+    if (!patch) return lens;
+    const result = await sendToBackground({ type: "lens-update", lensId, patch });
+    if (!result || result.ok !== true) {
+      await reloadLensesFromStorage();
+      setStatus("Save failed. Please try again.", "error");
+      return null;
+    }
+    const next = replaceLensInState(lensId, patch);
+    render();
+    setStatus(statusMessage, "ok");
+    return next;
+  });
+  return lensWriteQueue;
 }
 
 async function reloadLensesFromStorage() {
@@ -1182,62 +1191,57 @@ function selectorFromTypedInput(type, value) {
 }
 
 function addSelectorToLens(lensId, selector) {
-  const lens = findLens(lensId);
   const normalized = normalizeSelector(selector);
-  if (!lens || !normalized) return;
-  if (lens.groupSelectors.some((existing) => selectorKey(existing) === selectorKey(normalized))) return;
-  const groupSelectors = [...lens.groupSelectors, normalized];
-  const patch = {
-    groupSelectors,
-    ...firstBindingAutoNamePatch(lens, normalized.type === "title" ? normalized.value : "", lens.groupSelectors.length === 0),
-  };
+  if (!normalized) return;
   activeAdderId = lensId;
   if (normalized.type === "glob") {
     expandedLensRows.add(lensId);
   }
-  persistLensPatch(lensId, patch, "Group saved").catch((error) => {
+  persistLensPatch(lensId, (lens) => {
+    if (lens.groupSelectors.some((existing) => selectorKey(existing) === selectorKey(normalized))) return null;
+    return {
+      groupSelectors: [...lens.groupSelectors, normalized],
+      ...firstBindingAutoNamePatch(lens, normalized.type === "title" ? normalized.value : "", lens.groupSelectors.length === 0),
+    };
+  }, "Group saved").catch((error) => {
     console.error("Lens group save failed:", error);
     setStatus("Save failed. See extension console.", "error");
   });
 }
 
 function removeSelectorFromLens(lensId, selector) {
-  const lens = findLens(lensId);
   const normalized = normalizeSelector(selector);
-  if (!lens || !normalized) return;
+  if (!normalized) return;
   const removeKey = selectorKey(normalized);
-  const groupSelectors = lens.groupSelectors.filter((existing) => selectorKey(existing) !== removeKey);
-  persistLensPatch(lensId, { groupSelectors }, "Group removed").catch((error) => {
+  persistLensPatch(lensId, (lens) => ({
+    groupSelectors: lens.groupSelectors.filter((existing) => selectorKey(existing) !== removeKey),
+  }), "Group removed").catch((error) => {
     console.error("Lens group removal failed:", error);
     setStatus("Save failed. See extension console.", "error");
   });
 }
 function addCalendarPatternToLens(lensId, value) {
-  const lens = findLens(lensId);
   const pattern = typeof value === "string" ? value.trim() : "";
-  if (!lens || !pattern || lens.triggers.calendarPatterns.includes(pattern)) return;
-  const triggers = {
-    ...lens.triggers,
-    calendarPatterns: [...lens.triggers.calendarPatterns, pattern],
-  };
-  const patch = {
-    triggers,
-    ...firstBindingAutoNamePatch(lens, pattern, lensHasNoBindings(lens)),
-  };
-  persistLensPatch(lensId, patch, "Calendar pattern saved").catch((error) => {
+  if (!pattern) return;
+  persistLensPatch(lensId, (lens) => {
+    if (lens.triggers.calendarPatterns.includes(pattern)) return null;
+    return {
+      triggers: { ...lens.triggers, calendarPatterns: [...lens.triggers.calendarPatterns, pattern] },
+      ...firstBindingAutoNamePatch(lens, pattern, lensHasNoBindings(lens)),
+    };
+  }, "Calendar pattern saved").catch((error) => {
     console.error("Calendar pattern save failed:", error);
     setStatus("Save failed. See extension console.", "error");
   });
 }
 
 function removeCalendarPatternFromLens(lensId, pattern) {
-  const lens = findLens(lensId);
-  if (!lens) return;
-  const triggers = {
-    ...lens.triggers,
-    calendarPatterns: lens.triggers.calendarPatterns.filter((entry) => entry !== pattern),
-  };
-  persistLensPatch(lensId, { triggers }, "Calendar pattern removed").catch((error) => {
+  persistLensPatch(lensId, (lens) => ({
+    triggers: {
+      ...lens.triggers,
+      calendarPatterns: lens.triggers.calendarPatterns.filter((entry) => entry !== pattern),
+    },
+  }), "Calendar pattern removed").catch((error) => {
     console.error("Calendar pattern removal failed:", error);
     setStatus("Save failed. See extension console.", "error");
   });

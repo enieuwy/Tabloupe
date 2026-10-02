@@ -3083,7 +3083,7 @@ browser.runtime.onMessage.addListener((message) => {
     return handleGroupPreview(message.windowId, message.includeExistingGroups === true);
   }
   if (message && message.type === "ai-group-apply") {
-    return enqueueFocusWork(() => handleGroupApply(message.windowId, message.groups));
+    return enqueueFocusWork(() => handleGroupApply(message.windowId, message.groups, message.includeExistingGroups === true));
   }
   if (message && message.type === "ai-group-clear") {
     return Promise.resolve(handleGroupClear(message.windowId));
@@ -4472,6 +4472,7 @@ async function applyTabGrouping(groups, windowId, { groupableOnly = false, inclu
     // concurrent grouping entry point can't have created the same title between
     // our query and create.
     let existingByTitle;
+    let inventoryUsed = false;
     try {
       existingByTitle = await tabGroupsByTitle(windowId);
     } catch (error) {
@@ -4490,6 +4491,9 @@ async function applyTabGrouping(groups, windowId, { groupableOnly = false, inclu
         continue;
       }
       try {
+        // Moving a group's last tab deletes it. Re-clustering must use the live inventory.
+        if (includeExistingGroups && inventoryUsed) existingByTitle = await tabGroupsByTitle(windowId);
+        inventoryUsed = true;
         const created = await createOrMergeTabGroup({
           title: group.topic,
           color: group.color,
@@ -4791,13 +4795,15 @@ async function commitTabGroups(windowId, groups, { notify: doNotify = true, surf
   return result;
 }
 
-async function handleGroupApply(windowId, groups) {
+async function handleGroupApply(windowId, groups, includeExistingGroups = false) {
   if (!(await aiGroupingEnabled())) {
     return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
   }
-  const preview = cachedProposal(windowId);
-  const includeExistingGroups = Boolean(preview && lastProposalByWindow.get(windowId)?.includeExistingGroups);
   if (includeExistingGroups) {
+    const preview = cachedProposal(windowId);
+    if (!preview || lastProposalByWindow.get(windowId)?.includeExistingGroups !== true) {
+      return { ok: false, error: "stale_preview", message: "Preview the existing groups again before applying." };
+    }
     const previewIds = new Set(preview.flatMap((group) => group.tabs.map((tab) => tab.id)));
     groups = (Array.isArray(groups) ? groups : []).filter(isRecord).map((group) => ({
       ...group, tabs: (Array.isArray(group.tabs) ? group.tabs : []).filter((tab) => isRecord(tab) && previewIds.has(tab.id)),
