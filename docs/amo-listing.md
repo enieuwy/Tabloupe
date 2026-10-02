@@ -43,6 +43,8 @@ Tabloupe does not collect, sell, share, or transmit user data for analytics, adv
 AI tab grouping is optional. When enabled, Tabloupe sends only the minimum tab metadata needed for grouping: tab titles and hostnames. That metadata goes only to the endpoint the user explicitly configures. Users can keep grouping fully on-device through the optional macOS helper, which uses Apple Intelligence locally, or they can configure any OpenAI-compatible endpoint, including a localhost Ollama server. Existing tab contents, page bodies, cookies, credentials, and browsing history are not sent for AI grouping.
 
 The optional macOS helper uses a local WebSocket connection at ws://127.0.0.1:8767. This is a loopback-only connection for local automation and on-device AI grouping. Manual lens switching, Tab Search, and normal tab organization work without the helper.
+
+Calendar subscriptions are optional. The extension fetches ICS feeds only from user-configured hosts after host access is granted. Subscription URLs may contain private access tokens; those URLs and known active-event end times stay in local storage. Bookmark and recently-closed results use the browser's own APIs and do not leave the browser. Workspace snapshots and usage insights also stay local.
 ```
 
 ### Permission rationale and AMO reviewer notes
@@ -53,17 +55,19 @@ The optional macOS helper uses a local WebSocket connection at ws://127.0.0.1:87
 | `tabs` | Required permission | Lists open tabs for the popup and Tab Search, activates selected tabs, closes selected tabs, moves tabs, groups/ungroups selected tabs, and reads tab titles/URLs needed for search and grouping. |
 | `storage` | Required permission | Stores lenses, schedules, window profile overrides, AI settings, shortcut preferences, cached local state, and import/export data locally in Firefox. |
 | `notifications` | Required permission | Shows user-visible notices for events such as unavailable automation, grouping errors, or completion states where a popup is not open. |
-| `alarms` | Required permission | Runs opt-in lens schedules and backs off reconnect attempts to the optional local helper without keeping the event page awake continuously. |
+| `alarms` | Required permission | Runs opt-in schedules, timed-focus returns, calendar checks, and reconnect backoff without keeping the background awake continuously. |
 | `history` | Required permission | Adds optional history suggestions to the Tab Search overlay when the user types a query, after open-tab matches. |
 | `search` | Required permission | Lets the Tab Search overlay run a normal web search for the current query when the user chooses the search action row. |
-| `sessions` | Optional API permission | Requested only when the user selects “Show recently closed” in Tab Search. Lists and restores Firefox’s native, current-session closed-tab/window entries; no session data leaves Firefox. |
+| `sessions` | Optional API permission | Requested from “Show recently closed” in Tab Search or the enable control in Options. Lists and restores native closed-tab/window entries; no session data leaves Firefox. |
+| `bookmarks` | Optional API permission | Requested from Options to include saved bookmarks in Tab Search. Results exclude URLs already present in open tabs or history rows. |
+| `contextMenus` | Required API permission; feature off by default | Firefox does not accept this API as an optional permission. Options enables tab/page lens actions; the extension registers no menu items until the user turns it on. |
 | `contextualIdentities` | Required permission | Reads container names/colors to badge tabs and scope lenses; moves tabs between containers only when the user requests it. |
 | `cookies` | Required permission | Enables Firefox cookieStoreId container semantics so Tabloupe can badge tabs by container and move tabs into the selected container on request. |
 | `ws://127.0.0.1/*` | Required host permission | Connects only to the optional local macOS helper on loopback, primarily at `ws://127.0.0.1:8767`, for Focus automation and on-device AI grouping. Manual use does not require a helper to be running. |
 | `<all_urls>` content-script match | Content script match | Injects the isolated Tab Search overlay and captures the configured in-page shortcut on normal web pages. The content script communicates with the background script for tab data/actions; it does not collect page content. |
-| `https://*/*` | Optional host permission | Requested only when the user configures an HTTPS OpenAI-compatible AI provider endpoint so the background script can call that chosen endpoint. |
-| `http://localhost/*` | Optional host permission | Requested only for a user-configured loopback OpenAI-compatible endpoint such as local Ollama on `localhost`; plain HTTP is limited to local development endpoints. |
-| `http://127.0.0.1/*` | Optional host permission | Requested only for a user-configured loopback OpenAI-compatible endpoint such as local Ollama on `127.0.0.1`; plain HTTP is limited to local development endpoints. |
+| `https://*/*` | Optional host permission | Requested for the specific host of a configured AI endpoint or ICS subscription. |
+| `http://localhost/*` | Optional host permission | Requested for a configured loopback AI endpoint or ICS feed on `localhost`. |
+| `http://127.0.0.1/*` | Optional host permission | Requested for a configured loopback AI endpoint or ICS feed on `127.0.0.1`. Plain HTTP is otherwise rejected. |
 | `browser_specific_settings.gecko.data_collection_permissions.required: ["none"]` | Data collection declaration | Declares that the extension does not collect or transmit user data for AMO data-collection purposes. |
 
 ## Reviewer notes

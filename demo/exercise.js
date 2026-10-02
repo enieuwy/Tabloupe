@@ -1,0 +1,97 @@
+// Run this function body in an extension page in the disposable Firefox fixture.
+// Every operation uses the real browser APIs and production message handlers.
+const check = (condition, message) => { if (!condition) throw new Error(message); };
+const send = (message) => browser.runtime.sendMessage(message);
+const base = "http://127.0.0.1:18767";
+const current = await browser.windows.getCurrent();
+const windowId = current.id;
+const make = async (path, extra = {}) => {
+  const tab = await browser.tabs.create({ windowId, url: base + path, active: false, ...extra });
+  await new Promise((resolve, reject) => {
+    const finish = () => { clearTimeout(timer); browser.tabs.onUpdated.removeListener(listener); resolve(); };
+    const listener = (id, change, currentTab) => {
+      if (id === tab.id && currentTab.status === "complete" && currentTab.url === base + path) finish();
+    };
+    const timer = setTimeout(() => { browser.tabs.onUpdated.removeListener(listener); reject(new Error("Fixture page did not load")); }, 10000);
+    browser.tabs.onUpdated.addListener(listener);
+    browser.tabs.get(tab.id).then((currentTab) => {
+      if (currentTab.status === "complete" && currentTab.url === base + path) finish();
+    }, reject);
+  });
+  return tab;
+};
+const a = await make("/work");
+const b = await make("/work-two");
+const c = await make("/research");
+const pinned = await make("/shop", { pinned: true });
+const workId = await browser.tabs.group({ tabIds: [a.id, b.id] });
+await browser.tabGroups.update(workId, { title: "Work", color: "blue" });
+const researchId = await browser.tabs.group({ tabIds: [c.id] });
+await browser.tabGroups.update(researchId, { title: "Research", color: "green" });
+const work = await send({ type: "lens-save", windowId, source: "group", groupTitle: "Work", name: "Work" });
+const research = await send({ type: "lens-save", windowId, source: "group", groupTitle: "Research", name: "Research" });
+check(work.ok && research.ok, "Lens saves failed");
+await send({ type: "lens-activate", windowId, view: { kind: "lens", lensId: work.lens.id } });
+check(!(await browser.tabGroups.get(workId)).collapsed && (await browser.tabGroups.get(researchId)).collapsed, "Lens switching did not change actual groups");
+const evidence = { browser: await browser.runtime.getBrowserInfo(), windowId, workLensId: work.lens.id, researchLensId: research.lens.id, lensSwitch: "Work expanded; Research collapsed; pinned tab remains open" };
+for (const [selector, expected] of [[{ type: "color", value: "green" }, [researchId]], [{ type: "regex", value: "^Research$" }, [researchId]], [{ type: "urlHost", value: "127.0.0.1" }, [workId, researchId]]]) {
+  check((await send({ type: "lens-update", lensId: research.lens.id, patch: { groupSelectors: [selector] } })).ok, "Selector save failed");
+  await send({ type: "lens-activate", windowId, view: { kind: "lens", lensId: research.lens.id } });
+  const expanded = (await browser.tabGroups.query({ windowId })).filter((group) => !group.collapsed).map((group) => group.id).sort();
+  check(JSON.stringify(expanded) === JSON.stringify(expected.sort()), `Selector ${selector.type} mismatch`);
+}
+evidence.selectors = "color, restricted regex, and urlHost change real group visibility";
+const portable = [work.lens, research.lens].map(({ name, icon, color, groupSelectors }) => ({ name, icon, color, groupSelectors }));
+const imported = await send({ type: "lens-import", code: JSON.stringify({ tabloupeLensPack: 1, lenses: portable }) });
+check(imported.ok && imported.lenses.length === 2 && imported.lenses.every((lens) => ![work.lens.id, research.lens.id].includes(lens.id) && !lens.triggers.appleFocusIds.length), "Portable pack import failed");
+evidence.packImport = imported.lenses.map((lens) => ({ id: lens.id, name: lens.name, triggers: lens.triggers }));
+const saved = await send({ type: "lens-snapshot-save", lensId: work.lens.id, windowId });
+check(saved.ok && saved.snapshot.tabs.length === 2, "Snapshot capture failed");
+await browser.tabs.remove([a.id, b.id]);
+const sentinel = await make("/sentinel");
+const mergeId = await browser.tabs.group({ tabIds: [sentinel.id] });
+await browser.tabGroups.update(mergeId, { title: "Work", color: "purple" });
+const restored = await send({ type: "lens-snapshot-restore", lensId: work.lens.id, windowId });
+check(restored.ok && restored.restored === 2, "Snapshot restore failed");
+check((await browser.tabs.query({ windowId, groupId: mergeId })).length === 3, "Snapshot did not merge the existing group");
+check((await browser.tabGroups.get(mergeId)).color === "purple", "Snapshot changed existing group color");
+const repeatRestore = await send({ type: "lens-snapshot-restore", lensId: work.lens.id, windowId });
+check(repeatRestore.ok && repeatRestore.restored === 0 && repeatRestore.skipped === 2, "Repeated restore duplicated tabs");
+evidence.snapshots = { saved: saved.snapshot.tabs.length, restored, repeatRestore, mergedGroupId: mergeId };
+await browser.storage.local.set({ demoEvidence: evidence });
+const closed = await make("/closed");
+await browser.tabs.remove(closed.id);
+const recent = await send({ type: "tabsearch-recently-closed" });
+const closedRow = recent.sessions?.find((row) => row.url === base + "/closed");
+check(closedRow, "Closed tab missing from native sessions");
+const reopened = await send({ type: "tabsearch-restore-session", sessionId: closedRow.sessionId });
+check(reopened.ok && reopened.list.some((tab) => tab.url === base + "/closed"), "Native session restore failed");
+evidence.recentlyClosed = { sessionId: closedRow.sessionId, restored: reopened.ok };
+await browser.bookmarks.create({ title: "Tabloupe saved reference", url: base + "/bookmark" });
+await browser.bookmarks.create({ title: "Tabloupe open duplicate", url: base + "/work-two" });
+const bookmarks = await send({ type: "tabsearch-bookmarks", query: "Tabloupe" });
+check(bookmarks.ok && bookmarks.results.some((row) => row.url === base + "/bookmark") && !bookmarks.results.some((row) => row.url === base + "/work-two"), "Bookmark results or dedup failed");
+evidence.bookmarks = bookmarks;
+const destination = await browser.windows.create({ url: "about:blank", focused: false });
+const moved = await send({ type: "tabsearch-move-to-window", tabIds: [c.id], targetWindowId: destination.id });
+check(moved.ok && (await browser.tabs.get(c.id)).windowId === destination.id, "Move to existing window failed");
+evidence.moveToWindow = { targetWindowId: destination.id, tabId: c.id, actualWindowId: (await browser.tabs.get(c.id)).windowId };
+await browser.windows.update(windowId, { focused: true });
+await send({ type: "lens-update", lensId: work.lens.id, patch: { triggers: { appleFocusIds: [], calendarPatterns: ["Deep work"] } } });
+await send({ type: "lens-activate", windowId, view: { kind: "all" } });
+await fetch(base + "/calendar/start", { method: "POST" });
+await browser.storage.local.set({ calendarSources: [base + "/calendar.ics"] });
+const calendarStart = await send({ type: "calendar-feed-refresh" });
+const duringCalendar = await browser.storage.local.get(["activeView", "lastActivation"]);
+check(calendarStart.ok && duringCalendar.activeView.lensId === work.lens.id && duringCalendar.lastActivation.trigger === "calendar", "ICS did not activate the matching lens");
+await fetch(base + "/calendar/end", { method: "POST" });
+const calendarEnd = await send({ type: "calendar-feed-refresh" });
+const afterCalendar = await browser.storage.local.get("activeView");
+check(calendarEnd.ok && afterCalendar.activeView.kind === "all", "ICS event end did not revert");
+evidence.calendar = { start: calendarStart, during: duringCalendar, end: calendarEnd, after: afterCalendar };
+await browser.storage.local.set({ calendarSources: [], lensContextMenusEnabled: true, aiGroupingEnabled: true });
+const suggestion = await send({ type: "ai-lens-suggest", windowId });
+evidence.ai = { actualResultWithoutProvider: suggestion, blocked: "No live model or provider credentials in this fixture" };
+check((await browser.tabs.get(pinned.id)).pinned, "A pinned tab changed");
+await browser.storage.local.set({ demoEvidence: evidence });
+return evidence;

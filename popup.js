@@ -13,6 +13,9 @@ let windowId = null;
 let lensState = null;
 let proposal = null;
 let aiInitialized = false;
+let proposalIncludesExisting = false;
+let timedFocusPending = false;
+let suggestionPending = false;
 let connectionStatus = {
   connectionState: "reconnecting",
   lastError: null,
@@ -107,6 +110,113 @@ function setActionsDisabled(disabled) {
   }
 }
 
+function renderTimedFocus(state) {
+  const picker = el("timed-focus-lens");
+  const previous = picker.value;
+  picker.textContent = "";
+  for (const lens of state.lenses || []) {
+    const option = document.createElement("option");
+    option.value = lens.id;
+    option.textContent = lens.name;
+    picker.append(option);
+  }
+  const active = state.activeView && state.activeView.kind === "lens" ? state.activeView.lensId : "";
+  if ([...picker.options].some((option) => option.value === previous)) picker.value = previous;
+  else if (active) picker.value = active;
+  const available = typeof windowId === "number" && picker.options.length > 0;
+  picker.disabled = !available || timedFocusPending;
+  el("timed-focus-start").disabled = !available || timedFocusPending;
+  el("timed-focus-minutes").disabled = !available || timedFocusPending;
+  const session = state.timedSession;
+  el("timed-focus-cancel").hidden = !session;
+  el("timed-focus-cancel").disabled = typeof windowId !== "number" || timedFocusPending;
+  el("timed-focus-status").textContent = session
+    ? `${(state.lenses || []).find((lens) => lens.id === session.lensId)?.name || "Lens"} · ends ${new Date(session.endsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+    : available ? "Returns to the previous view when the timer ends." : "Save a lens to start timed focus.";
+}
+
+async function startTimedFocus() {
+  const input = el("timed-focus-minutes");
+  const minutes = Number(input.value);
+  const lensId = el("timed-focus-lens").value;
+  if (typeof windowId !== "number" || !lensId || timedFocusPending) return;
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 240) {
+    setLensStatus("Enter a whole duration from 1 to 240 minutes.", "error");
+    input.focus();
+    return;
+  }
+  await changeTimedFocus({ type: "lens-timed-start", lensId, minutes });
+}
+
+async function changeTimedFocus(message) {
+  if (typeof windowId !== "number" || timedFocusPending) return;
+  timedFocusPending = true;
+  renderTimedFocus(lensState || {});
+  setLensStatus(message.type === "lens-timed-start" ? "Starting timed focus…" : "Canceling timed focus…");
+  try {
+    const result = await send(message);
+    if (!result || result.ok !== true) throw new Error(result && result.error || "message_failed");
+    await refreshLensState();
+    setLensStatus(message.type === "lens-timed-start" ? "Timed focus started." : "Timed focus canceled.", "ok");
+  } catch (error) {
+    setLensStatus(`Could not change timed focus: ${error.message}.`, "error");
+  } finally {
+    timedFocusPending = false;
+    renderTimedFocus(lensState || {});
+  }
+}
+
+async function suggestLens() {
+  if (typeof windowId !== "number" || suggestionPending) return;
+  suggestionPending = true;
+  el("ai-suggest-lens").disabled = true;
+  setStatus("Suggesting a lens…");
+  try {
+    const result = await send({ type: "ai-lens-suggest" });
+    if (!result || result.ok !== true || !result.proposal || !Array.isArray(result.proposal.groupTitles)) {
+      throw new Error(result && (result.message || result.error) || "No suggestion available");
+    }
+    el("ai-lens-name").value = result.proposal.name;
+    el("ai-lens-titles").value = result.proposal.groupTitles.join("\n");
+    el("ai-lens-preview").hidden = false;
+    setStatus("Edit the name and group titles, then save the lens.", "ok");
+    el("ai-lens-name").focus();
+  } catch (error) {
+    setStatus(`Could not suggest a lens: ${error.message}.`, "error");
+  } finally {
+    suggestionPending = false;
+    el("ai-suggest-lens").disabled = typeof windowId !== "number" || !el("ai-enabled").checked;
+  }
+}
+
+async function saveSuggestedLens() {
+  if (typeof windowId !== "number" || suggestionPending) return;
+  const name = el("ai-lens-name").value.trim();
+  const groupTitles = [...new Set(el("ai-lens-titles").value.split("\n").map((title) => title.trim()).filter(Boolean))];
+  if (!name || groupTitles.length === 0) {
+    setStatus("Enter a lens name and at least one group title.", "error");
+    return;
+  }
+  suggestionPending = true;
+  el("ai-lens-save").disabled = true;
+  setStatus("Saving suggested lens…");
+  try {
+    const code = JSON.stringify({ tabloupeLens: 1, lens: {
+      name, icon: "target", color: null, groupSelectors: groupTitles.map((value) => ({ type: "title", value })),
+    } });
+    const result = await send({ type: "lens-import", code });
+    if (!result || result.ok !== true) throw new Error(result && result.error || "message_failed");
+    el("ai-lens-preview").hidden = true;
+    await refreshLensState();
+    setStatus("Suggested lens saved.", "ok");
+  } catch (error) {
+    setStatus(`Could not save suggested lens: ${error.message}.`, "error");
+  } finally {
+    suggestionPending = false;
+    el("ai-lens-save").disabled = false;
+  }
+}
+
 function renderProposal(groups) {
   const container = el("ai-groups");
   container.textContent = "";
@@ -139,6 +249,8 @@ function renderDisabled() {
   proposal = null;
   el("ai-groups").hidden = true;
   el("ai-summary").textContent = "Turn on AI tab grouping to organize this window's tabs into topics.";
+  el("ai-suggest-lens").disabled = true;
+  el("ai-include-existing").disabled = true;
   setStatus("");
   showButtons({});
 }
@@ -147,11 +259,12 @@ function renderIdle(groupableCount) {
   proposal = null;
   el("ai-groups").hidden = true;
   setStatus("");
+  const includeExisting = el("ai-include-existing").checked;
   if (groupableCount >= 2) {
-    el("ai-summary").textContent = `${groupableCount} ungrouped tabs in this window.`;
+    el("ai-summary").textContent = `${groupableCount} ${includeExisting ? "web" : "ungrouped"} tabs in this window.`;
     showButtons({ organize: true });
   } else {
-    el("ai-summary").textContent = `Only ${groupableCount} groupable tab${groupableCount === 1 ? "" : "s"}. Open at least 2 ungrouped web tabs.`;
+    el("ai-summary").textContent = `Only ${groupableCount} groupable tab${groupableCount === 1 ? "" : "s"}. Open at least 2 web tabs${includeExisting ? "." : ", or include existing groups."}`;
     showButtons({});
   }
   setActionsDisabled(false);
@@ -200,6 +313,11 @@ const WINDOW_SCOPED_MESSAGES = new Set([
   "ai-group-preview",
   "ai-group-apply",
   "ai-group-clear",
+  "ai-lens-suggest",
+  "lens-snapshot-save",
+  "lens-snapshot-restore",
+  "lens-timed-start",
+  "lens-timed-cancel",
 ]);
 
 function isWindowScoped(message) {
@@ -409,6 +527,7 @@ function renderLensState(state) {
   renderLensChips(lensState);
   renderCurrentGroups(lensState);
   renderWindowProfile(lensState);
+  renderTimedFocus(lensState);
   const empty = !lensState.hasGroups && (lensState.lenses || []).length === 0;
   el("empty-state").hidden = !empty;
   setLensStatus("");
@@ -496,7 +615,7 @@ async function runPreview() {
 
   let result;
   try {
-    result = await send({ type: "ai-group-preview" });
+    result = await send({ type: "ai-group-preview", includeExistingGroups: el("ai-include-existing").checked });
   } catch (error) {
     console.error("AI preview failed:", error);
     setStatus("Could not reach the background service.", "error");
@@ -511,8 +630,9 @@ async function runPreview() {
   }
 
   proposal = result.groups;
+  proposalIncludesExisting = result.includeExistingGroups === true;
   renderProposal(proposal);
-  setStatus(`Proposed ${proposal.length} group${proposal.length === 1 ? "" : "s"}. Review, then apply.`, "ok");
+  setStatus(`Proposed ${proposal.length} group${proposal.length === 1 ? "" : "s"}${proposalIncludesExisting ? ", including existing groups" : ""}. Review, then apply.`, "ok");
 }
 
 async function applyGroups() {
@@ -524,7 +644,7 @@ async function applyGroups() {
 
   let result;
   try {
-    result = await send({ type: "ai-group-apply", groups: proposal });
+    result = await send({ type: "ai-group-apply", groups: proposal, includeExistingGroups: proposalIncludesExisting });
   } catch (error) {
     console.error("AI apply failed:", error);
     setStatus("Apply failed. See extension console.", "error");
@@ -559,7 +679,7 @@ async function dismiss() {
 async function refreshAi({ autoPreview = false } = {}) {
   let state;
   try {
-    state = await send({ type: "ai-group-state" });
+    state = await send({ type: "ai-group-state", includeExistingGroups: el("ai-include-existing").checked });
   } catch (error) {
     console.error("AI state failed:", error);
     setStatus("Could not reach the background service.", "error");
@@ -579,6 +699,8 @@ async function refreshAi({ autoPreview = false } = {}) {
     return;
   }
   renderAuto(state, autoStored.aiAutoGroup === true);
+  el("ai-suggest-lens").disabled = state.enabled !== true || typeof windowId !== "number" || suggestionPending;
+  el("ai-include-existing").disabled = state.enabled !== true || typeof windowId !== "number";
 
   if (state.enabled !== true) {
     renderDisabled();
@@ -587,8 +709,9 @@ async function refreshAi({ autoPreview = false } = {}) {
 
   if (Array.isArray(state.proposal) && state.proposal.length > 0) {
     proposal = state.proposal;
+    proposalIncludesExisting = state.cachedProposalMode === true;
     renderProposal(proposal);
-    setStatus(`Proposed ${proposal.length} group${proposal.length === 1 ? "" : "s"}. Review, then apply.`, "ok");
+    setStatus(`Proposed ${proposal.length} group${proposal.length === 1 ? "" : "s"}${proposalIncludesExisting ? ", including existing groups" : ""}. Review, then apply.`, "ok");
     return;
   }
 
@@ -676,6 +799,10 @@ async function ensureAiInitialized() {
     saveAiPreference(event, "aiAutoGroup");
   });
   el("ai-organize").addEventListener("click", runPreview);
+  el("ai-include-existing").addEventListener("change", () => refreshAi({ autoPreview: false }));
+  el("ai-suggest-lens").addEventListener("click", suggestLens);
+  el("ai-lens-save").addEventListener("click", saveSuggestedLens);
+  el("ai-lens-dismiss").addEventListener("click", () => { el("ai-lens-preview").hidden = true; });
   el("ai-regroup").addEventListener("click", runPreview);
   el("ai-apply").addEventListener("click", applyGroups);
   el("ai-dismiss").addEventListener("click", dismiss);
@@ -697,6 +824,13 @@ async function init() {
 
   el("lens-show-all").addEventListener("click", () => activateView({ kind: "all" }));
   el("lens-save-window").addEventListener("click", saveWindowAsLens);
+  el("timed-focus-start").addEventListener("click", startTimedFocus);
+  el("timed-focus-cancel").addEventListener("click", () => changeTimedFocus({ type: "lens-timed-cancel" }));
+  if (browser.storage.onChanged && browser.storage.onChanged.addListener) {
+    browser.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && (changes.timedLensSession || changes.activeView || changes.lenses)) refreshLensState();
+    });
+  }
   el("window-profile").addEventListener("change", (event) => {
     const select = event.target;
     const previous = windowProfileSelectValue(lensState && lensState.windowProfile);
@@ -722,7 +856,7 @@ async function init() {
     // Window-scoped actions would silently span every window; disable them and
     // say so instead of producing a lens from unrelated groups. Runs after the
     // first render, which clears the status line.
-    for (const id of ["lens-save-window", "window-profile", "open-ai", "empty-organize"]) {
+    for (const id of ["lens-save-window", "window-profile", "open-ai", "empty-organize", "timed-focus-start", "timed-focus-cancel"]) {
       const node = el(id);
       if (node) node.disabled = true;
     }

@@ -66,6 +66,7 @@ const state = {
   windowId: undefined,
   lenses: [],
   activeView: { kind: "all" },
+  historyActiveView: { kind: "all" },
   lastActivation: null,
   legacyFocusMappingsBackup: null,
   seenFocusIds: {},
@@ -113,6 +114,57 @@ let statusUndoTimer = null;
 const expandedLensRows = new Set();
 const untouchedDefaultLensIds = new Set();
 const userNamedLensIds = new Set();
+const snapshotSummaries = new Map();
+const snapshotActions = new Map();
+const SELECTOR_TYPES = new Set(["title", "glob", "container", "color", "regex", "urlHost"]);
+const GROUP_COLORS = ["blue", "cyan", "green", "orange", "pink", "purple", "red", "yellow", "grey"];
+
+function selectorValidationError(type, value) {
+  if (!SELECTOR_TYPES.has(type)) return "Choose a selector type.";
+  if (!value && type !== "title") return "Enter a selector value.";
+  if (type === "color" && !GROUP_COLORS.includes(value.toLowerCase())) {
+    return `Choose a group color: ${GROUP_COLORS.join(", ")}.`;
+  }
+  if (type === "urlHost") {
+    if (/[\/\\:@?#\s]/.test(value)) return "Enter a hostname without a URL path, port, or wildcard.";
+    try {
+      const url = new URL(`https://${value}`);
+      if (url.hostname.toLowerCase() !== value.toLowerCase() || url.port || url.username || url.password) {
+        return "Enter an exact hostname, without a URL path, port, or wildcard.";
+      }
+    } catch (error) {
+      return "Enter an exact hostname, such as github.com.";
+    }
+  }
+  if (type === "regex") {
+    if (value.length > 128) return "Limit the regular expression to 128 characters.";
+    // Keep the same restricted grammar as the background. At most one .*
+    // prevents multiple unbounded scans; other quantifiers are not supported.
+    let wildcard = false;
+    let inClass = false;
+    for (let i = 0; i < value.length; i += 1) {
+      const char = value[i];
+      if (char === "\\") {
+        const escaped = value[++i];
+        if (!escaped || !/^[dDsSwWbB\\.^$[\]{}()*+?|/-]$/.test(escaped)) return "Unsupported regular expression escape.";
+        continue;
+      }
+      if (char === "[" && !inClass) { inClass = true; continue; }
+      if (char === "]" && inClass) { inClass = false; continue; }
+      if (inClass) continue;
+      if (char === "." && value[i + 1] === "*") {
+        if (wildcard) return "Use at most one .*; other repetition is not supported.";
+        wildcard = true;
+        i += 1;
+      } else if ("(){}|*+?".includes(char)) {
+        return "Use literals, character classes, anchors, or one .* only.";
+      }
+    }
+    if (inClass) return "Close the character class with ].";
+    try { new RegExp(value); } catch (error) { return "Enter a valid regular expression."; }
+  }
+  return "";
+}
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -129,11 +181,10 @@ function normalizeSelector(value) {
   if (!isRecord(value)) {
     return null;
   }
-  const type = value.type === "glob" ? "glob" : value.type === "title" ? "title" : value.type === "container" ? "container" : null;
-  const selectorValue = typeof value.value === "string" ? value.value.trim() : "";
-  if (!type || typeof value.value !== "string" || (!selectorValue && type !== "title")) {
-    return null;
-  }
+  const type = SELECTOR_TYPES.has(value.type) ? value.type : null;
+  let selectorValue = typeof value.value === "string" ? value.value.trim() : "";
+  if (!type || typeof value.value !== "string" || selectorValidationError(type, selectorValue)) return null;
+  if (type === "color" || type === "urlHost") selectorValue = selectorValue.toLowerCase();
   return { type, value: selectorValue };
 }
 
@@ -202,7 +253,7 @@ function normalizeFocusSessionHistory(value) {
     endedAt: typeof entry.endedAt === "number" ? entry.endedAt : null,
     expandedGroups: normalizeStringArray(entry.expandedGroups),
     collapsedGroups: normalizeStringArray(entry.collapsedGroups),
-  })).filter((entry) => entry.startedAt && entry.endedAt) : [];
+  })).filter((entry) => Number.isFinite(entry.startedAt) && Number.isFinite(entry.endedAt) && entry.endedAt >= entry.startedAt) : [];
 }
 
 function normalizeSeen(value) {
@@ -239,6 +290,7 @@ function normalizeCurrentGroups(value) {
     .map((group) => ({
       title: group.title,
       color: typeof group.color === "string" ? group.color : null,
+      urlHosts: Array.isArray(group.urlHosts) ? normalizeStringArray(group.urlHosts) : null,
       savedIn: Array.isArray(group.savedIn) ? normalizeStringArray(group.savedIn) : null,
       active: Boolean(group.active),
     }));
@@ -587,6 +639,7 @@ function mergeLensStateSummaries(lensSummaries) {
     if (typeof summary.color === "string" && summary.color.trim()) {
       existing.color = summary.color.trim();
     }
+    snapshotSummaries.set(summary.id, isRecord(summary.snapshot) ? summary.snapshot : null);
     if (summary.active) {
       state.activeView = { kind: "lens", lensId: summary.id };
     }
@@ -631,6 +684,7 @@ async function commitLoadedState({ stored, firefoxSnapshot, lensState, container
   };
   applyStored("lenses", normalizeLenses(stored.lenses));
   applyStored("activeView", isRecord(stored.activeView) ? stored.activeView : { kind: "all" });
+  if (!changedKeys.has("activeView")) state.historyActiveView = state.activeView;
   applyStored("lastActivation", isRecord(stored.lastActivation) ? stored.lastActivation : null);
   applyStored("legacyFocusMappingsBackup", isRecord(stored.legacyFocusMappingsBackup) ? stored.legacyFocusMappingsBackup : null);
   applyStored("seenFocusIds", normalizeSeen(stored.seenFocusIds));
@@ -920,20 +974,115 @@ function closeLensImport() {
 async function addLensFromCode() {
   const input = document.getElementById("lens-import-code");
   const code = input ? input.value : "";
+  const button = document.getElementById("lens-import-add");
+  if (button) button.disabled = true;
+  try {
+    if (await importPortableLenses(code)) {
+      if (input) input.value = "";
+      setLensImportVisible(false);
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function importPortableLenses(code) {
   const result = await sendToBackground({ type: "lens-import", code });
-  if (!result || result.ok !== true) {
-    showToast("Not a valid lens code.", "error");
-    return;
+  const imported = result && Array.isArray(result.lenses) ? result.lenses : result && result.lens ? [result.lens] : [];
+  if (!result || result.ok !== true || imported.length === 0) {
+    showToast(`Could not import lenses${result && result.error ? `: ${result.error}` : "."}`, "error");
+    return false;
   }
-  if (input) {
-    input.value = "";
-  }
-  setLensImportVisible(false);
-  const merged = state.lenses.filter((lens) => lens.id !== result.lens.id);
-  merged.push(result.lens);
-  state.lenses = normalizeLenses(merged);
+  const ids = new Set(imported.map((lens) => lens.id));
+  state.lenses = normalizeLenses([...state.lenses.filter((lens) => !ids.has(lens.id)), ...imported]);
   render();
-  showToast("Lens added.", "ok");
+  showToast(`${imported.length} lens${imported.length === 1 ? "" : "es"} added.`, "ok");
+  return true;
+}
+
+function sharePayloadForPack(lenses) {
+  return { tabloupeLensPack: 1, lenses: lenses.map((lens) => sharePayloadForLens(lens).lens) };
+}
+
+async function exportLensPack() {
+  const code = JSON.stringify(sharePayloadForPack(state.lenses));
+  try {
+    await navigator.clipboard.writeText(code);
+    showToast("Lens pack copied to clipboard.", "ok");
+  } catch (error) {
+    setLensImportVisible(true);
+    showLensShareFallback(code);
+  }
+}
+
+const STARTER_LENSES = {
+  Developer: { name: "Developer", icon: "terminal", color: "#0060df", groupSelectors: [
+    { type: "urlHost", value: "github.com" }, { type: "urlHost", value: "stackoverflow.com" }, { type: "glob", value: "*Dev*" },
+  ] },
+  Researcher: { name: "Researcher", icon: "book", color: "#7c5cff", groupSelectors: [
+    { type: "urlHost", value: "scholar.google.com" }, { type: "urlHost", value: "arxiv.org" }, { type: "glob", value: "*Research*" },
+  ] },
+  Shopping: { name: "Shopping", icon: "cart", color: "#ff9400", groupSelectors: [
+    { type: "urlHost", value: "www.amazon.com" }, { type: "urlHost", value: "www.ebay.com" }, { type: "glob", value: "*Shop*" },
+  ] },
+};
+
+async function importStarterLens() {
+  const picker = document.getElementById("lens-template");
+  const button = document.getElementById("lens-template-add");
+  const template = picker && STARTER_LENSES[picker.value];
+  if (!template) return;
+  button.disabled = true;
+  try {
+    await importPortableLenses(JSON.stringify({ tabloupeLensPack: 1, lenses: [template] }));
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function makeSnapshotControls(lens) {
+  const row = document.createElement("div");
+  row.className = "snapshot-controls";
+  const summary = snapshotSummaries.get(lens.id);
+  const action = snapshotActions.get(lens.id);
+  const status = document.createElement("span");
+  status.className = `snapshot-status${action && action.error ? " error" : ""}`;
+  status.setAttribute("role", "status");
+  status.textContent = action ? action.message : summary
+    ? `${summary.tabCount} saved tabs · ${new Date(summary.at).toLocaleString()}`
+    : "No saved snapshot.";
+  for (const [type, label] of [["lens-snapshot-save", "Save snapshot"], ["lens-snapshot-restore", "Restore snapshot"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    button.textContent = label;
+    button.setAttribute("aria-label", `${label} for ${lens.name}`);
+    button.disabled = typeof state.windowId !== "number" || Boolean(action && action.pending) ||
+      (type === "lens-snapshot-restore" && !summary);
+    button.addEventListener("click", () => runSnapshotAction(lens.id, type));
+    row.append(button);
+  }
+  if (typeof state.windowId !== "number") status.textContent = "Cannot identify this window. Reload to use snapshots.";
+  row.append(status);
+  return row;
+}
+
+async function runSnapshotAction(lensId, type) {
+  if (typeof state.windowId !== "number" || snapshotActions.get(lensId)?.pending) return;
+  snapshotActions.set(lensId, { pending: true, message: type === "lens-snapshot-save" ? "Saving snapshot…" : "Restoring snapshot…" });
+  render();
+  const result = await sendToBackground({ type, lensId, windowId: state.windowId });
+  if (!result || result.ok !== true) {
+    const partial = result && typeof result.restored === "number" ? ` Restored ${result.restored}; skipped ${result.skipped}.` : "";
+    snapshotActions.set(lensId, { error: true, message: `Snapshot failed: ${result && result.error || "message_failed"}.${partial}` });
+  } else if (type === "lens-snapshot-save") {
+    snapshotSummaries.set(lensId, { at: result.snapshot.at, tabCount: result.snapshot.tabs.length });
+    snapshotActions.set(lensId, { message: `${result.snapshot.tabs.length} tabs saved.` });
+  } else {
+    snapshotActions.set(lensId, { message: `Restored ${result.restored} tabs; skipped ${result.skipped}.` });
+    await refreshLensState();
+  }
+  render();
 }
 
 function selectorKey(selector) {
@@ -993,20 +1142,18 @@ function replaceLensInState(lensId, patch) {
 }
 
 async function persistLensPatch(lensId, patch, statusMessage = "Saved") {
-  const next = replaceLensInState(lensId, patch);
-  if (!next) {
+  if (!findLens(lensId)) {
     setStatus("Lens not found.", "error");
     return null;
   }
-  render();
   const result = await sendToBackground({ type: "lens-update", lensId, patch });
   if (!result || result.ok !== true) {
-    // The background rejected the edit; revert the optimistic UI to the
-    // authoritative stored state instead of falsely reporting success.
     await reloadLensesFromStorage();
     setStatus("Save failed. Please try again.", "error");
     return null;
   }
+  const next = replaceLensInState(lensId, patch);
+  render();
   setStatus(statusMessage, "ok");
   return next;
 }
@@ -1030,13 +1177,8 @@ function selectorFromTypedInput(type, value) {
   if (!trimmed) {
     return null;
   }
-  if (type === "container") {
-    return { type: "container", value: trimmed };
-  }
-  if (type === "glob") {
-    return { type: "glob", value: trimmed };
-  }
-  return selectorFromText(trimmed);
+  if (type === "title") return selectorFromText(trimmed);
+  return normalizeSelector({ type, value: trimmed });
 }
 
 function addSelectorToLens(lensId, selector) {
@@ -1115,6 +1257,9 @@ function selectorMatchesTitle(selector, title) {
   if (selector.type === "glob") {
     return globToRegExp(selector.value).test(title);
   }
+  if (selector.type === "regex") {
+    return !selectorValidationError("regex", selector.value) && new RegExp(selector.value).test(title.slice(0, 512));
+  }
   return false;
 }
 
@@ -1126,9 +1271,13 @@ function selectorMatchCount(selector) {
     const target = selector.value.toLowerCase();
     return state.containerNames.some((name) => name.toLowerCase() === target) ? 1 : 0;
   }
-  const regex = globToRegExp(selector.value);
+  if (selector.type === "color") return state.currentGroups.filter((group) => group.color === selector.value).length;
+  if (selector.type === "urlHost") {
+    if (state.currentGroups.some((group) => !Array.isArray(group.urlHosts))) return null;
+    return state.currentGroups.filter((group) => group.urlHosts.some((host) => host.toLowerCase() === selector.value)).length;
+  }
   return Object.entries(state.firefoxGroupTitleCounts).reduce((count, [title, titleCount]) => {
-    return regex.test(title) ? count + titleCount : count;
+    return selectorMatchesTitle(selector, title) ? count + titleCount : count;
   }, 0);
 }
 
@@ -1141,18 +1290,18 @@ function makeChip(lensId, selector) {
   label.textContent = selector.value || "Untitled group";
   chip.append(label);
 
-  if (selector.type === "glob" || selector.type === "container") {
+  if (selector.type !== "title") {
     const badge = document.createElement("span");
     badge.className = "group-chip-badge";
-    badge.textContent = selector.type === "container" ? "container" : "pattern";
+    badge.textContent = selector.type === "glob" ? "pattern" : selector.type === "urlHost" ? "host" : selector.type;
     chip.append(badge);
   }
-  if (count === 0) {
+  if (count === 0 || count === null) {
     const meta = document.createElement("span");
     meta.className = "group-chip-meta";
-    meta.textContent = "no match";
+    meta.textContent = count === null ? "checked on activation" : "no match";
     chip.append(meta);
-  } else if (selector.type === "glob") {
+  } else if (selector.type !== "title") {
     const meta = document.createElement("span");
     meta.className = "group-chip-meta";
     meta.textContent = `matches ${count}`;
@@ -1789,7 +1938,7 @@ function makeCalendarPatternEditor(lens) {
   chips.append(input);
   const hint = document.createElement("p");
   hint.className = "field-hint";
-  hint.textContent = "Activates this lens while a matching calendar event is running (requires the macOS helper with calendar enabled). Glob patterns match event titles.";
+  hint.textContent = "Activates this lens while a matching calendar event is running. Configure calendar subscriptions below, or enable calendar events in the optional macOS helper. Glob patterns match event titles.";
   wrap.append(heading, chips, hint);
   return wrap;
 }
@@ -1933,6 +2082,9 @@ function renderLensCard(lens, index) {
     ["title", "Group"],
     ["glob", "Pattern"],
     ["container", "Container"],
+    ["color", "Color"],
+    ["regex", "Regex"],
+    ["urlHost", "URL host"],
   ]) {
     const element = document.createElement("option");
     element.value = option[0];
@@ -1946,20 +2098,44 @@ function renderLensCard(lens, index) {
   input.autocomplete = "off";
   input.setAttribute("aria-label", `Add a selector to ${lens.name}`);
   input.placeholder = "+ add group\u2026";
+  const validation = document.createElement("p");
+  validation.className = "selector-validation";
+  validation.id = `selector-validation-${index}`;
+  validation.setAttribute("role", "status");
+  input.setAttribute("aria-describedby", validation.id);
   const updateSelectorInput = () => {
+    input.setCustomValidity("");
+    validation.textContent = "";
+    input.removeAttribute("aria-invalid");
     if (typeSelect.value === "container") {
       input.setAttribute("list", containerListId);
       input.placeholder = "+ add container\u2026";
-    } else {
+    } else if (typeSelect.value === "title" || typeSelect.value === "glob") {
       input.setAttribute("list", groupListId);
       input.placeholder = typeSelect.value === "glob" ? "+ add pattern\u2026" : "+ add group\u2026";
+    } else {
+      input.removeAttribute("list");
+      input.placeholder = { color: "blue", regex: "^Client .*", urlHost: "github.com" }[typeSelect.value];
     }
+    input.maxLength = typeSelect.value === "regex" ? 128 : 512;
   };
   typeSelect.addEventListener("change", updateSelectorInput);
+  input.addEventListener("input", () => {
+    input.setCustomValidity("");
+    input.removeAttribute("aria-invalid");
+    validation.textContent = "";
+  });
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
       const selector = selectorFromTypedInput(typeSelect.value, input.value);
+      const error = selectorValidationError(typeSelect.value, input.value.trim());
+      if (error) {
+        input.setCustomValidity(error);
+        input.setAttribute("aria-invalid", "true");
+        validation.textContent = error;
+        return;
+      }
       if (selector) {
         addSelectorToLens(lens.id, selector);
       }
@@ -1970,6 +2146,7 @@ function renderLensCard(lens, index) {
   });
   chips.append(typeSelect, input);
   selectorSection.append(selectorHeading, chips);
+  selectorSection.append(validation);
   selectorSection.append(makeRowDatalist(groupListId, lensSelectorValues(lens, "title")));
   selectorSection.append(makeContainerDatalist(containerListId, lensSelectorValues(lens, "container")));
 
@@ -1978,10 +2155,11 @@ function renderLensCard(lens, index) {
   panel.hidden = !optionsOpen;
   const hint = document.createElement("p");
   hint.className = "pattern-hint";
-  hint.textContent = "* = any text, ? = one character, e.g. Client *";
+  hint.textContent = "Patterns: * = any text, ? = one character. Regex: up to 128 characters; literals, classes, anchors, or one .* only. URL host matches an exact hostname.";
   panel.append(hint, makeLensStyleEditor(lens), makeScheduleEditor(lens), makeCalendarPatternEditor(lens));
   selectorSection.append(panel);
   card.append(selectorSection);
+  card.append(makeSnapshotControls(lens));
 
   optionsBtn.addEventListener("click", () => {
     const open = !expandedLensRows.has(lens.id);
@@ -2387,7 +2565,131 @@ function viewName(view) {
   return "View";
 }
 
+function usageDateKey(timestamp) {
+  const date = new Date(timestamp);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function usageWeekKey(timestamp) {
+  const date = new Date(timestamp);
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() - (date.getDay() + 6) % 7);
+  return usageDateKey(date.getTime());
+}
+
+function aggregateUsageInsights(history, activeView, lastActivation, now = Date.now()) {
+  const result = { totalMs: 0, sessionCount: 0, ongoing: false, perLens: [], perTrigger: [], perDay: [], perWeek: [] };
+  if (!Number.isFinite(now)) return result;
+  const entries = normalizeFocusSessionHistory(history).map((entry) => ({ ...entry, endedAt: Math.min(entry.endedAt, now) }));
+  if (isRecord(lastActivation) && Number.isFinite(lastActivation.at) && lastActivation.at <= now && isRecord(activeView)) {
+    const completedUntil = entries.reduce((end, entry) => Math.max(end, entry.endedAt >= entry.startedAt ? entry.endedAt : 0), 0);
+    entries.push({ view: activeView, trigger: lastActivation.trigger || "manual", startedAt: Math.max(lastActivation.at, completedUntil), endedAt: now, ongoing: true });
+  }
+  entries.sort((a, b) => a.startedAt - b.startedAt || a.endedAt - b.endedAt || Number(Boolean(a.ongoing)) - Number(Boolean(b.ongoing)));
+  const lenses = new Map();
+  const triggers = new Map();
+  const days = new Map();
+  const weeks = new Map();
+  const add = (map, key, ms, count, extra = {}) => {
+    const bucket = map.get(key) || { key, totalMs: 0, count: 0, ...extra };
+    bucket.totalMs += ms;
+    bucket.count += count;
+    map.set(key, bucket);
+  };
+  // One global active view means overlapping stored intervals must count once.
+  let coveredUntil = -Infinity;
+  for (const entry of entries) {
+    const start = Math.max(0, entry.startedAt, coveredUntil);
+    const end = entry.endedAt;
+    if (end <= start) continue;
+    coveredUntil = end;
+    const duration = end - start;
+    result.totalMs += duration;
+    result.sessionCount += 1;
+    result.ongoing ||= Boolean(entry.ongoing);
+    const view = entry.view;
+    const key = view.kind === "lens" ? `lens:${view.lensId}` : view.kind === "all" ? "all" : `view:${view.label || view.kind}`;
+    add(lenses, key, duration, 1, { view });
+    add(triggers, entry.trigger, duration, 1);
+    let cursor = start;
+    while (cursor < end) {
+      const nextDay = new Date(cursor);
+      nextDay.setHours(24, 0, 0, 0);
+      const boundary = Math.min(end, nextDay.getTime());
+      add(days, usageDateKey(cursor), boundary - cursor, cursor === start ? 1 : 0);
+      add(weeks, usageWeekKey(cursor), boundary - cursor, cursor === start ? 1 : 0);
+      cursor = boundary;
+    }
+  }
+  result.perLens = [...lenses.values()].sort((a, b) => b.totalMs - a.totalMs);
+  result.perTrigger = [...triggers.values()].sort((a, b) => b.totalMs - a.totalMs);
+  result.perDay = [...days.values()].sort((a, b) => a.key.localeCompare(b.key));
+  result.perWeek = [...weeks.values()].sort((a, b) => a.key.localeCompare(b.key));
+  return result;
+}
+
+function formatUsageDuration(ms) {
+  const minutes = Math.floor(Math.max(0, ms) / 60000);
+  if (minutes === 0) return "<1 min";
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)}h ${minutes % 60} min`;
+}
+
+function renderUsageInsights() {
+  const container = document.getElementById("usage-insights");
+  if (!container) return;
+  container.textContent = "";
+  const insights = aggregateUsageInsights(state.focusSessionHistory, state.historyActiveView, state.lastActivation);
+  const heading = document.createElement("h3");
+  heading.textContent = "Usage insights";
+  const summary = document.createElement("p");
+  summary.className = "summary";
+  summary.textContent = insights.totalMs > 0
+    ? `${formatUsageDuration(insights.totalMs)} total · ${insights.sessionCount} sessions${insights.ongoing ? " · includes the current session" : ""}`
+    : "No focus time recorded yet.";
+  container.append(heading, summary);
+  const manualMs = insights.perTrigger.filter((entry) => entry.key === "manual" || entry.key === "timed").reduce((sum, entry) => sum + entry.totalMs, 0);
+  if (insights.totalMs > 0) {
+    const share = document.createElement("p");
+    share.className = "muted";
+    share.textContent = `Manual and timed: ${Math.round(manualMs / insights.totalMs * 100)}% · Automation: ${Math.round((insights.totalMs - manualMs) / insights.totalMs * 100)}%`;
+    container.append(share);
+  }
+  const grid = document.createElement("div");
+  grid.className = "insights-grid";
+  for (const [title, rows, label] of [
+    ["Time per lens", insights.perLens, (row) => viewName(row.view)],
+    ["Trigger source", insights.perTrigger, (row) => row.key],
+    ["Daily trend", insights.perDay.slice(-14), (row) => row.key],
+    ["Weekly trend", insights.perWeek.slice(-8), (row) => `Week of ${row.key}`],
+  ]) {
+    const section = document.createElement("section");
+    const caption = document.createElement("h4");
+    caption.textContent = title;
+    const list = document.createElement("ul");
+    list.className = "insights-list";
+    const maxMs = Math.max(1, ...rows.map((row) => row.totalMs));
+    for (const row of rows) {
+      const item = document.createElement("li");
+      const text = document.createElement("span");
+      text.textContent = `${label(row)} · ${formatUsageDuration(row.totalMs)} · ${row.count} starts`;
+      const bar = document.createElement("progress");
+      bar.max = maxMs;
+      bar.value = row.totalMs;
+      bar.setAttribute("aria-label", `${label(row)}: ${formatUsageDuration(row.totalMs)}`);
+      item.append(text, bar);
+      list.append(item);
+    }
+    section.append(caption, list);
+    grid.append(section);
+  }
+  const note = document.createElement("p");
+  note.className = "muted";
+  note.textContent = "Stored history only. Daily totals use local time; weeks start on Monday. Each interval counts once.";
+  container.append(grid, note);
+}
+
 function renderActivity() {
+  renderUsageInsights();
   const summary = document.getElementById("activity-summary");
   const list = document.getElementById("activity-list");
   if (!summary || !list) return;
@@ -2397,13 +2699,10 @@ function renderActivity() {
     summary.textContent = "No sessions yet.";
     return;
   }
-  const totalMs = state.focusSessionHistory.reduce((sum, entry) => sum + Math.max(0, entry.endedAt - entry.startedAt), 0);
-  const totalMinutes = Math.round(totalMs / 60000);
-  summary.textContent = `${state.focusSessionHistory.length} session${state.focusSessionHistory.length === 1 ? "" : "s"} recorded, ${totalMinutes < 60 ? `${totalMinutes} min` : `${Math.round(totalMinutes / 60)}h`} total.`;
+  summary.textContent = `${state.focusSessionHistory.length} completed session${state.focusSessionHistory.length === 1 ? "" : "s"} recorded.`;
   for (const session of sessions) {
     const item = document.createElement("li");
-    const minutes = Math.max(1, Math.round((session.endedAt - session.startedAt) / 60000));
-    item.textContent = `${viewName(session.view)} — ${minutes} min via ${session.trigger}`;
+    item.textContent = `${viewName(session.view)} — ${formatUsageDuration(session.endedAt - session.startedAt)} via ${session.trigger}`;
     list.append(item);
   }
 }
@@ -2982,8 +3281,20 @@ function applyStorageChange(changes) {
     state.lenses = normalizeLenses(changes.lenses.newValue);
     syncUntouchedDefaultLenses();
   }
+  if (changes.lensTabSnapshots) {
+    snapshotSummaries.clear();
+    const snapshots = changes.lensTabSnapshots.newValue;
+    if (isRecord(snapshots)) {
+      for (const [lensId, snapshot] of Object.entries(snapshots)) {
+        if (isRecord(snapshot) && Number.isFinite(snapshot.at) && Array.isArray(snapshot.tabs)) {
+          snapshotSummaries.set(lensId, { at: snapshot.at, tabCount: snapshot.tabs.length });
+        }
+      }
+    }
+  }
   if (changes.activeView) {
     state.activeView = isRecord(changes.activeView.newValue) ? changes.activeView.newValue : { kind: "all" };
+    state.historyActiveView = state.activeView;
   }
   if (changes.lastActivation) {
     state.lastActivation = isRecord(changes.lastActivation.newValue) ? changes.lastActivation.newValue : null;
@@ -3565,6 +3876,8 @@ document.addEventListener("DOMContentLoaded", () => {
   if (importCancel) {
     importCancel.addEventListener("click", closeLensImport);
   }
+  document.getElementById("export-lens-pack").addEventListener("click", exportLensPack);
+  document.getElementById("lens-template-add").addEventListener("click", importStarterLens);
 
 
   const syncLenses = document.getElementById("sync-lenses");

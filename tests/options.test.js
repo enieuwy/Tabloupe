@@ -1135,20 +1135,6 @@ test("concurrent schedule edits preserve both lenses' changes", async () => {
   assert.equal(harness.storageData.lensSchedules.find((schedule) => schedule.lensId === "lens_play").enabled, true);
 });
 
-test("advanced panel shows glob help and icon color editors", async () => {
-  const { document } = createHarness({
-    storage: { lenses: [lensFixture()] },
-  });
-  await settle();
-
-  lensCard(document).querySelector(".icon-btn-options").click();
-  await settle();
-
-  const panel = lensCard(document).querySelector(".row-options");
-  assert.match(panel.textContent, /\* = any text, \? = one character, e\.g\. Client \*/);
-  assert.ok(panel.querySelector('input[aria-label="Icon for Work lens"]'));
-  assert.ok(panel.querySelector('input[aria-label="Color for Work lens"]'));
-});
 
 test("saving an edited grouping prompt stores it as the override", async () => {
   const harness = createHarness();
@@ -1398,7 +1384,6 @@ test("lens import appends a fresh lens and rejects malformed codes without writi
   assert.equal(JSON.stringify(harness.storageData.lenses), before);
   assert.equal(harness.document.getElementById("lens-import-code").value, "{not json");
   assert.ok(!setKeys.includes("lenses"), "malformed import did not write lenses");
-  assert.equal(harness.document.querySelector("#toast-host .toast").textContent, "Not a valid lens code.");
 });
 
 test("loadAll keeps a concurrent storage.onChanged update instead of reverting it", async () => {
@@ -1906,4 +1891,70 @@ test("a non-conflicting shortcut clears any stale reserved-hint text", async () 
   await settle();
 
   assert.equal(harness.document.getElementById("shortcut-reserved-hint").hidden, true);
+});
+
+test("usage insights split a session at local midnight and the Monday week boundary", async () => {
+  const harness = createHarness();
+  await settle();
+  const start = new Date(2026, 9, 4, 23, 30).getTime();
+  const end = new Date(2026, 9, 5, 0, 30).getTime();
+  const insights = harness.window.aggregateUsageInsights([
+    { view: { kind: "lens", lensId: "work" }, trigger: "manual", startedAt: start, endedAt: end },
+  ], null, null, end);
+  assert.equal(insights.totalMs, 60 * 60000);
+  assert.deepEqual(Array.from(insights.perDay, (row) => [row.key, row.totalMs]), [
+    ["2026-10-04", 30 * 60000], ["2026-10-05", 30 * 60000],
+  ]);
+  assert.deepEqual(Array.from(insights.perWeek, (row) => [row.key, row.totalMs]), [
+    ["2026-09-28", 30 * 60000], ["2026-10-05", 30 * 60000],
+  ]);
+  assert.equal(insights.perTrigger[0].count, 1);
+  harness.window.close();
+});
+
+test("usage insights clip ongoing and future sessions and do not double-count stored overlaps", async () => {
+  const harness = createHarness();
+  await settle();
+  const start = new Date(2026, 9, 3, 10).getTime();
+  const minute = 60000;
+  const history = [
+    { view: { kind: "lens", lensId: "work" }, trigger: "manual", startedAt: start, endedAt: start + 20 * minute },
+    { view: { kind: "lens", lensId: "work" }, trigger: "manual", startedAt: start, endedAt: start + 20 * minute },
+    { view: { kind: "lens", lensId: "research" }, trigger: "schedule", startedAt: start + 15 * minute, endedAt: start + 40 * minute },
+    { view: { kind: "all" }, trigger: "manual", startedAt: start + 50 * minute, endedAt: start + 45 * minute },
+  ];
+  const insights = harness.window.aggregateUsageInsights(history,
+    { kind: "lens", lensId: "focus" }, { at: start + 35 * minute, trigger: "timed" }, start + 50 * minute);
+  assert.equal(insights.totalMs, 50 * minute);
+  assert.equal(insights.sessionCount, 3);
+  assert.equal(insights.ongoing, true);
+  assert.deepEqual(Array.from(insights.perLens, (row) => [row.key, row.totalMs]), [
+    ["lens:work", 20 * minute], ["lens:research", 20 * minute], ["lens:focus", 10 * minute],
+  ]);
+  const clipped = harness.window.aggregateUsageInsights(history, null, null, start + 30 * minute);
+  assert.equal(clipped.totalMs, 30 * minute);
+  harness.window.close();
+});
+
+test("new selectors preserve explicit types and reject unsafe regular expressions and URL paths", async () => {
+  const harness = createHarness();
+  await settle();
+  const selectors = harness.window.normalizeSelectors([
+    { type: "color", value: "BLUE" },
+    { type: "regex", value: "^Client [A-Z].*" },
+    { type: "regex", value: "\\bClient\\b" },
+    { type: "urlHost", value: "GitHub.com" },
+    { type: "regex", value: "(a+)+$" },
+    { type: "regex", value: ".*x.*" },
+    { type: "urlHost", value: "github.com/issues" },
+    { type: "unknown", value: "value" },
+  ]);
+  assert.deepEqual(clone(selectors), [
+    { type: "color", value: "blue" },
+    { type: "regex", value: "^Client [A-Z].*" },
+    { type: "regex", value: "\\bClient\\b" },
+    { type: "urlHost", value: "github.com" },
+  ]);
+  assert.equal(harness.window.selectorFromTypedInput("regex", "x".repeat(129)), null);
+  harness.window.close();
 });

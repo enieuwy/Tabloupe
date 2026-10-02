@@ -1034,6 +1034,84 @@ input.mono {
   font-size: 13px;
 }
 
+.lens-template-row,
+.snapshot-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+  font-size: 12px;
+}
+
+.snapshot-controls {
+  margin: 12px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.snapshot-controls button,
+.lens-template-row button {
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.snapshot-status {
+  color: var(--muted);
+}
+
+.snapshot-status.error,
+.selector-validation {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.selector-validation:empty {
+  display: none;
+}
+
+.usage-insights {
+  margin-bottom: 20px;
+}
+
+.insights-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.insights-grid section {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.insights-grid h4 {
+  margin: 0 0 8px;
+}
+
+.insights-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.insights-list li {
+  display: grid;
+  gap: 3px;
+}
+
+.insights-list progress {
+  width: 100%;
+  height: 5px;
+  accent-color: var(--accent);
+}
+
 .lenses-list {
   display: grid;
   gap: 14px;

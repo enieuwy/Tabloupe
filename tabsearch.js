@@ -37,8 +37,12 @@ let listLoadError = "";
 let dragTabIds = [];
 let dropIndicator = null;
 let historyResults = [];
+let bookmarkResults = [];
+let moveWindowPickerOpen = false;
+let moveWindowTargets = [];
 let historyQuery = "";
 let historyDebounceTimer = null;
+let undoClosedSession = null;
 let tabContainers = [];
 let recentlyClosed = [];
 let recentlyClosedAvailable = false;
@@ -67,6 +71,8 @@ const ICON_SEARCH =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>';
 const ICON_CLOCK =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>';
+const ICON_BOOKMARK =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h12v18l-6-4-6 4z"/></svg>';
 const ICON_GLOBE =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M3 12h18"></path><path d="M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18"></path></svg>';
 const ICON_CLOSE =
@@ -140,6 +146,7 @@ function scheduleHistoryFetch(query) {
   const trimmed = query.trim();
   if (trimmed === "") {
     historyResults = [];
+    bookmarkResults = [];
     historyQuery = "";
     if (historyDebounceTimer !== null) {
       clearTimeout(historyDebounceTimer);
@@ -149,19 +156,25 @@ function scheduleHistoryFetch(query) {
   }
 
   clearTimeout(historyDebounceTimer);
+  const gen = overlayGen;
   historyDebounceTimer = setTimeout(async () => {
     historyDebounceTimer = null;
     try {
-      const res = await browser.runtime.sendMessage({ type: "tabsearch-history", query: trimmed });
-      if (!inputEl || inputEl.value.trim() !== trimmed) return;
+      const [res, bookmarks] = await Promise.all([
+        browser.runtime.sendMessage({ type: "tabsearch-history", query: trimmed }),
+        browser.runtime.sendMessage({ type: "tabsearch-bookmarks", query: trimmed }).catch(() => null),
+      ]);
+      if (gen !== overlayGen || !inputEl || inputEl.value.trim() !== trimmed) return;
       historyResults = res && res.ok && Array.isArray(res.results) ? res.results : [];
+      bookmarkResults = bookmarks && bookmarks.ok && Array.isArray(bookmarks.results) ? bookmarks.results : [];
       historyQuery = trimmed;
       render(inputEl.value);
     } catch (error) {
       // Check staleness BEFORE mutating shared state: an older query's failure
       // must not clear results that belong to the current query.
-      if (!inputEl || inputEl.value.trim() !== trimmed) return;
+      if (gen !== overlayGen || !inputEl || inputEl.value.trim() !== trimmed) return;
       historyResults = [];
+      bookmarkResults = [];
       historyQuery = trimmed;
       render(inputEl.value);
     }
@@ -552,6 +565,9 @@ function render(query) {
       }
     }
     actionRows.push(...historyRows);
+    if (historyQuery === trimmed && trimmed.length >= 2) {
+      actionRows.push(...bookmarkResults.map((item) => ({ kind: "bookmark", ...item })));
+    }
     actionRows.push({ kind: "web", query: trimmed, url: parseQueryAsUrl(trimmed) });
   }
   listEl.textContent = "";
@@ -637,11 +653,11 @@ function render(query) {
     }
   }
 
-  let sectionShown = false;
+  let sectionShown = "";
   for (const row of actionRows) {
-    if (row.kind === "history" && !sectionShown) {
-      listEl.appendChild(makeSectionHeader("History"));
-      sectionShown = true;
+    if (row.kind !== "web" && sectionShown !== row.kind) {
+      listEl.appendChild(makeSectionHeader(row.kind === "bookmark" ? "Bookmarks" : "History"));
+      sectionShown = row.kind;
     }
     if (row.kind === "web") {
       listEl.appendChild(makeSectionHeader("Search"));
@@ -889,7 +905,7 @@ function makeActionRow(row, index) {
 
   const icon = document.createElement("span");
   icon.className = "action-icon";
-  replaceChildrenWithTrustedHTML(icon, row.kind === "web" ? ICON_GLOBE : ICON_CLOCK);
+  replaceChildrenWithTrustedHTML(icon, row.kind === "web" ? ICON_GLOBE : row.kind === "bookmark" ? ICON_BOOKMARK : ICON_CLOCK);
   item.appendChild(icon);
 
   const text = document.createElement("div");
@@ -898,7 +914,7 @@ function makeActionRow(row, index) {
   title.className = "title";
   const name = document.createElement("span");
   name.className = "name";
-  const hasTitle = (row.kind === "history" || row.kind === "closed-tab") && row.title && row.title.trim();
+  const hasTitle = (row.kind === "history" || row.kind === "bookmark" || row.kind === "closed-tab") && row.title && row.title.trim();
   const isGoTo = row.kind === "web" && row.url;
   name.textContent =
     row.kind === "recent-enable"
@@ -992,7 +1008,7 @@ function applyListActionResult(result, fallbackMessage) {
     pruneMarked();
   }
   if (!Array.isArray(result) && result && typeof result === "object") {
-    actionMessage = result.message || result.error || fallbackMessage;
+    actionMessage = result.message || result.error || (failed ? fallbackMessage : "");
   }
 }
 
@@ -1207,6 +1223,7 @@ function clearMarks() {
   anchorIndex = null;
   groupDraftOpen = false;
   containerPickerOpen = false;
+  moveWindowPickerOpen = false;
   actionMessage = "";
 }
 
@@ -1232,7 +1249,7 @@ function renderFooter() {
     const verb =
       sel && sel.kind === "web"
         ? goVerb
-        : sel && sel.kind === "history"
+        : sel && (sel.kind === "history" || sel.kind === "bookmark")
           ? "open in new tab"
           : "switch";
     const shiftVerb = webRow && sel && sel.kind !== "web" ? goVerb : null;
@@ -1242,6 +1259,9 @@ function renderFooter() {
     }
     if (browseMode() && !recentlyClosedAvailable) {
       footerEl.appendChild(makeActionButton("Show recently closed", () => activate({ kind: "recent-enable" })));
+    }
+    if (undoClosedSession) {
+      footerEl.appendChild(makeActionButton("Undo last close", () => activate(undoClosedSession)));
     }
     if (actionMessage) {
       const message = document.createElement("span");
@@ -1291,6 +1311,7 @@ function renderFooter() {
   const menu = document.createElement("div");
   menu.className = "menu";
   menu.appendChild(makeActionButton("Move to new window", () => runBulkListAction("tabsearch-move-new-window", { tabIds: tabs.map((tab) => tab.id) })));
+  menu.appendChild(makeActionButton("Move to window…", showMoveWindowPicker));
   const moveContainer = makeActionButton("Move to container\u2026", () => {
     groupDraftOpen = false;
     containerPickerOpen = true;
@@ -1328,7 +1349,51 @@ function renderFooter() {
     renderGroupDraft(tabs, windowId);
   } else if (containerPickerOpen) {
     renderContainerPicker(tabs);
+  } else if (moveWindowPickerOpen) {
+    renderMoveWindowPicker(tabs);
   }
+}
+
+async function showMoveWindowPicker() {
+  const gen = overlayGen;
+  try {
+    const result = await browser.runtime.sendMessage({ type: "tabsearch-windows" });
+    if (gen !== overlayGen || !isOpen()) return;
+    if (!result?.ok) throw new Error("Could not read the open windows.");
+    moveWindowTargets = result.windows || [];
+    moveWindowPickerOpen = true;
+    groupDraftOpen = false;
+    containerPickerOpen = false;
+  } catch (error) {
+    if (gen !== overlayGen || !isOpen()) return;
+    actionMessage = error.message;
+  }
+  render(inputEl.value);
+}
+
+function renderMoveWindowPicker(tabs) {
+  const form = document.createElement("form");
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", "Destination window");
+  for (const target of moveWindowTargets) {
+    if (tabs.every((tab) => tab.windowId === target.id)) continue;
+    const option = document.createElement("option");
+    option.value = String(target.id);
+    option.textContent = `${target.title} (${target.tabCount} tabs)`;
+    select.appendChild(option);
+  }
+  const move = makeActionButton("Move", () => {}, "submit");
+  move.disabled = select.options.length === 0;
+  form.append(select, move, makeActionButton("Cancel", () => {
+    moveWindowPickerOpen = false;
+    render(inputEl.value);
+  }));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!select.value) return;
+    runBulkListAction("tabsearch-move-to-window", { tabIds: tabs.map((tab) => tab.id), targetWindowId: Number(select.value) });
+  });
+  footerEl.appendChild(form);
 }
 
 function renderGroupDraft(tabs, windowId) {
@@ -1508,10 +1573,17 @@ async function loadRecentlyClosed(gen) {
   }
 }
 
-async function refreshRecentlyClosed() {
+async function refreshRecentlyClosed(undoCandidates = null) {
   const gen = overlayGen;
   await loadRecentlyClosed(gen);
-  if (gen === overlayGen && isOpen()) render(inputEl.value);
+  if (gen !== overlayGen || !isOpen()) return;
+  if (undoCandidates) {
+    undoClosedSession = recentlyClosed.find((row) => row.kind === "closed-tab" &&
+      !undoCandidates.previous.has(row.sessionId) && undoCandidates.urls.has(row.url)) || null;
+  } else if (undoClosedSession && !recentlyClosed.some((row) => row.sessionId === undoClosedSession.sessionId)) {
+    undoClosedSession = null;
+  }
+  render(inputEl.value);
 }
 
 async function loadOverlayTabs(gen) {
@@ -1558,6 +1630,17 @@ async function openOverlay() {
   focusInput();
   await loadOverlayTabs(gen);
   if (gen !== overlayGen || !isOpen()) return; // closed or reopened while awaiting
+  if (isStandalonePage()) {
+    const requested = new URL(window.location.href).searchParams.get("selected");
+    if (requested) {
+      const liveIds = new Set(allTabs.map((tab) => tab.id));
+      for (const value of requested.split(",")) {
+        const id = Number(value);
+        if (liveIds.has(id)) marked.add(id);
+      }
+      window.history.replaceState(null, "", browser.runtime.getURL("tabsearch.html?tabsearchOpen=1"));
+    }
+  }
   render(inputEl.value);
 }
 
@@ -1630,7 +1713,7 @@ function activate(item) {
     message = item.url
       ? { type: "tabsearch-open-url", url: item.url }
       : { type: "tabsearch-web-search", query: item.query };
-  } else if (item.kind === "history") {
+  } else if (item.kind === "history" || item.kind === "bookmark") {
     message = { type: "tabsearch-open-url", url: item.url };
   } else {
     message = { type: "tabsearch-activate", tabId: item.id, windowId: item.windowId };
@@ -1677,12 +1760,13 @@ async function runGuardedListAction(send, { onResult, onError } = {}) {
 }
 
 function closeTab(tab) {
+  const undoCandidates = { urls: new Set([tab.url]), previous: new Set(recentlyClosed.map((row) => row.sessionId)) };
   return runGuardedListAction(
     () => browser.runtime.sendMessage({ type: "tabsearch-close", tabId: tab.id }),
     {
       onResult(refreshed) {
         applyListActionResult(refreshed, "Could not close that tab.");
-        refreshRecentlyClosed();
+        refreshRecentlyClosed(undoCandidates);
       },
       onError() {
         // The request itself failed, so the tab is almost certainly still open:
@@ -1694,12 +1778,15 @@ function closeTab(tab) {
 }
 
 function runBulkListAction(type, payload) {
+  const undoCandidates = type === "tabsearch-close-many"
+    ? { urls: new Set(allTabs.filter((tab) => payload.tabIds.includes(tab.id)).map((tab) => tab.url)), previous: new Set(recentlyClosed.map((row) => row.sessionId)) }
+    : null;
   return runGuardedListAction(
     () => browser.runtime.sendMessage({ type, ...payload }),
     {
       onResult(result) {
         applyListActionResult(result, "Action failed.");
-        if (type === "tabsearch-close-many") refreshRecentlyClosed();
+        if (type === "tabsearch-close-many") refreshRecentlyClosed(undoCandidates);
       },
       onError() {
         actionMessage = "Action failed.";

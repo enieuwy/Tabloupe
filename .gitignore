@@ -3,6 +3,10 @@ web-ext-artifacts/
 .build.lock/
 node_modules/
 .web-ext-profile/
+dist/
+.demo-profile/
+demo/evidence/
+demo/fixture-*/
 
 .DS_Store
 .agents/

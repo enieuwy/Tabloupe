@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <link rel="stylesheet" href="popup.css">
+  <script src="browser-compat.js"></script>
   <script defer src="popup.js"></script>
 </head>
 <body>
@@ -27,6 +28,18 @@
         <h2 id="lenses-heading">Lenses</h2>
       </div>
       <div id="lens-chips" class="lens-chips"></div>
+    </section>
+    <section class="panel timed-focus-panel" aria-labelledby="timed-focus-heading">
+      <h2 id="timed-focus-heading">Timed focus</h2>
+      <div class="timed-focus-controls">
+        <label for="timed-focus-lens">Lens</label>
+        <select id="timed-focus-lens"></select>
+        <label for="timed-focus-minutes">Minutes</label>
+        <input id="timed-focus-minutes" type="number" min="1" max="240" step="1" value="25">
+        <button id="timed-focus-start" type="button">Start</button>
+      </div>
+      <p id="timed-focus-status" class="muted" role="status" aria-live="polite"></p>
+      <button id="timed-focus-cancel" type="button" class="secondary compact" hidden>Cancel timed focus</button>
     </section>
 
     <section id="groups-section" class="section" aria-labelledby="groups-heading">
@@ -63,6 +76,22 @@
     <p id="popup-connection" class="conn" role="status"></p>
 
     <p id="ai-summary" class="summary"></p>
+    <label class="toggle" id="ai-existing-row">
+      <input id="ai-include-existing" type="checkbox">
+      <span>Include existing groups in the next preview</span>
+    </label>
+    <p class="muted">Pinned tabs and non-web tabs stay unchanged. Review the proposal before Apply.</p>
+    <button id="ai-suggest-lens" type="button" class="secondary">Suggest a lens from current groups</button>
+    <section id="ai-lens-preview" class="panel" aria-label="Suggested lens" hidden>
+      <label for="ai-lens-name">Lens name</label>
+      <input id="ai-lens-name" type="text" maxlength="200">
+      <label for="ai-lens-titles">Matching group titles (one per line)</label>
+      <textarea id="ai-lens-titles" rows="4"></textarea>
+      <div class="actions">
+        <button id="ai-lens-save" type="button">Save suggested lens</button>
+        <button id="ai-lens-dismiss" type="button" class="secondary">Dismiss suggestion</button>
+      </div>
+    </section>
 
     <label id="ai-pin-row" class="toggle pin-toggle" hidden>
       <input id="ai-pin" type="checkbox">

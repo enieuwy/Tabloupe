@@ -39,6 +39,12 @@ const AUTO_GROUP_DEBOUNCE_MS = 5000;
 const AUTO_GROUP_COOLDOWN_MS = 30000;
 const SCHEDULE_ALARM_NAME = "lens-schedule-tick";
 const FOCUS_SESSION_HISTORY_KEY = "focusSessionHistory";
+const LENS_SNAPSHOTS_KEY = "lensTabSnapshots";
+const MAX_LENS_SNAPSHOTS = 50;
+const MAX_SNAPSHOT_TABS = 200;
+const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
+const TIMED_SESSION_KEY = "timedLensSession";
+const TIMED_SESSION_ALARM = "lens-timed-end";
 const SYNC_LENSES_KEY = "syncLenses";
 const SYNC_LAST_ERROR_KEY = "syncLastError";
 const LENS_SYNC_META_KEY = "lensSyncMeta";
@@ -822,7 +828,63 @@ async function recordSeen(rawId) {
 }
 
 function isSelectorType(type) {
-  return type === "title" || type === "glob" || type === "container";
+  return ["title", "glob", "container", "color", "regex", "urlHost"].includes(type);
+}
+
+// No repetition of user-controlled expressions, alternatives, or backreferences.
+// A single .* is useful for title searches; the bounded input limits its work.
+function safeTitleRegex(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) return null;
+  let inClass = false;
+  let wildcard = false;
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+    if (char === "\\") {
+      const next = value[++i];
+      if (!next || !/^[dDsSwWbB\\.^$[\]{}()*+?|/-]$/.test(next)) return null;
+    } else if (inClass) {
+      if (char === "]") inClass = false;
+    } else if (char === "[") {
+      inClass = true;
+    } else if (char === "." && value[i + 1] === "*") {
+      if (wildcard) return null;
+      wildcard = true;
+      i += 1;
+    } else if ("(){}|*+?".includes(char)) {
+      return null;
+    }
+  }
+  if (inClass) return null;
+  try {
+    return new RegExp(value);
+  } catch (error) {
+    return null;
+  }
+}
+
+function normalizedSelectorValue(selector) {
+  if (!isRecord(selector) || !isSelectorType(selector.type) || typeof selector.value !== "string") return "";
+  const value = selector.value.trim();
+  if (selector.type === "regex") return safeTitleRegex(value) ? value : "";
+  if (selector.type === "color") {
+    return [...TAB_GROUP_COLORS, "grey"].includes(value.toLowerCase()) ? value.toLowerCase() : "";
+  }
+  if (selector.type === "urlHost") {
+    if (!value || /[\/\\:@?#\s]/.test(value)) return "";
+    try {
+      const host = new URL(`https://${value}`).hostname.toLowerCase();
+      return host === value.toLowerCase() ? host : "";
+    } catch (error) {
+      return "";
+    }
+  }
+  return value;
+}
+
+function validSelectors(value) {
+  return Array.isArray(value) && value.every((selector) =>
+    isRecord(selector) && isSelectorType(selector.type) && typeof selector.value === "string" &&
+    (selector.type === "title" || normalizedSelectorValue(selector) !== ""));
 }
 
 function normalizedSelectors(value) {
@@ -836,7 +898,7 @@ function normalizedSelectors(value) {
       continue;
     }
     if (typeof selector.value !== "string") continue;
-    const raw = selector.value.trim();
+    const raw = normalizedSelectorValue(selector);
     if (raw === "" && selector.type !== "title") {
       continue;
     }
@@ -988,12 +1050,16 @@ async function setActiveView(view, lastActivation) {
   }
   await browser.storage.local.set({
     activeView: view,
+    [TIMED_SESSION_KEY]: lastActivation && isRecord(lastActivation.timedSession) ? lastActivation.timedSession : null,
     lastActivation: {
       trigger: lastActivation && typeof lastActivation.trigger === "string" ? lastActivation.trigger : "manual",
       ...(lastActivation && typeof lastActivation.triggerId === "string" ? { triggerId: lastActivation.triggerId } : {}),
       at: Date.now(),
     },
   });
+  if (!lastActivation || !lastActivation.timedSession) {
+    bestEffort(browser.alarms.clear(TIMED_SESSION_ALARM), "Timed alarm clear failed:");
+  }
 }
 
 function viewKey(view) {
@@ -1012,11 +1078,16 @@ async function recordActivationSession(view, lastActivation, snapshot = null) {
     "expandedGroups",
     "collapsedGroups",
   ]);
+  await browser.storage.local.set({ [FOCUS_SESSION_HISTORY_KEY]: activationSessionHistory(view, lastActivation, stored, now) });
+}
+
+function activationSessionHistory(view, lastActivation, stored, now = Date.now()) {
   const history = Array.isArray(stored[FOCUS_SESSION_HISTORY_KEY]) ? stored[FOCUS_SESSION_HISTORY_KEY].filter(isRecord) : [];
   const previousView = isPersistedView(stored.activeView) ? stored.activeView : null;
   const previousActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
   const previousStartedAt = typeof previousActivation.at === "number" ? previousActivation.at : null;
-  if (previousView && previousStartedAt && viewKey(previousView) !== viewKey(view)) {
+  if (previousView && previousStartedAt && (viewKey(previousView) !== viewKey(view) ||
+      previousActivation.trigger === "timed" || lastActivation.trigger === "timed")) {
     history.push({
       view: previousView,
       trigger: typeof previousActivation.trigger === "string" ? previousActivation.trigger : "manual",
@@ -1030,7 +1101,7 @@ async function recordActivationSession(view, lastActivation, snapshot = null) {
   if (history.length > MAX_FOCUS_SESSION_HISTORY) {
     history.splice(0, history.length - MAX_FOCUS_SESSION_HISTORY);
   }
-  await browser.storage.local.set({ [FOCUS_SESSION_HISTORY_KEY]: history });
+  return history;
 }
 
 
@@ -1503,6 +1574,11 @@ async function pullLensSyncQueued() {
     "lenses",
     "lensSchedules",
     "activeView",
+    "lastActivation",
+    TIMED_SESSION_KEY,
+    FOCUS_SESSION_HISTORY_KEY,
+    "expandedGroups",
+    "collapsedGroups",
     "automationFallback",
     AI_GROUPING_PROMPT_KEY,
     "tabSearchShortcut",
@@ -1615,6 +1691,9 @@ async function pullLensSyncQueued() {
   }
   if (activeViewOrphaned) {
     values.activeView = { kind: "all" };
+    values[TIMED_SESSION_KEY] = null;
+    values.lastActivation = { trigger: "external", at: Date.now() };
+    values[FOCUS_SESSION_HISTORY_KEY] = activationSessionHistory({ kind: "all" }, values.lastActivation, stored);
   }
   if (fallbackOrphaned) {
     values.automationFallback = { kind: "all" };
@@ -1642,6 +1721,10 @@ async function pullLensSyncQueued() {
   const current = await browser.storage.local.get([
     "lenses",
     "lensSchedules",
+    "activeView",
+    "lastActivation",
+    TIMED_SESSION_KEY,
+    FOCUS_SESSION_HISTORY_KEY,
     AI_GROUPING_PROMPT_KEY,
     "tabSearchShortcut",
   ]);
@@ -1650,6 +1733,12 @@ async function pullLensSyncQueued() {
     !syncSnapshotsEqual(current.lensSchedules, stored.lensSchedules) ||
     !syncSnapshotsEqual(current[AI_GROUPING_PROMPT_KEY], stored[AI_GROUPING_PROMPT_KEY]) ||
     !syncSnapshotsEqual(current.tabSearchShortcut, stored.tabSearchShortcut)
+    || (activeViewOrphaned && (
+      !syncSnapshotsEqual(current.activeView, stored.activeView) ||
+      !syncSnapshotsEqual(current.lastActivation, stored.lastActivation) ||
+      !syncSnapshotsEqual(current[TIMED_SESSION_KEY], stored[TIMED_SESSION_KEY]) ||
+      !syncSnapshotsEqual(current[FOCUS_SESSION_HISTORY_KEY], stored[FOCUS_SESSION_HISTORY_KEY])
+    ))
   ) {
     return false;
   }
@@ -1784,87 +1873,63 @@ function syncScheduleAlarm() {
 function titleSelectorMatcher(selectors) {
   const exact = new Set();
   const globValues = [];
+  const regexes = [];
   for (const selector of normalizedSelectors(selectors)) {
     if (selector.type === "glob") {
       globValues.push(selector.value);
     } else if (selector.type === "title") {
       exact.add(selector.value);
+    } else if (selector.type === "regex") {
+      regexes.push(safeTitleRegex(selector.value));
     }
   }
   const globMatches = buildTitleMatcher(globValues);
-  return (title) => exact.has(title) || globMatches(title);
+  return (title) => exact.has(title) || globMatches(title) ||
+    regexes.some((regex) => regex.test(typeof title === "string" ? title.slice(0, 512) : ""));
 }
 
-function selectorMatcher(selectors) {
-  return titleSelectorMatcher(selectors);
+function webUrlHost(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.hostname.toLowerCase() : "";
+  } catch (error) {
+    return "";
+  }
 }
 
-function lensSelectorsMatch(lens, title) {
-  return titleSelectorMatcher(lens && lens.groupSelectors)(title);
-}
-
-async function selectorMatcherForGroups(selectors, groups) {
+async function selectorMatcherForGroups(selectors, groups, suppliedTabs = null) {
   const normalized = normalizedSelectors(selectors);
   const titleMatches = titleSelectorMatcher(normalized);
-  const containerNames = new Set(
-    normalized
-      .filter((selector) => selector.type === "container")
-      .map((selector) => selector.value.toLowerCase())
-  );
-  if (containerNames.size === 0) {
-    return (group) => titleMatches(group.title);
-  }
-
+  const colors = new Set(normalized.filter((selector) => selector.type === "color").map((selector) => selector.value));
+  const hosts = new Set(normalized.filter((selector) => selector.type === "urlHost").map((selector) => selector.value));
+  const containerNames = new Set(normalized.filter((selector) => selector.type === "container")
+    .map((selector) => selector.value.toLowerCase()));
   const matchingStoreIds = new Set();
-  for (const container of await getContainers()) {
-    if (containerNames.has(container.name.toLowerCase())) {
-      matchingStoreIds.add(container.cookieStoreId);
+  if (containerNames.size > 0) {
+    for (const container of await getContainers()) {
+      if (containerNames.has(container.name.toLowerCase())) matchingStoreIds.add(container.cookieStoreId);
     }
   }
-  if (matchingStoreIds.size === 0) {
-    return (group) => titleMatches(group.title);
-  }
-
-  const candidateGroupIds = new Set((Array.isArray(groups) ? groups : [])
-    .map((group) => group && group.id)
-    .filter((id) => typeof id === "number"));
-  const windowIds = [...new Set((Array.isArray(groups) ? groups : [])
-    .map((group) => group && group.windowId)
-    .filter((id) => typeof id === "number"))];
-  const tabsByWindow = await Promise.all(windowIds.map((windowId) =>
-    browser.tabs.query({ windowId }).catch(() => [])
-  ));
-  const matchingContainerGroups = new Set();
-  for (const tabs of tabsByWindow) {
+  const memberMatches = new Set();
+  if (hosts.size > 0 || matchingStoreIds.size > 0) {
+    const candidateGroupIds = new Set((groups || []).map((group) => group.id));
+    const windowIds = [...new Set((groups || []).map((group) => group.windowId).filter((id) => typeof id === "number"))];
+    const tabs = suppliedTabs || (await Promise.all(windowIds.map((windowId) => browser.tabs.query({ windowId })))).flat();
     for (const tab of tabs) {
-      if (
-        typeof tab.groupId === "number" &&
-        candidateGroupIds.has(tab.groupId) &&
-        typeof tab.cookieStoreId === "string" &&
-        matchingStoreIds.has(tab.cookieStoreId)
-      ) {
-        matchingContainerGroups.add(tab.groupId);
-      }
+      if (!candidateGroupIds.has(tab.groupId)) continue;
+      const host = webUrlHost(tab.url);
+      if (matchingStoreIds.has(tab.cookieStoreId) || hosts.has(host)) memberMatches.add(tab.groupId);
     }
   }
-
-  return (group) => titleMatches(group.title) || matchingContainerGroups.has(group.id);
+  return (group) => titleMatches(group.title) || colors.has(group.color) || memberMatches.has(group.id);
 }
 
-function lensesMatchingTitle(title, lenses) {
-  return (Array.isArray(lenses) ? lenses : [])
-    .filter((lens) => lensSelectorsMatch(lens, title))
-    .map((lens) => lens.name);
-}
-
-// savedIn annotations must use the same semantics as activation, including
-// container selectors: otherwise the popup labels a group "Not saved" while a
-// container-only lens genuinely includes it.
-async function lensesMatchingGroups(lenses, groups) {
+// savedIn annotations use the full activation semantics for every selector type.
+async function lensesMatchingGroups(lenses, groups, tabs = null) {
   const list = Array.isArray(lenses) ? lenses : [];
   const matchers = [];
   for (const lens of list) {
-    matchers.push(await selectorMatcherForGroups(lens.groupSelectors, groups));
+    matchers.push(await selectorMatcherForGroups(lens.groupSelectors, groups, tabs));
   }
   return (Array.isArray(groups) ? groups : []).map((group) =>
     list.filter((lens, index) => matchers[index](group)).map((lens) => lens.name)
@@ -2107,7 +2172,7 @@ async function handleAppleFocus(rawId) {
   }
   const stored = await browser.storage.local.get(["lastActivation", LAST_APPLIED_APPLE_FOCUS_KEY]);
   const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
-  if (rawId === stored[LAST_APPLIED_APPLE_FOCUS_KEY] && lastActivation.trigger === "manual") {
+  if (rawId === stored[LAST_APPLIED_APPLE_FOCUS_KEY] && ["manual", "timed"].includes(lastActivation.trigger)) {
     return;
   }
   const lens = await findLensForAppleFocusId(rawId);
@@ -2236,7 +2301,10 @@ async function handleMessage(msg) {
     return;
   }
   if (msg.type === "calendarEvents") {
-    await handleCalendarEvents(isRecord(msg.payload) ? msg.payload : {});
+    const deliver = typeof globalThis.deliverBusCalendarEvents === "function"
+      ? globalThis.deliverBusCalendarEvents
+      : handleCalendarEvents;
+    await deliver(isRecord(msg.payload) ? msg.payload : {});
     return;
   }
   if (msg.type !== "focus") {
@@ -2438,12 +2506,217 @@ async function connect() {
   ws.onerror = () => ws.close();
 }
 
+// Firefox briefly reports about:blank after tabs.create. Keep the requested URL
+// until navigation completes so a second Restore cannot duplicate those tabs.
+const pendingSnapshotTabs = new Map();
+
+function snapshotUrl(value) {
+  if (typeof value !== "string" || value.length > 8192) return "";
+  try {
+    const url = new URL(value);
+    return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password ? url.href : "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function normalizedSnapshots(value) {
+  const entries = isRecord(value) ? Object.entries(value) : [];
+  const snapshots = {};
+  let bytes = 0;
+  for (const [lensId, snapshot] of entries.sort((a, b) => (b[1]?.at || 0) - (a[1]?.at || 0))) {
+    if (Object.keys(snapshots).length >= MAX_LENS_SNAPSHOTS) break;
+    if (!isRecord(snapshot) || !Number.isFinite(snapshot.at) || !Array.isArray(snapshot.tabs)) continue;
+    const tabs = snapshot.tabs.slice(0, MAX_SNAPSHOT_TABS).flatMap((tab) => {
+      const url = snapshotUrl(tab && tab.url);
+      if (!url) return [];
+      return [{
+        title: typeof tab.title === "string" ? tab.title.slice(0, 512) : "",
+        url,
+        groupTitle: typeof tab.groupTitle === "string" ? tab.groupTitle.slice(0, 512) : "",
+        color: normalizeTabGroupColor(tab.color),
+        pinned: tab.pinned === true,
+      }];
+    });
+    const entry = { at: snapshot.at, tabs };
+    const size = new TextEncoder().encode(JSON.stringify(entry)).length;
+    if (bytes + size > MAX_SNAPSHOT_BYTES) continue;
+    snapshots[lensId] = entry;
+    bytes += size;
+  }
+  return snapshots;
+}
+
+async function snapshotWindow(windowId) {
+  if (!Number.isInteger(windowId) || windowId < 0) return false;
+  if (browser.windows && typeof browser.windows.get === "function") {
+    const window = await browser.windows.get(windowId);
+    return window.type === "normal" && !window.incognito;
+  }
+  return true;
+}
+
+async function handleLensSnapshotSave(msg) {
+  if (!(await snapshotWindow(msg.windowId))) return { ok: false, error: "missing_window" };
+  const lens = (await getLenses()).find((entry) => entry.id === msg.lensId);
+  if (!lens) return { ok: false, error: "missing_lens" };
+  const [groups, tabs, stored] = await Promise.all([
+    browser.tabGroups.query({ windowId: msg.windowId }),
+    browser.tabs.query({ windowId: msg.windowId }),
+    browser.storage.local.get(LENS_SNAPSHOTS_KEY),
+  ]);
+  const matches = await selectorMatcherForGroups(lens.groupSelectors, groups, tabs);
+  const matchingGroups = new Map(groups.filter(matches).map((group) => [group.id, group]));
+  const captured = tabs.filter((tab) => matchingGroups.has(tab.groupId) && snapshotUrl(tab.url));
+  if (captured.length > MAX_SNAPSHOT_TABS ||
+      [...matchingGroups.values()].some((group) => typeof group.title === "string" && group.title.length > 512)) {
+    return { ok: false, error: "snapshot_too_large" };
+  }
+  const snapshot = {
+    at: Date.now(),
+    tabs: captured.map((tab) => ({
+      title: typeof tab.title === "string" ? tab.title.slice(0, 512) : "",
+      url: snapshotUrl(tab.url),
+      groupTitle: matchingGroups.get(tab.groupId).title || "",
+      color: matchingGroups.get(tab.groupId).color,
+      pinned: tab.pinned === true,
+    })),
+  };
+  const previous = normalizedSnapshots(stored[LENS_SNAPSHOTS_KEY]);
+  delete previous[lens.id];
+  const snapshots = normalizedSnapshots({ [lens.id]: snapshot, ...previous });
+  if (!snapshots[lens.id]) return { ok: false, error: "snapshot_too_large" };
+  await browser.storage.local.set({ [LENS_SNAPSHOTS_KEY]: snapshots });
+  return { ok: true, snapshot: snapshots[lens.id] };
+}
+
+async function handleLensSnapshotRestore(msg) {
+  if (!(await snapshotWindow(msg.windowId))) return { ok: false, restored: 0, skipped: 0, error: "missing_window" };
+  if (!(await getLenses()).some((lens) => lens.id === msg.lensId)) {
+    return { ok: false, restored: 0, skipped: 0, error: "missing_lens" };
+  }
+  const stored = await browser.storage.local.get(LENS_SNAPSHOTS_KEY);
+  const snapshot = normalizedSnapshots(stored[LENS_SNAPSHOTS_KEY])[msg.lensId];
+  if (!snapshot) return { ok: false, restored: 0, skipped: 0, error: "missing_snapshot" };
+  return withGroupingLock(msg.windowId, async () => {
+    const existingByTitle = await tabGroupsByTitle(msg.windowId);
+    const openTabs = await browser.tabs.query({ windowId: msg.windowId });
+    const liveIds = new Set(openTabs.map((tab) => tab.id));
+    for (const [id, pending] of pendingSnapshotTabs) {
+      if (pending.windowId === msg.windowId && !liveIds.has(id)) pendingSnapshotTabs.delete(id);
+    }
+    const openUrls = new Set(openTabs.map((tab) =>
+      snapshotUrl(tab.pendingUrl) || snapshotUrl(tab.url) || pendingSnapshotTabs.get(tab.id)?.url || ""));
+    const pendingGroups = new Map();
+    const failures = [];
+    let restored = 0;
+    let skipped = 0;
+    for (const saved of snapshot.tabs) {
+      if (openUrls.has(saved.url)) {
+        skipped += 1;
+        continue;
+      }
+      try {
+        const created = await browser.tabs.create({ windowId: msg.windowId, url: saved.url, pinned: saved.pinned, active: false });
+        pendingSnapshotTabs.set(created.id, { windowId: msg.windowId, url: saved.url });
+        openUrls.add(saved.url);
+        restored += 1;
+        // Browsers do not permit pinned tabs inside groups.
+        if (!saved.pinned && saved.groupTitle) {
+          if (!pendingGroups.has(saved.groupTitle)) pendingGroups.set(saved.groupTitle, { color: saved.color, tabIds: [] });
+          pendingGroups.get(saved.groupTitle).tabIds.push(created.id);
+        }
+      } catch (error) {
+        failures.push({ url: saved.url, error: error.message || "tab_create_failed" });
+      }
+    }
+    for (const [title, group] of pendingGroups) {
+      try {
+        const created = await createOrMergeTabGroup({ title, ...group, windowId: msg.windowId, existingByTitle });
+        existingByTitle.set(title, created);
+      } catch (error) {
+        failures.push({ groupTitle: title, error: error.message || "group_restore_failed" });
+      }
+    }
+    return { ok: failures.length === 0, restored, skipped, ...(failures.length ? { error: "restore_partial", failures } : {}) };
+  });
+}
+
+function normalizeTimedSession(value) {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.lensId !== "string" ||
+      !Number.isFinite(value.endsAt) || !Number.isFinite(value.startedAt) || !isPersistedView(value.previousView)) return null;
+  return value;
+}
+
+async function handleTimedStart(msg) {
+  if (!Number.isInteger(msg.minutes) || msg.minutes < 1 || msg.minutes > 240) return { ok: false, error: "invalid_minutes" };
+  if (!(await getLenses()).some((lens) => lens.id === msg.lensId)) return { ok: false, error: "missing_lens" };
+  const stored = await browser.storage.local.get(TIMED_SESSION_KEY);
+  const previousSession = normalizeTimedSession(stored[TIMED_SESSION_KEY]);
+  const startedAt = Date.now();
+  const session = {
+    id: `timed_${startedAt}_${Math.random().toString(36).slice(2)}`,
+    lensId: msg.lensId,
+    startedAt,
+    endsAt: startedAt + msg.minutes * 60000,
+    previousView: previousSession ? previousSession.previousView : await getActiveView(),
+  };
+  await browser.alarms.create(TIMED_SESSION_ALARM, { when: session.endsAt });
+  try {
+    const ok = await activateView({ kind: "lens", lensId: msg.lensId },
+      { trigger: "timed", triggerId: session.id, timedSession: session });
+    if (!ok) {
+      await restoreTimedAlarm();
+      return { ok: false, error: "activation_failed" };
+    }
+  } catch (error) {
+    await restoreTimedAlarm();
+    throw error;
+  }
+  return { ok: true, session: { lensId: session.lensId, endsAt: session.endsAt } };
+}
+
+async function handleTimedCancel() {
+  const stored = await browser.storage.local.get([TIMED_SESSION_KEY, "activeView", "lastActivation",
+    FOCUS_SESSION_HISTORY_KEY, "expandedGroups", "collapsedGroups"]);
+  if (normalizeTimedSession(stored[TIMED_SESSION_KEY])) {
+    const view = await getActiveView();
+    await setActiveView(view, { trigger: "manual" });
+    await recordActivationSession(view, { trigger: "manual" }, stored);
+  } else {
+    await browser.alarms.clear(TIMED_SESSION_ALARM);
+  }
+  return { ok: true };
+}
+
+async function restoreTimedAlarm() {
+  const stored = await browser.storage.local.get([TIMED_SESSION_KEY, "activeView", "lastActivation", "lenses"]);
+  const session = normalizeTimedSession(stored[TIMED_SESSION_KEY]);
+  if (!session) {
+    await browser.alarms.clear(TIMED_SESSION_ALARM);
+    return;
+  }
+  if (viewKey(stored.activeView) !== `lens:${session.lensId}` ||
+      stored.lastActivation?.trigger !== "timed" || stored.lastActivation?.triggerId !== session.id) {
+    await browser.storage.local.set({ [TIMED_SESSION_KEY]: null });
+    await browser.alarms.clear(TIMED_SESSION_ALARM);
+    return;
+  }
+  if (session.endsAt > Date.now()) {
+    await browser.alarms.create(TIMED_SESSION_ALARM, { when: session.endsAt });
+    return;
+  }
+  const previous = resolvableView(session.previousView, stored.lenses);
+  const target = previous.kind === "all" && session.previousView.kind === "lens" ? await getAutomationFallback() : previous;
+  if (!(await activateView(target, { trigger: "manual" }))) throw new Error("Timed lens reversion failed.");
+}
+
 async function handleLensState(windowId) {
   await sessionStateReady;
   const [lenses, persistedActiveView, stored, aiEnabled] = await Promise.all([
     getLenses(),
     getActiveView(),
-    browser.storage.local.get("lastActivation"),
+    browser.storage.local.get(["lastActivation", TIMED_SESSION_KEY, LENS_SNAPSHOTS_KEY]),
     aiGroupingEnabled(),
   ]);
   const activeView = typeof windowId === "number" && transientViewsByWindow.has(windowId)
@@ -2451,24 +2724,37 @@ async function handleLensState(windowId) {
     : persistedActiveView;
   const query = typeof windowId === "number" ? { windowId } : {};
   const groups = await browser.tabGroups.query(query);
-  const savedIn = await lensesMatchingGroups(lenses, groups);
+  const tabs = await browser.tabs.query(query);
+  const hostsByGroup = new Map();
+  for (const tab of tabs) {
+    const host = webUrlHost(tab.url);
+    if (!host) continue;
+    if (!hostsByGroup.has(tab.groupId)) hostsByGroup.set(tab.groupId, new Set());
+    hostsByGroup.get(tab.groupId).add(host);
+  }
+  const snapshots = normalizedSnapshots(stored[LENS_SNAPSHOTS_KEY]);
+  const timedSession = normalizeTimedSession(stored[TIMED_SESSION_KEY]);
+  const savedIn = await lensesMatchingGroups(lenses, groups, tabs);
   const hasAppleBinding = lenses.some((lens) => lens.triggers.appleFocusIds.length > 0) ||
     Boolean(socket && socket.readyState === WebSocket.OPEN);
   return {
     activeView,
     windowProfile: getWindowProfile(windowId),
     lastActivation: isRecord(stored.lastActivation) ? stored.lastActivation : null,
+    timedSession: timedSession ? { lensId: timedSession.lensId, endsAt: timedSession.endsAt } : null,
     lenses: lenses.map((lens) => ({
       id: lens.id,
       name: lens.name,
       icon: lens.icon,
       color: lens.color,
       active: activeView.kind === "lens" && activeView.lensId === lens.id,
+      snapshot: snapshots[lens.id] ? { at: snapshots[lens.id].at, tabCount: snapshots[lens.id].tabs.length } : null,
     })),
     currentGroups: groups.map((group, index) => ({
       title: typeof group.title === "string" ? group.title : "",
       color: typeof group.color === "string" ? group.color : null,
       savedIn: savedIn[index] || [],
+      urlHosts: [...(hostsByGroup.get(group.id) || [])],
     })),
     hasGroups: groups.length > 0,
     hasAppleBinding,
@@ -2526,6 +2812,9 @@ async function handleLensUpdate(msg) {
     return { ok: false, error: "missing_lens" };
   }
   const patch = msg.patch;
+  if (hasOwn(patch, "groupSelectors") && !validSelectors(patch.groupSelectors)) {
+    return { ok: false, error: "invalid_selectors" };
+  }
   const updated = { ...lenses[index] };
   if (typeof patch.name === "string" && patch.name.trim()) updated.name = patch.name.trim();
   if (typeof patch.icon === "string" && patch.icon) updated.icon = patch.icon;
@@ -2554,6 +2843,10 @@ async function handleLensDelete(msg) {
   }
   const lenses = await getLenses();
   await saveLenses(lenses.filter((lens) => lens.id !== lensId));
+  const storedSnapshots = await browser.storage.local.get(LENS_SNAPSHOTS_KEY);
+  const snapshots = normalizedSnapshots(storedSnapshots[LENS_SNAPSHOTS_KEY]);
+  delete snapshots[lensId];
+  await browser.storage.local.set({ [LENS_SNAPSHOTS_KEY]: snapshots });
   // Schedules are keyed by lensId; leaving one behind keeps the minute alarm
   // alive for a lens that can never be activated or edited again.
   const storedSchedules = await browser.storage.local.get("lensSchedules");
@@ -2573,9 +2866,9 @@ async function handleLensDelete(msg) {
   if (removedWindowOverride) {
     await persistSessionWindowState();
   }
-  const activeView = await getActiveView();
-  if (activeView.kind === "lens" && activeView.lensId === lensId) {
-    await setActiveView({ kind: "all" }, { trigger: "manual" });
+  const { activeView } = await browser.storage.local.get("activeView");
+  if (isRecord(activeView) && activeView.kind === "lens" && activeView.lensId === lensId) {
+    await activateView({ kind: "all" }, { trigger: "manual" });
   }
   return { ok: true };
 }
@@ -2661,31 +2954,39 @@ async function handleLensImport(msg) {
   } catch (error) {
     return { ok: false, error: "invalid_code" };
   }
-  if (!isRecord(parsed) || parsed.tabloupeLens !== 1 || !isRecord(parsed.lens)) {
+  if (!isRecord(parsed)) return { ok: false, error: "invalid_code" };
+  const portable = parsed.tabloupeLensPack === 1 && Array.isArray(parsed.lenses)
+    ? parsed.lenses
+    : parsed.tabloupeLens === 1 && isRecord(parsed.lens) ? [parsed.lens] : [];
+  if (portable.length === 0 || portable.length > 100 ||
+      portable.some((lens) => !isRecord(lens) || typeof lens.name !== "string" || !lens.name.trim())) {
     return { ok: false, error: "invalid_code" };
   }
-  const name = typeof parsed.lens.name === "string" ? parsed.lens.name.trim() : "";
-  if (!name) {
-    return { ok: false, error: "invalid_code" };
+  if (portable.some((lens) => !validSelectors(lens.groupSelectors))) {
+    return { ok: false, error: "invalid_selectors" };
   }
   const now = Date.now();
-  const lens = normalizeLens({
-    id: generateLensId(),
-    name,
-    icon: parsed.lens.icon,
-    color: parsed.lens.color,
-    groupSelectors: parsed.lens.groupSelectors,
-    triggers: { appleFocusIds: [], calendarPatterns: [] },
-    createdAt: now,
-    updatedAt: now,
-  });
-  if (!lens) {
-    return { ok: false, error: "invalid_code" };
-  }
   const lenses = await getLenses();
-  lenses.push(lens);
-  await saveLenses(lenses);
-  return { ok: true, lens };
+  const usedIds = new Set(lenses.map((lens) => lens.id));
+  const imported = portable.map((lens) => {
+    const baseId = generateLensId();
+    let id = baseId;
+    let suffix = 0;
+    while (usedIds.has(id)) id = `${baseId}_${++suffix}`;
+    usedIds.add(id);
+    return normalizeLens({
+      icon: lens.icon,
+      color: lens.color,
+      groupSelectors: lens.groupSelectors,
+      id,
+      name: lens.name.trim(),
+      triggers: { appleFocusIds: [], calendarPatterns: [] },
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+  await saveLenses([...lenses, ...imported]);
+  return { ok: true, lens: imported[0], lenses: imported };
 }
 
 function start() {
@@ -2715,6 +3016,7 @@ function start() {
       // Unblock all lens reads/writes now that migration has settled; must run
       // before reconcileLensSync (which reads lenses through getLenses).
       resolveLensMigrationReady();
+      enqueueFocusWork(() => restoreTimedAlarm()).catch((error) => console.error("Timed alarm init error:", error));
       connect();
       lensSyncInit
         .then(() => {
@@ -2756,14 +3058,29 @@ browser.runtime.onMessage.addListener((message) => {
   if (message && message.type === "lens-import") {
     return enqueueFocusWork(() => handleLensImport(message));
   }
+  if (message && message.type === "lens-snapshot-save") {
+    return enqueueFocusWork(() => handleLensSnapshotSave(message));
+  }
+  if (message && message.type === "lens-snapshot-restore") {
+    return enqueueFocusWork(() => handleLensSnapshotRestore(message));
+  }
+  if (message && message.type === "lens-timed-start") {
+    return enqueueFocusWork(() => handleTimedStart(message));
+  }
+  if (message && message.type === "lens-timed-cancel") {
+    return enqueueFocusWork(() => handleTimedCancel());
+  }
+  if (message && message.type === "ai-lens-suggest") {
+    return handleLensSuggest(message.windowId);
+  }
   if (message && message.type === "window-profile-set") {
     return enqueueFocusWork(() => handleWindowProfileSet(message));
   }
   if (message && message.type === "ai-group-state") {
-    return handleGroupState(message.windowId);
+    return handleGroupState(message.windowId, message.includeExistingGroups === true);
   }
   if (message && message.type === "ai-group-preview") {
-    return handleGroupPreview(message.windowId);
+    return handleGroupPreview(message.windowId, message.includeExistingGroups === true);
   }
   if (message && message.type === "ai-group-apply") {
     return enqueueFocusWork(() => handleGroupApply(message.windowId, message.groups));
@@ -2865,6 +3182,7 @@ if (browser.tabs && browser.tabs.onCreated && browser.tabs.onCreated.addListener
 if (browser.tabs && browser.tabs.onUpdated && browser.tabs.onUpdated.addListener) {
   browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo && changeInfo.status === "complete" && tab && typeof tab.windowId === "number") {
+      pendingSnapshotTabs.delete(tabId);
       scheduleAutoGroup(tab.windowId);
     }
   });
@@ -3205,6 +3523,7 @@ async function resolveActivation(view, windowId) {
     };
   }
   if (isRecord(view) && view.kind === "transient") {
+    if (!validSelectors(view.selectors)) return { ok: false, error: "invalid_selectors" };
     return {
       ok: true,
       view: {
@@ -3478,6 +3797,7 @@ async function activateView(view, activation = {}) {
   if (!resolved.ok) {
     return false;
   }
+  if (resolved.view.kind === "transient") await handleTimedCancel();
   const sessionSnapshot = isPersistedView(resolved.view)
     ? await browser.storage.local.get([
       FOCUS_SESSION_HISTORY_KEY,
@@ -3487,7 +3807,7 @@ async function activateView(view, activation = {}) {
       "collapsedGroups",
     ])
     : null;
-  const automationWithProfiles = activation.trigger !== "manual" &&
+  const automationWithProfiles = activation.trigger !== "manual" && activation.trigger !== "timed" &&
     resolved.view.kind !== "transient" &&
     windowProfileOverrides.size > 0;
   if (automationWithProfiles) {
@@ -3616,14 +3936,13 @@ function isUngroupedTab(tab) {
   return tab.groupId === -1;
 }
 
-async function collectGroupableTabs(windowId) {
+async function collectGroupableTabs(windowId, includeExistingGroups = false) {
   const targetWindow = typeof windowId === "number" ? windowId : browser.windows.WINDOW_ID_CURRENT;
   const tabs = await browser.tabs.query({ windowId: targetWindow });
-  // Only touch ungrouped, non-pinned web tabs so existing manual groups and
-  // privileged pages (about:, moz-extension:, …) are never disturbed.
+  // Grouped web tabs participate only in an explicit re-cluster preview.
   return tabs.filter((tab) =>
     !tab.pinned &&
-    isUngroupedTab(tab) &&
+    (isUngroupedTab(tab) || (includeExistingGroups && Number.isInteger(tab.groupId) && tab.groupId >= 0)) &&
     typeof tab.url === "string" &&
     GROUPABLE_URL.test(tab.url)
   );
@@ -3877,12 +4196,12 @@ async function cloudCluster(payload, provider, systemPrompt) {
   return parseGroupsFromContent(content);
 }
 
-async function computeTabGrouping(windowId, explicitTabs) {
-  const candidates = Array.isArray(explicitTabs) ? explicitTabs : await collectGroupableTabs(windowId);
+async function computeTabGrouping(windowId, explicitTabs, includeExistingGroups = false) {
+  const candidates = Array.isArray(explicitTabs) ? explicitTabs : await collectGroupableTabs(windowId, includeExistingGroups);
   if (candidates.length < 2) {
     const message = Array.isArray(explicitTabs)
-      ? "Select at least 2 ungrouped tabs to organize."
-      : "Open at least 2 ungrouped tabs to organize.";
+      ? "Select at least 2 web tabs to organize."
+      : includeExistingGroups ? "Open at least 2 web tabs to organize." : "Open at least 2 ungrouped tabs to organize.";
     return { ok: false, error: "not_enough_tabs", message };
   }
 
@@ -3927,7 +4246,7 @@ async function computeTabGrouping(windowId, explicitTabs) {
 }
 
 function normalizeTabGroupColor(color, fallback = null) {
-  if (TAB_GROUP_COLORS.includes(color)) {
+  if ([...TAB_GROUP_COLORS, "grey"].includes(color)) {
     return color;
   }
   return TAB_GROUP_COLORS.includes(fallback) ? fallback : null;
@@ -4144,7 +4463,7 @@ async function createTabGroupFromRequest(request) {
   });
 }
 
-async function applyTabGrouping(groups, windowId) {
+async function applyTabGrouping(groups, windowId, { groupableOnly = false, includeExistingGroups = false } = {}) {
   return withGroupingLock(windowId, async () => {
     const applied = [];
     const failures = [];
@@ -4162,8 +4481,12 @@ async function applyTabGrouping(groups, windowId) {
       return { applied: [], failures: groups.map((group) => group.topic), error: "group_lookup_failed" };
     }
     for (const group of groups) {
-      const tabIds = group.tabs.map((tab) => tab.id).filter((id) => typeof id === "number");
+      const liveIds = groupableOnly
+        ? new Set((await collectGroupableTabs(windowId, includeExistingGroups)).map((tab) => tab.id))
+        : null;
+      const tabIds = group.tabs.map((tab) => tab.id).filter((id) => typeof id === "number" && (!liveIds || liveIds.has(id)));
       if (tabIds.length === 0) {
+        if (groupableOnly) failures.push(group.topic);
         continue;
       }
       try {
@@ -4286,10 +4609,30 @@ function cachedProposal(windowId) {
   return entry.groups;
 }
 
-async function handleGroupState(windowId) {
+async function handleLensSuggest(windowId) {
+  if (!(await aiGroupingEnabled())) return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
+  if (!Number.isInteger(windowId) || windowId < 0) return { ok: false, error: "missing_window" };
+  const groups = await browser.tabGroups.query({ windowId });
+  const byId = new Map(groups.filter((group) => typeof group.title === "string" && group.title.trim()).map((group) => [group.id, group]));
+  const candidates = (await collectGroupableTabs(windowId, true))
+    .filter((tab) => byId.has(tab.groupId))
+    .map((tab) => ({ ...tab, title: `${byId.get(tab.groupId).title}: ${tab.title || ""}` }));
+  if (candidates.length === 0) {
+    return { ok: false, error: "no_groups", message: "Create a group with web tabs before suggesting a lens." };
+  }
+  // The daemon and configured cloud provider share the real grouping contract.
+  // Topic labels supply a suggested name; no unsupported lens-name frame is sent.
+  const result = await computeTabGrouping(windowId, candidates, true);
+  if (!result.ok) return result;
+  const name = [...new Set(result.groups.map((group) => group.topic))].slice(0, 2).join(" · ").slice(0, 80);
+  const groupTitles = [...new Set(candidates.map((tab) => byId.get(tab.groupId).title))];
+  return { ok: true, proposal: { name, groupTitles } };
+}
+
+async function handleGroupState(windowId, includeExistingGroups = false) {
   const [enabled, candidates, provider, pinToFocus, activeFocus, autoGroup] = await Promise.all([
     aiGroupingEnabled(),
-    collectGroupableTabs(windowId),
+    collectGroupableTabs(windowId, includeExistingGroups),
     getProvider(),
     aiPinToFocusEnabled(),
     activeFocusName(),
@@ -4299,6 +4642,8 @@ async function handleGroupState(windowId) {
     enabled,
     groupableCount: candidates.length,
     proposal: cachedProposal(windowId),
+    includeExistingGroups,
+    cachedProposalMode: lastProposalByWindow.get(windowId)?.includeExistingGroups === true,
     providerKind: provider.kind,
     pinToFocus,
     activeFocus,
@@ -4316,7 +4661,7 @@ function handleGroupClear(windowId) {
   return { ok: true };
 }
 
-async function handleGroupPreview(windowId) {
+async function handleGroupPreview(windowId, includeExistingGroups = false) {
   if (!(await aiGroupingEnabled())) {
     return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
   }
@@ -4337,7 +4682,10 @@ async function handleGroupPreview(windowId) {
   const key = typeof windowId === "number" ? windowId : "current";
   const existing = inflightPreviews.get(key);
   if (existing) {
-    return existing;
+    const result = await existing;
+    if (result.includeExistingGroups === includeExistingGroups) return result;
+    if (inflightPreviews.get(key) === existing) inflightPreviews.delete(key);
+    return handleGroupPreview(windowId, includeExistingGroups);
   }
   const work = (async () => {
     // An auto-group pass may already be clustering this window. Wait for it so
@@ -4350,13 +4698,13 @@ async function handleGroupPreview(windowId) {
       }
     }
     const gen = currentProposalGen(windowId);
-    const result = await computeTabGrouping(windowId);
+    const result = { ...(await computeTabGrouping(windowId, undefined, includeExistingGroups)), includeExistingGroups };
     if (result.ok) {
       await clearLastError();
       // Only cache if no dismiss/apply/window-close invalidated this proposal
       // while it was computing.
       if (typeof windowId === "number" && proposalGenByWindow.get(windowId) === gen) {
-        lastProposalByWindow.set(windowId, { groups: result.groups, ts: Date.now() });
+        lastProposalByWindow.set(windowId, { groups: result.groups, includeExistingGroups, ts: Date.now() });
       }
     } else {
       await setLastError(result.error, result.message);
@@ -4367,15 +4715,15 @@ async function handleGroupPreview(windowId) {
   try {
     return await work;
   } finally {
-    inflightPreviews.delete(key);
+    if (inflightPreviews.get(key) === work) inflightPreviews.delete(key);
   }
 }
 
-async function commitTabGroups(windowId, groups, { notify: doNotify = true, surfaceEmptyError = true, surfaceStatus = true, pinToActiveLens = true } = {}) {
+async function commitTabGroups(windowId, groups, { notify: doNotify = true, surfaceEmptyError = true, surfaceStatus = true, pinToActiveLens = true, includeExistingGroups = false } = {}) {
   // Re-validate against live tab state: between preview and apply a tab may have
   // been closed, pinned, manually grouped, or navigated off http(s). Only group
   // ids that are still groupable right now.
-  const groupableIds = new Set((await collectGroupableTabs(windowId)).map((tab) => tab.id));
+  const groupableIds = new Set((await collectGroupableTabs(windowId, includeExistingGroups)).map((tab) => tab.id));
   const normalized = (Array.isArray(groups) ? groups : [])
     .filter((group) => isRecord(group) && typeof group.topic === "string" && Array.isArray(group.tabs))
     .map((group) => ({
@@ -4400,7 +4748,7 @@ async function commitTabGroups(windowId, groups, { notify: doNotify = true, surf
     return result;
   }
 
-  const outcome = await applyTabGrouping(normalized, windowId);
+  const outcome = await applyTabGrouping(normalized, windowId, { groupableOnly: true, includeExistingGroups });
   const ok = outcome.failures.length === 0;
   let pinFailed = false;
   if (outcome.applied.length > 0) {
@@ -4447,7 +4795,15 @@ async function handleGroupApply(windowId, groups) {
   if (!(await aiGroupingEnabled())) {
     return { ok: false, error: "disabled", message: "AI tab grouping is turned off." };
   }
-  return commitTabGroups(windowId, groups, { notify: true });
+  const preview = cachedProposal(windowId);
+  const includeExistingGroups = Boolean(preview && lastProposalByWindow.get(windowId)?.includeExistingGroups);
+  if (includeExistingGroups) {
+    const previewIds = new Set(preview.flatMap((group) => group.tabs.map((tab) => tab.id)));
+    groups = (Array.isArray(groups) ? groups : []).filter(isRecord).map((group) => ({
+      ...group, tabs: (Array.isArray(group.tabs) ? group.tabs : []).filter((tab) => isRecord(tab) && previewIds.has(tab.id)),
+    }));
+  }
+  return commitTabGroups(windowId, groups, { notify: true, includeExistingGroups });
 }
 
 function scheduleAutoGroup(windowId) {
@@ -5286,6 +5642,8 @@ browser.alarms.onAlarm.addListener((alarm) => {
     connect();
   } else if (alarm.name === SCHEDULE_ALARM_NAME) {
     enqueueFocusWork(() => handleScheduleTick()).catch((error) => console.error("Schedule activation error:", error));
+  } else if (alarm.name === TIMED_SESSION_ALARM) {
+    return enqueueFocusWork(() => restoreTimedAlarm()).catch((error) => console.error("Timed activation error:", error));
   }
 });
 

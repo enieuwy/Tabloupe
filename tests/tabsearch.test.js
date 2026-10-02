@@ -379,6 +379,7 @@ test("recently closed sessions render in browse mode and restore by session id",
   await settle();
 
   assert.ok(harness.sent.some((message) => message.type === "tabsearch-restore-session" && message.sessionId === "closed-1"));
+  assert.equal(overlayRoot(harness).querySelector(".message"), null, "successful restore must not display a failure");
 });
 
 test("recently closed access is requested only from its footer action", async () => {

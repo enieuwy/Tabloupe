@@ -24,14 +24,17 @@
     "search",
     "contextualIdentities",
     "cookies",
+    "contextMenus",
     "ws://127.0.0.1/*"
   ],
   "optional_permissions": [
     "sessions",
+    "bookmarks",
     "https://*/*",
     "http://localhost/*",
     "http://127.0.0.1/*"
   ],
+  "omnibox": { "keyword": "tl" },
   "content_security_policy": "script-src 'self'; object-src 'self'; connect-src 'self' https: http://localhost:* http://127.0.0.1:* ws://127.0.0.1:8767;",
   "commands": {
     "search-tabs": {
@@ -88,6 +91,7 @@
         "<all_urls>"
       ],
       "js": [
+        "browser-compat.js",
         "tabsearch.js"
       ],
       "run_at": "document_idle",
@@ -111,7 +115,12 @@
   },
   "background": {
     "scripts": [
-      "background.js"
+      "browser-compat.js",
+      "vendor/ical.js",
+      "calendar.js",
+      "background.js",
+      "calendar-runtime.js",
+      "native-runtime.js"
     ],
     "persistent": false
   }

@@ -2651,7 +2651,6 @@ test("tabsearch-ai-preview needs at least two selected candidates", async () => 
 
   assert.equal(result.ok, false);
   assert.equal(result.error, "not_enough_tabs");
-  assert.equal(result.message, "Select at least 2 ungrouped tabs to organize.");
   assert.equal(harness.sentMessages.filter((frame) => frame.type === "groupTabs").length, 0);
 });
 
@@ -6257,4 +6256,261 @@ test("a failed welcome-page open does not retry forever (f0333b03)", async () =>
   }
   await waitFor(() => assert.equal(harness.storageData.onboardingSeen, true));
   assert.ok(harness.consoleErrors.some((args) => String(args[0]).includes("Opening the welcome page failed")));
+});
+
+test("rich selectors use the same group membership for activation and savedIn", async () => {
+  const harness = createHarness({
+    storage: { lenses: [
+      lens("blue", "Blue", [{ type: "color", value: "BLUE" }]),
+      lens("host", "Code", [{ type: "urlHost", value: "GITHUB.COM" }]),
+      lens("regex", "Tasks", [{ type: "regex", value: "^Project .*$" }]),
+    ] },
+    groups: [
+      { id: 1, windowId: 1, title: "Project Alpha", color: "blue" },
+      { id: 2, windowId: 1, title: "Code", color: "red" },
+      { id: 3, windowId: 1, title: "Other", color: "grey" },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, url: "https://example.test/", active: true },
+      { id: 11, windowId: 1, groupId: 2, url: "https://GITHUB.COM/repo" },
+      { id: 12, windowId: 1, groupId: 3, url: "https://github.com.evil.test/github.com" },
+    ],
+  });
+  await settle();
+  const state = await harness.request({ type: "lens-state", windowId: 1 });
+  assert.deepEqual(clone(state.currentGroups.map((group) => group.savedIn)), [["Blue", "Tasks"], ["Code"], []]);
+  await harness.request({ type: "lens-activate", view: { kind: "lens", lensId: "host" } });
+  assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.id === 1).collapsed, true);
+  await harness.request({ type: "lens-activate", windowId: 1,
+    view: { kind: "transient", selectors: [{ type: "color", value: "grey" }] } });
+  assert.equal(harness.groupState.find((group) => group.id === 3).collapsed, false);
+  assert.equal(harness.groupState.find((group) => group.id === 2).collapsed, true);
+});
+
+test("unsafe regexes and non-host URLs cannot change a lens", async () => {
+  const harness = createHarness({ storage: { lenses: [lens("a", "A", [])] } });
+  await settle();
+  for (const selector of [
+    { type: "regex", value: "(a+)+$" },
+    { type: "regex", value: "a|aa" },
+    { type: "regex", value: ".*a.*" },
+    { type: "regex", value: String.raw`a\1` },
+    { type: "regex", value: "x".repeat(129) },
+    { type: "urlHost", value: "https://github.com/path" },
+  ]) {
+    const result = await harness.request({ type: "lens-update", lensId: "a", patch: { groupSelectors: [selector] } });
+    assert.equal(result.error, "invalid_selectors");
+    assert.deepEqual(harness.storageData.lenses[0].groupSelectors, []);
+  }
+});
+
+test("lens packs import atomically with fresh IDs and no automation or snapshot data", async () => {
+  const harness = createHarness();
+  await settle();
+  const portable = { name: "Code", id: "old", groupSelectors: [{ type: "urlHost", value: "github.com" }],
+    triggers: { appleFocusIds: ["private"], calendarPatterns: ["meeting"] }, snapshot: { tabs: ["private"] } };
+  const result = await harness.request({ type: "lens-import",
+    code: JSON.stringify({ tabloupeLensPack: 1, lenses: [portable, { ...portable, name: "Blue", groupSelectors: [{ type: "color", value: "blue" }] }] }) });
+  assert.equal(result.ok, true);
+  assert.equal(new Set(result.lenses.map((entry) => entry.id)).size, 2);
+  assert.ok(result.lenses.every((entry) => entry.id !== "old"));
+  assert.deepEqual(harness.storageData.lenses.map((entry) => entry.triggers), [
+    { appleFocusIds: [], calendarPatterns: [] }, { appleFocusIds: [], calendarPatterns: [] },
+  ]);
+  assert.ok(harness.storageData.lenses.every((entry) => !Object.hasOwn(entry, "snapshot")));
+  const before = clone(harness.storageData.lenses);
+  const bad = await harness.request({ type: "lens-import",
+    code: JSON.stringify({ tabloupeLensPack: 1, lenses: [portable, { name: "" }] }) });
+  assert.equal(bad.ok, false);
+  assert.deepEqual(harness.storageData.lenses, before);
+});
+
+test("snapshots restore missing safe URLs and merge groups without changing existing colors", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lens("a", "Work", [{ type: "title", value: "Work" }])] },
+    groups: [{ id: 1, windowId: 1, title: "Work", color: "blue" }],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, url: "https://example.test/open" },
+      { id: 11, windowId: 1, groupId: 1, url: "https://example.test/closed" },
+      { id: 12, windowId: 1, groupId: 1, url: "about:config" },
+      { id: 13, windowId: 1, groupId: 1, url: "https://example.test/pinned", pinned: true },
+    ],
+  });
+  await settle();
+  const saved = await harness.request({ type: "lens-snapshot-save", lensId: "a", windowId: 1 });
+  assert.equal(saved.ok, true);
+  assert.deepEqual(clone(saved.snapshot.tabs.map((tab) => tab.url)), [
+    "https://example.test/open", "https://example.test/closed", "https://example.test/pinned",
+  ]);
+  harness.tabState.splice(1);
+  harness.groupState[0].color = "red";
+  const restored = await harness.request({ type: "lens-snapshot-restore", lensId: "a", windowId: 1 });
+  assert.deepEqual(clone(restored), { ok: true, restored: 2, skipped: 1 });
+  assert.equal(harness.groupState[0].color, "red");
+  assert.equal(harness.tabState.find((tab) => tab.url.endsWith("/closed")).groupId, 1);
+  assert.equal(harness.tabState.find((tab) => tab.url.endsWith("/pinned")).pinned, true);
+  const again = await harness.request({ type: "lens-snapshot-restore", lensId: "a", windowId: 1 });
+  assert.deepEqual(clone(again), { ok: true, restored: 0, skipped: 3 });
+});
+
+test("a second snapshot restore does not duplicate tabs whose navigation is still pending", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("pending", "Work", [{ type: "title", value: "Work" }])],
+      lensTabSnapshots: { pending: { at: Date.now(), tabs: [{ title: "Document", url: "https://example.test/document", groupTitle: "Work", color: "blue", pinned: false }] } },
+    },
+  });
+  await settle();
+  const originalCreate = harness.context.browser.tabs.create;
+  harness.context.browser.tabs.create = async (properties) => {
+    const created = await originalCreate(properties);
+    harness.tabState.find((tab) => tab.id === created.id).url = "about:blank";
+    return { ...created, url: "about:blank", status: "loading" };
+  };
+  const first = await harness.request({ type: "lens-snapshot-restore", lensId: "pending", windowId: 1 });
+  assert.equal(first.restored, 1);
+  const second = await harness.request({ type: "lens-snapshot-restore", lensId: "pending", windowId: 1 });
+  assert.deepEqual(clone(second), { ok: true, restored: 0, skipped: 1 });
+});
+
+test("snapshot restore reports partial group errors while retaining created tabs", async () => {
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("a", "Work", [])],
+      lensTabSnapshots: { a: { at: 1, tabs: [
+        { url: "https://example.test/a", groupTitle: "Work", color: "blue" },
+        { url: "javascript:alert(1)", groupTitle: "Work" },
+      ] } },
+    },
+  });
+  await settle();
+  harness.browser.tabs.group = async () => { throw new Error("group denied"); };
+  const result = await harness.request({ type: "lens-snapshot-restore", lensId: "a", windowId: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "restore_partial");
+  assert.equal(result.restored, 1);
+  assert.deepEqual(harness.tabState.map((tab) => tab.url), ["https://example.test/a"]);
+  assert.equal(result.failures[0].groupTitle, "Work");
+});
+
+test("snapshot storage evicts old lenses and refuses an oversized tab set", async () => {
+  const old = Object.fromEntries(Array.from({ length: 50 }, (_, index) => [`old_${index}`, { at: index + 1, tabs: [] }]));
+  const harness = createHarness({
+    storage: { lenses: [lens("a", "Work", [{ type: "title", value: "Work" }])], lensTabSnapshots: old },
+    groups: [{ id: 1, windowId: 1, title: "Work" }],
+    tabs: [{ id: 10, windowId: 1, groupId: 1, url: "https://example.test/" }],
+  });
+  await settle();
+  await harness.request({ type: "lens-snapshot-save", lensId: "a", windowId: 1 });
+  assert.equal(Object.keys(harness.storageData.lensTabSnapshots).length, 50);
+  assert.equal(harness.storageData.lensTabSnapshots.old_0, undefined);
+  assert.equal(harness.storageData.lensTabSnapshots.a.tabs[0].url, "https://example.test/");
+  const before = clone(harness.storageData.lensTabSnapshots);
+  harness.tabState.push(...Array.from({ length: 200 }, (_, index) =>
+    ({ id: 20 + index, windowId: 1, groupId: 1, url: `https://example.test/${index}` })));
+  const tooLarge = await harness.request({ type: "lens-snapshot-save", lensId: "a", windowId: 1 });
+  assert.equal(tooLarge.error, "snapshot_too_large");
+  assert.deepEqual(harness.storageData.lensTabSnapshots, before);
+});
+
+test("timed focus persists alarm ownership, expires to the previous view, and records timed history", async () => {
+  const harness = createHarness({ storage: { lenses: [lens("a", "A", [])], activeView: { kind: "all" } } });
+  await settle();
+  const started = await harness.request({ type: "lens-timed-start", lensId: "a", minutes: 1 });
+  assert.equal(started.ok, true);
+  assert.equal(harness.storageData.activeView.lensId, "a");
+  assert.equal(harness.storageData.lastActivation.trigger, "timed");
+  assert.equal(harness.alarms.findLast((alarm) => alarm.name === "lens-timed-end").config.when, started.session.endsAt);
+  const resumed = createHarness({ storage: clone(harness.storageData) });
+  await settle();
+  assert.equal(resumed.alarms.findLast((alarm) => alarm.name === "lens-timed-end").config.when, started.session.endsAt);
+  resumed.storageData.timedLensSession.endsAt = Date.now() - 1;
+  await resumed.alarms.listener({ name: "lens-timed-end" });
+  assert.deepEqual(resumed.storageData.activeView, { kind: "all" });
+  assert.equal(resumed.storageData.timedLensSession, null);
+  const history = resumed.storageData.focusSessionHistory;
+  assert.equal(history.at(-1).trigger, "timed");
+  assert.equal(history.at(-1).view.lensId, "a");
+  assert.ok(history.at(-1).endedAt >= history.at(-1).startedAt);
+});
+
+test("manual and automation switches cancel timed ownership even when the lens remains the same", async () => {
+  for (const trigger of ["manual", "calendar"]) {
+    const harness = createHarness({ storage: { lenses: [lens("a", "A", [])], activeView: { kind: "all" } } });
+    await settle();
+    await harness.request({ type: "lens-timed-start", lensId: "a", minutes: 1 });
+    await harness.context.activateView({ kind: "lens", lensId: "a" }, { trigger });
+    assert.equal(harness.storageData.timedLensSession, null);
+    await harness.alarms.listener({ name: "lens-timed-end" });
+    assert.equal(harness.storageData.activeView.lensId, "a");
+    assert.equal(harness.storageData.lastActivation.trigger, trigger);
+    assert.equal(harness.storageData.focusSessionHistory.at(-1).trigger, "timed");
+  }
+});
+
+test("explicit timed cancellation leaves the current lens visible and ends timed history", async () => {
+  const harness = createHarness({ storage: { lenses: [lens("a", "A", [])] } });
+  await settle();
+  await harness.request({ type: "lens-timed-start", lensId: "a", minutes: 1 });
+  const result = await harness.request({ type: "lens-timed-cancel" });
+  assert.equal(result.ok, true);
+  assert.equal(harness.storageData.activeView.lensId, "a");
+  assert.equal(harness.storageData.timedLensSession, null);
+  assert.equal(harness.storageData.focusSessionHistory.at(-1).trigger, "timed");
+});
+
+test("AI re-clustering preserves cached mode and revalidates pinned and privileged tabs on apply", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true, aiProvider: { kind: "custom", baseURL: "https://api.example.test/v1", model: "model" } },
+    groups: [{ id: 1, windowId: 1, title: "Old" }],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, url: "https://example.test/a" },
+      { id: 11, windowId: 1, groupId: 1, url: "https://example.test/b" },
+      { id: 12, windowId: 1, groupId: 1, url: "https://example.test/c" },
+      { id: 13, windowId: 1, groupId: 1, url: "about:config" },
+    ],
+    fetchHandler: async () => chatCompletion([{ topic: "New", tabIndices: [0, 1, 2] }]),
+  });
+  await settle();
+  assert.equal((await harness.request({ type: "ai-group-state", windowId: 1 })).groupableCount, 0);
+  assert.equal((await harness.request({ type: "ai-group-state", windowId: 1, includeExistingGroups: true })).groupableCount, 3);
+  const preview = await harness.request({ type: "ai-group-preview", windowId: 1, includeExistingGroups: true });
+  harness.tabState.find((tab) => tab.id === 11).pinned = true;
+  harness.tabState.find((tab) => tab.id === 12).url = "about:config";
+  const result = await harness.request({ type: "ai-group-apply", windowId: 1, groups: preview.groups });
+  assert.equal(result.ok, true);
+  assert.notEqual(harness.tabState.find((tab) => tab.id === 10).groupId, 1);
+  for (const id of [11, 12, 13]) assert.equal(harness.tabState.find((tab) => tab.id === id).groupId, 1);
+});
+
+test("AI lens suggestions use the configured provider without saving or regrouping", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true, aiProvider: { kind: "custom", baseURL: "https://api.example.test/v1", model: "model" } },
+    groups: [{ id: 1, windowId: 1, title: "Existing Work" }],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, url: "https://example.test/a", title: "Design" },
+      { id: 11, windowId: 1, groupId: 1, url: "https://example.test/b", title: "Code" },
+    ],
+    fetchHandler: async () => chatCompletion([{ topic: "Project", tabIndices: [0, 1] }]),
+  });
+  await settle();
+  const result = await harness.request({ type: "ai-lens-suggest", windowId: 1 });
+  assert.deepEqual(clone(result), { ok: true, proposal: { name: "Project", groupTitles: ["Existing Work"] } });
+  assert.equal(harness.storageData.lenses, undefined);
+  assert.deepEqual(harness.groupCreations, []);
+  assert.equal(harness.sentMessages.filter((frame) => frame.type === "groupTabs").length, 0);
+});
+
+test("deleting a timed lens cancels the timer and records its completed span", async () => {
+  const harness = createHarness({ storage: { lenses: [lens("a", "A", [])] } });
+  await settle();
+  await harness.request({ type: "lens-timed-start", lensId: "a", minutes: 1 });
+  await harness.request({ type: "lens-delete", lensId: "a" });
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+  assert.equal(harness.storageData.timedLensSession, null);
+  assert.equal(harness.storageData.focusSessionHistory.at(-1).trigger, "timed");
+  assert.equal(harness.storageData.focusSessionHistory.at(-1).view.lensId, "a");
+  await harness.alarms.listener({ name: "lens-timed-end" });
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
 });

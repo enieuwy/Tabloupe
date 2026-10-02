@@ -65,6 +65,51 @@ h1 {
   border-radius: var(--radius);
 }
 
+.timed-focus-panel,
+#ai-lens-preview {
+  display: grid;
+  gap: 8px;
+  padding: 11px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.timed-focus-panel h2 {
+  margin: 0;
+  font-size: 12px;
+}
+
+.timed-focus-controls {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+}
+
+.timed-focus-controls button {
+  grid-column: 1 / -1;
+}
+
+.timed-focus-controls input,
+.timed-focus-controls select,
+#ai-lens-preview input,
+#ai-lens-preview textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+}
+
+#ai-suggest-lens {
+  width: 100%;
+  margin: 10px 0;
+}
+
 .showing-line {
   margin: 0;
   font-size: 14px;

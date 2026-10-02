@@ -848,6 +848,51 @@ test("a failed window-profile save rolls the selector back (9e829756)", async ()
   assert.match(harness.document.getElementById("lens-status").textContent, /Could not save this window's automation setting/);
 });
 
+test("timed focus rejects fractions and durations outside the popup limit before changing the view", async () => {
+  const harness = createHarness({
+    respond: (message) => message.type === "lens-state" ? defaultLensState({
+      lenses: [{ id: "lens_work", name: "Work" }],
+    }) : { ok: true },
+  });
+  await settle();
+  const input = harness.document.getElementById("timed-focus-minutes");
+  for (const value of ["", "0", "241", "1.5"]) {
+    input.value = value;
+    harness.document.getElementById("timed-focus-start").click();
+    await settle();
+  }
+  assert.equal(harness.sent.some((message) => message.type === "lens-timed-start"), false);
+  assert.equal(harness.document.getElementById("timed-focus-start").disabled, false);
+  harness.dom.window.close();
+});
+
+test("a failed suggested-lens save keeps the editable preview for retry", async () => {
+  let lensSaves = 0;
+  const harness = createHarness({
+    respond: (message) => {
+      if (message.type === "lens-state") return defaultLensState({ currentGroups: [{ title: "Work" }], hasGroups: true });
+      if (message.type === "ai-group-state") return { enabled: true, groupableCount: 0 };
+      if (message.type === "ai-lens-suggest") return { ok: true, proposal: { name: "Work", groupTitles: ["Work"] } };
+      if (message.type === "lens-import") { lensSaves += 1; return { ok: false, error: "storage_failed" }; }
+      return {};
+    },
+  });
+  await settle();
+  await openAi(harness);
+  harness.document.getElementById("ai-suggest-lens").click();
+  await settle();
+  assert.equal(lensSaves, 0, "a proposal does not silently create a lens");
+  const name = harness.document.getElementById("ai-lens-name");
+  name.value = "Edited work";
+  harness.document.getElementById("ai-lens-save").click();
+  await settle();
+  assert.equal(harness.document.getElementById("ai-lens-preview").hidden, false);
+  assert.equal(name.value, "Edited work");
+  assert.equal(harness.document.getElementById("ai-lens-save").disabled, false);
+  assert.equal(harness.closed, 0);
+  harness.dom.window.close();
+});
+
 test("a failed tab-search open keeps the popup open with an error (4e115a7f)", async () => {
   const harness = createHarness({
     respond: (message) => {
