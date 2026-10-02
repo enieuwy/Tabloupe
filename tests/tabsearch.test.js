@@ -244,31 +244,63 @@ test("group titles are searchable and rendered as badges", async () => {
   assert.equal(badge.dataset.color, "purple");
 });
 
-test("rendering is bounded for large tab lists", async () => {
+test("browse mode reaches the last tab beyond the ranked search cap", async () => {
   const tabs = Array.from({ length: 75 }, (_, index) => ({
     id: index + 1,
-    windowId: 1,
+    windowId: index < 60 ? 1 : 2,
     title: `Example ${index + 1}`,
     url: `https://example.com/${index + 1}`,
-    favIconUrl: "",
     active: index === 0,
-    currentWindow: true,
+    currentWindow: index < 60,
+    grouped: index >= 60,
+    groupId: index >= 60 ? 9 : -1,
+    groupTitle: index >= 60 ? "Later window" : "",
   }));
   const harness = createHarness({ tabs });
-  assert.equal(
-    harness.window.filterTabs(harness.window.prepareTabsForSearch(tabs), "example", 50).length,
-    50,
-  );
   pressCtrlS(harness);
   await settle();
-
+  assert.deepEqual(rowTitles(harness), tabs.map((tab) => tab.title));
   const root = overlayRoot(harness);
-  assert.equal(root.querySelectorAll(".row:not(.action-row)").length, 50);
+  assert.match(root.querySelector(".group-header").textContent, /Later window/);
+  pressKey(harness, "ArrowUp");
+  pressKey(harness, "Enter");
+  await settle();
+  assert.deepEqual(plain(harness.sent.find((m) => m.type === "tabsearch-activate")), {
+    type: "tabsearch-activate", tabId: 75, windowId: 2,
+  });
+});
 
-  const input = root.querySelector(".search");
-  input.value = "example";
-  input.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
-  assert.equal(root.querySelectorAll(".row:not(.action-row)").length, 50);
+test("group header drops leave marked tabs from another window untouched", async () => {
+  const tabs = SAMPLE_TABS.map((tab) => ({ ...tab, groupId: tab.grouped ? 5 : -1 }));
+  const harness = createHarness({
+    tabs,
+    respond(message) {
+      if (message.type === "tabsearch-list") return tabs;
+      if (message.type === "tabsearch-group") return { ok: true, list: tabs };
+      return {};
+    },
+  });
+  pressCtrlS(harness);
+  await settle();
+  rows(harness)[0].querySelector("input").click();
+  rows(harness)[2].querySelector("input").click();
+  rows(harness)[0].dispatchEvent(new harness.window.Event("dragstart", { bubbles: true }));
+  overlayRoot(harness).querySelector(".group-header").dispatchEvent(
+    new harness.window.Event("drop", { bubbles: true, cancelable: true }),
+  );
+  await settle();
+  const request = harness.sent.find((message) => message.type === "tabsearch-group");
+  assert.deepEqual(plain(request.tabIds), [20]);
+  assert.equal(request.windowId, 1);
+  assert.match(overlayRoot(harness).querySelector(".message").textContent, /Only tabs in that window/);
+  harness.sent.length = 0;
+  rows(harness)[2].dispatchEvent(new harness.window.Event("dragstart", { bubbles: true }));
+  overlayRoot(harness).querySelector(".group-header").dispatchEvent(
+    new harness.window.Event("drop", { bubbles: true, cancelable: true }),
+  );
+  await settle();
+  assert.equal(harness.sent.some((message) => message.type === "tabsearch-group"), false);
+  assert.match(overlayRoot(harness).querySelector(".message").textContent, /within one window/);
 });
 
 test("Enter activates the selected tab and closes the overlay", async () => {

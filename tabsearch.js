@@ -176,11 +176,6 @@ function prepareTabsForSearch(tabs) {
   return tabs;
 }
 
-function faviconFor(tab) {
-  const url = tab.favIconUrl || "";
-  // Only render http(s)/data favicons; skip privileged/empty to avoid console noise.
-  return /^(https?:|data:)/i.test(url) ? url : "";
-}
 
 function isOpen() {
   return host !== null;
@@ -540,7 +535,7 @@ function render(query) {
   }
   const trimmed = query.trim();
   const matches = filterTabs(allTabs, query, MAX_RENDERED_RESULTS);
-  const renderedCount = Math.min(matches.length, MAX_RENDERED_RESULTS);
+  const renderedCount = trimmed === "" ? matches.length : Math.min(matches.length, MAX_RENDERED_RESULTS);
   const actionRows = [];
   const historyRows = [];
   const recentRows = trimmed === "" ? recentlyClosed : [];
@@ -754,18 +749,8 @@ function makeTabRow(tab, index, interactive, opts = {}) {
   });
   row.appendChild(mark);
 
-  const favUrl = faviconFor(tab);
-  if (favUrl) {
-    const fav = document.createElement("img");
-    fav.className = "fav";
-    fav.src = favUrl;
-    fav.addEventListener("error", () => {
-      fav.replaceWith(makeFavFallback());
-    });
-    row.appendChild(fav);
-  } else {
-    row.appendChild(makeFavFallback());
-  }
+  // Use a local icon: shadow DOM does not isolate resource loads from the page.
+  row.appendChild(makeFavFallback());
 
   const text = document.createElement("div");
   text.className = "text";
@@ -962,25 +947,29 @@ function hideDropIndicator() {
   if (dropIndicator) dropIndicator.style.display = "none";
 }
 
-function dropAtPosition(tabIds, index, placeAfter) {
-  const anchor = filtered[index];
-  if (!anchor) return;
-  // Tab groups are window-scoped and a marked selection may span windows.
-  // Dragging only reorders within the anchor's window, so drop the outsiders
-  // instead of relocating them across windows behind the user's back.
+function tabsInDropWindow(tabIds, windowId) {
+  // Both drop targets must leave tabs from other windows untouched.
   const byId = new Map(allTabs.map((tab) => [tab.id, tab]));
   const sameWindowIds = tabIds.filter((id) => {
     const tab = byId.get(id);
-    return tab && tab.windowId === anchor.windowId;
+    return tab && tab.windowId === windowId;
   });
   if (sameWindowIds.length === 0) {
     actionMessage = "Drag only works within one window.";
     if (isOpen()) render(inputEl.value);
-    return;
+    return [];
   }
   if (sameWindowIds.length !== tabIds.length) {
     actionMessage = "Only tabs in that window were moved.";
   }
+  return sameWindowIds;
+}
+
+function dropAtPosition(tabIds, index, placeAfter) {
+  const anchor = filtered[index];
+  if (!anchor) return;
+  const sameWindowIds = tabsInDropWindow(tabIds, anchor.windowId);
+  if (sameWindowIds.length === 0) return;
   const prev = placeAfter ? anchor : filtered[index - 1];
   const next = placeAfter ? filtered[index + 1] : anchor;
   const inWindow = (tab) => tab && tab.windowId === anchor.windowId;
@@ -1135,6 +1124,9 @@ function makeGroupHeader(tab, count) {
 
 function groupOntoExisting(tabIds, groupId, windowId) {
   if (!Array.isArray(tabIds) || tabIds.length === 0) return;
+  const requestedCount = tabIds.length;
+  tabIds = tabsInDropWindow(tabIds, windowId);
+  if (tabIds.length === 0) return;
   return runGuardedListAction(
     () => browser.runtime.sendMessage({ type: "tabsearch-group", tabIds, groupId, windowId }),
     {
@@ -1143,6 +1135,7 @@ function groupOntoExisting(tabIds, groupId, windowId) {
           if (Array.isArray(result.list)) allTabs = prepareTabsForSearch(result.list);
           clearMarks();
           pruneMarked();
+          if (tabIds.length !== requestedCount) actionMessage = "Only tabs in that window were moved.";
         } else {
           actionMessage = (result && (result.message || result.error)) || "Could not group tabs.";
         }
