@@ -337,21 +337,6 @@ build_and_sign() {
     success "  ✓ Build complete"
   fi
 
-  # Find the latest XPI by modification time
-  XPI_PATH="$(python3 - "$XPI_DIR" <<'PY'
-import sys
-from pathlib import Path
-
-artifact_dir = Path(sys.argv[1])
-files = sorted(artifact_dir.glob("*.xpi"), key=lambda path: path.stat().st_mtime, reverse=True)
-print(files[0] if files else "")
-PY
-)"
-  if [[ -z "$XPI_PATH" || ! -f "$XPI_PATH" ]]; then
-    die "No .xpi found in $XPI_DIR"
-  fi
-
-  # Extract version from manifest
   NEW_VERSION="$(python3 - "$REPO_DIR/manifest.json" <<'PY'
 import json
 import sys
@@ -361,6 +346,30 @@ with Path(sys.argv[1]).open() as handle:
     print(json.load(handle)["version"])
 PY
 )"
+
+  # Select by the embedded version, not just the newest artifact's mtime.
+  XPI_PATH="$(python3 - "$XPI_DIR" "$NEW_VERSION" <<'PY'
+import json
+import sys
+import zipfile
+from pathlib import Path
+
+artifact_dir = Path(sys.argv[1])
+files = sorted(artifact_dir.glob("*.xpi"), key=lambda path: path.stat().st_mtime, reverse=True)
+for path in files:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            version = json.loads(archive.read("manifest.json"))["version"]
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile):
+        continue
+    if version == sys.argv[2]:
+        print(path)
+        break
+PY
+)"
+  if [[ -z "$XPI_PATH" || ! -f "$XPI_PATH" ]]; then
+    die "No .xpi with embedded version $NEW_VERSION found in $XPI_DIR"
+  fi
 
   info "  XPI:     $XPI_PATH"
   info "  Version: $NEW_VERSION"
@@ -397,8 +406,8 @@ main() {
 
   # Always run
   preflight_checks
-  snapshot_session
   build_and_sign
+  snapshot_session
 
   if $DRY_RUN; then
     print_summary

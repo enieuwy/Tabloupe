@@ -43,11 +43,11 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   exit 1
 fi
 
-SIGN_SUCCEEDED=false
+SUBMISSION_ACCEPTED=false
 ORIGINAL_MANIFEST=""
 
 cleanup() {
-  if [[ "$SIGN_SUCCEEDED" != true && -n "$ORIGINAL_MANIFEST" ]]; then
+  if [[ "$SUBMISSION_ACCEPTED" != true && -n "$ORIGINAL_MANIFEST" ]]; then
     cp "$ORIGINAL_MANIFEST" manifest.json
   fi
   [[ -n "$ORIGINAL_MANIFEST" ]] && rm -f "$ORIGINAL_MANIFEST"
@@ -59,7 +59,7 @@ ORIGINAL_MANIFEST="$(mktemp)"
 cp manifest.json "$ORIGINAL_MANIFEST"
 
 echo "Bump version in manifest.json..."
-python3 - <<'PY'
+NEW_VERSION="$(python3 - <<'PY'
 import json
 from pathlib import Path
 
@@ -68,21 +68,52 @@ data = json.loads(manifest.read_text())
 major, minor, patch = data["version"].split(".")
 data["version"] = ".".join((major, minor, str(int(patch) + 1)))
 manifest.write_text(json.dumps(data, indent=2) + "\n")
-print("Bumped version to:", data["version"])
+print(data["version"])
 PY
+)"
+echo "Bumped version to: $NEW_VERSION"
 
 echo "Packaging and submitting to Mozilla ($CHANNEL)..."
 # The listed channel submits the build for AMO review. The first listed
 # submission creates the public listing, and the .xpi may not be signed
 # immediately.
 npx --no-install web-ext sign --channel="$CHANNEL"
-SIGN_SUCCEEDED=true
+# A successful submission reserves this version at AMO even if signing is
+# pending. Do not restore the manifest and reuse an accepted version.
+SUBMISSION_ACCEPTED=true
 
-# Keep only the newest signed artifacts; old XPIs accumulate a full copy of
-# the extension per build and deploy only ever needs the latest one.
-# Retention is optional cleanup, so it must never fail the run: a listed
-# submission can return no .xpi at all, and under `set -euo pipefail` a globbing
-# `ls` with no matches would abort the script *after* signing succeeded.
+XPI_PATH="$(python3 - "$NEW_VERSION" <<'PY'
+import json
+import sys
+import zipfile
+from pathlib import Path
+
+files = sorted(Path("web-ext-artifacts").glob("*.xpi"),
+               key=lambda path: path.stat().st_mtime, reverse=True)
+for path in files:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            version = json.loads(archive.read("manifest.json"))["version"]
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile):
+        continue
+    if version == sys.argv[1]:
+        print(path)
+        break
+PY
+)"
+
+if [[ -z "$XPI_PATH" ]]; then
+  if [[ "$CHANNEL" == listed ]]; then
+    echo "Submission accepted for version $NEW_VERSION; signing is pending."
+    echo "No matching .xpi is available. Do not install an older artifact for this version."
+    exit 0
+  fi
+  echo "Error: submission accepted for version $NEW_VERSION, but no matching .xpi is available." >&2
+  exit 1
+fi
+
+# Keep the newest signed artifacts, and always retain the matching installable
+# artifact even if an older version has a newer modification time.
 KEEP_ARTIFACTS=5
 if [[ -d web-ext-artifacts ]]; then
   shopt -s nullglob
@@ -90,9 +121,10 @@ if [[ -d web-ext-artifacts ]]; then
   shopt -u nullglob
   if ((${#artifacts[@]} > KEEP_ARTIFACTS)); then
     while IFS= read -r old_xpi; do
+      [[ "$old_xpi" == "$XPI_PATH" ]] && continue
       rm -f "$old_xpi"
     done < <(ls -t "${artifacts[@]}" | tail -n +$((KEEP_ARTIFACTS + 1)))
   fi
 fi
 
-echo "Done! You can install the new .xpi from ./web-ext-artifacts/ via about:addons"
+echo "Done! Install version $NEW_VERSION from $XPI_PATH via about:addons"
