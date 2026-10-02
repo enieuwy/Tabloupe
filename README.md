@@ -28,6 +28,8 @@ npm ci
 
 Then `about:addons` → gear menu → *Install Add-on From File…* and pick the `.xpi`. Signing requires AMO API keys in `.env` (see `build.sh`).
 
+`./build.sh listed` can succeed while AMO signing is still pending. The accepted submission keeps its version reserved. Install only when the script reports a matching artifact. `deploy.sh` checks the XPI's embedded version against `manifest.json` before taking a Firefox session snapshot or showing install instructions.
+
 For development, run it in a throwaway profile instead:
 
 ```sh
@@ -43,6 +45,10 @@ npx web-ext run --firefox=deved
 
 Everything else — selector editing, schedules, calendar patterns, container rules, sync, backup — lives in the Options page.
 
+Untitled groups appear as **Untitled group** during onboarding and in Options. Saving them creates an empty-title selector, which matches untitled groups without matching named groups.
+
+Tab Search browse mode includes every open tab; only ranked search results have a display cap. Dragging onto a row or group header affects only tabs in the target window.
+
 ## Optional macOS helper
 
 `mac-command-centre` is a small Swift daemon (not yet published) that provides Focus-mode and calendar triggers plus on-device AI grouping over a local WebSocket (`ws://127.0.0.1:8767`). It is entirely optional: manual lens switching works on every OS without it.
@@ -53,12 +59,16 @@ Pair the two by running `mac-command-centre pairing-token` and pasting the token
 
 No telemetry, no analytics, no accounts. Everything stays on your machine unless you explicitly configure a remote AI endpoint — in which case only tab titles and hostnames of the window being organized are sent, to that endpoint alone. Backup export never includes API keys. The full permissions rationale is in [`docs/amo-listing.md`](docs/amo-listing.md).
 
+Tab Search uses local generic icons instead of loading other tabs' favicon URLs into the current page.
+
 ## Development
 
 ```sh
 npm ci
 npm run verify        # web-ext lint + node --test (260+ tests) + npm audit
 ```
+
+Run `bash tests/signing.test.sh` for offline signing/deployment smoke checks. It uses temporary profiles, synthetic XPIs, and a stub signer; it does not contact AMO.
 
 The codebase is unminified vanilla JS with no build step: `background.js` (event page, lens model, activation, bus client), `popup.js`, `options.js`, `tabsearch.js` (content-script overlay). Architecture notes live in `AGENTS.md`.
 
