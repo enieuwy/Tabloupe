@@ -131,7 +131,7 @@ function normalizeSelector(value) {
   }
   const type = value.type === "glob" ? "glob" : value.type === "title" ? "title" : value.type === "container" ? "container" : null;
   const selectorValue = typeof value.value === "string" ? value.value.trim() : "";
-  if (!type || !selectorValue) {
+  if (!type || typeof value.value !== "string" || (!selectorValue && type !== "title")) {
     return null;
   }
   return { type, value: selectorValue };
@@ -235,7 +235,7 @@ function normalizeCurrentGroups(value) {
     return [];
   }
   return value
-    .filter((group) => isRecord(group) && typeof group.title === "string" && group.title.length > 0)
+    .filter((group) => isRecord(group) && typeof group.title === "string")
     .map((group) => ({
       title: group.title,
       color: typeof group.color === "string" ? group.color : null,
@@ -461,7 +461,7 @@ async function queryFirefoxGroupSnapshot() {
     const counts = {};
     const currentGroups = [];
     for (const group of groups) {
-      if (typeof group.title !== "string" || group.title.length === 0) continue;
+      if (typeof group.title !== "string") continue;
       counts[group.title] = (counts[group.title] || 0) + 1;
       currentGroups.push({
         title: group.title,
@@ -1138,7 +1138,7 @@ function makeChip(lensId, selector) {
   chip.className = `group-chip${selector.type === "glob" ? " group-chip-pattern" : ""}${selector.type === "container" ? " group-chip-container" : ""}${count === 0 ? " is-muted" : ""}`;
   const label = document.createElement("span");
   label.className = "group-chip-label";
-  label.textContent = selector.value;
+  label.textContent = selector.value || "Untitled group";
   chip.append(label);
 
   if (selector.type === "glob" || selector.type === "container") {
@@ -1167,7 +1167,7 @@ function makeChip(lensId, selector) {
   const remove = document.createElement("button");
   remove.type = "button";
   remove.className = "group-chip-remove";
-  remove.setAttribute("aria-label", `Remove ${selector.value}`);
+  remove.setAttribute("aria-label", `Remove ${selector.value || "Untitled group"}`);
   remove.textContent = "\u00d7";
   remove.addEventListener("click", () => removeSelectorFromLens(lensId, selector));
   chip.append(remove);
@@ -2029,7 +2029,7 @@ function makeGroupPaletteChip(group) {
   const chip = document.createElement("span");
   chip.className = "palette-chip group-palette-chip";
   const label = document.createElement("span");
-  label.textContent = group.title;
+  label.textContent = group.title || "Untitled group";
   const savedIn = currentGroupSavedIn(group);
   const meta = document.createElement("span");
   meta.className = "palette-chip-meta";

@@ -835,8 +835,9 @@ function normalizedSelectors(value) {
     if (!isRecord(selector) || !isSelectorType(selector.type)) {
       continue;
     }
-    const raw = typeof selector.value === "string" ? selector.value.trim() : "";
-    if (raw === "") {
+    if (typeof selector.value !== "string") continue;
+    const raw = selector.value.trim();
+    if (raw === "" && selector.type !== "title") {
       continue;
     }
     const key = `${selector.type}\u0000${raw}`;
@@ -1871,10 +1872,10 @@ async function lensesMatchingGroups(lenses, groups) {
 }
 
 function selectorsFromTitles(titles) {
-  return normalizeTitles(titles).map((title) => ({
+  return normalizedSelectors(titles.filter((title) => typeof title === "string").map((title) => ({
     type: isGlobPattern(title) ? "glob" : "title",
     value: title,
-  }));
+  })));
 }
 
 function selectorSetKey(selectors) {

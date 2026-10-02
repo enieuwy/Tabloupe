@@ -117,6 +117,22 @@ test("the welcome page offers the current window's groups as a first lens", asyn
   assert.equal(stateMessage.windowId, 7, "the page scopes its read to its own window");
 });
 
+test("untitled groups remain visible and require a lens name before saving", async () => {
+  const harness = createHarness({ currentGroups: [{ title: "", color: "blue", savedIn: [] }] });
+  await settle();
+  assert.deepEqual(groupChips(harness), ["Untitled group"]);
+  assert.equal(harness.document.getElementById("save-row").hidden, false);
+  assert.equal(harness.document.getElementById("groups-empty").hidden, true);
+  harness.document.getElementById("lens-name").value = "";
+  harness.document.getElementById("save-lens").click();
+  await settle();
+  assert.equal(harness.sent.some((message) => message.type === "lens-save"), false);
+  harness.document.getElementById("lens-name").value = "My groups";
+  harness.document.getElementById("save-lens").click();
+  await settle();
+  assert.equal(harness.document.getElementById("save-lens").textContent, "Saved");
+});
+
 test("saving from the welcome page uses the real lens-save path", async () => {
   const harness = createHarness({ currentGroups: [{ title: "Work", color: "blue", savedIn: [] }] });
   await settle();

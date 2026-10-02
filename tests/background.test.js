@@ -977,6 +977,35 @@ test("lens-activate expands matching groups, collapses non-matches, and persists
   assert.ok(harness.tabUpdates.some((entry) => entry.id === 10 && entry.patch.active === true));
 });
 
+test("saving untitled groups preserves an exact selector through reload and activation", async () => {
+  const harness = createHarness({
+    groups: [{ id: 1, windowId: 1, title: "", collapsed: true }],
+    tabs: [{ id: 10, windowId: 1, groupId: 1, active: false }],
+  });
+  await settle();
+  const saved = await harness.request({ type: "lens-save", source: "window", windowId: 1, name: "Untitled work" });
+  assert.equal(saved.ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(saved.lens.groupSelectors)), [{ type: "title", value: "" }]);
+  const reloaded = createHarness({
+    storage: harness.storageData,
+    groups: [
+      { id: 1, windowId: 1, title: "", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: true },
+    ],
+  });
+  await settle();
+  const result = await reloaded.request({
+    type: "lens-activate", windowId: 1, view: { kind: "lens", lensId: saved.lens.id },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(reloaded.groupState.find((group) => group.id === 1).collapsed, false);
+  assert.equal(reloaded.groupState.find((group) => group.id === 2).collapsed, true);
+});
+
 test("lens-activate all expands all groups and persists the all view", async () => {
   const harness = createHarness({
     storage: { activeView: { kind: "lens", lensId: "lens_work" } },

@@ -110,7 +110,7 @@ async function loadGroups() {
   try {
     const state = await browser.runtime.sendMessage({ type: "lens-state", windowId });
     const groups = state && Array.isArray(state.currentGroups) ? state.currentGroups : [];
-    renderGroups(groups.filter((group) => group && typeof group.title === "string" && group.title !== ""));
+    renderGroups(groups.filter((group) => group && typeof group.title === "string"));
   } catch (error) {
     console.error("Welcome page lens-state failed:", error);
     el("groups-summary").textContent = "Could not read this window's tab groups.";

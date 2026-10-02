@@ -278,6 +278,21 @@ function lensFixture(overrides = {}) {
   };
 }
 
+test("saved untitled selectors show live matches and remain removable", async () => {
+  const { document, messages } = createHarness({
+    storage: { lenses: [lensFixture({ groupSelectors: [{ type: "title", value: "" }] })] },
+    groups: [{ id: 1, title: "", color: "blue" }, { id: 2, title: "", color: "red" }],
+  });
+  await settle();
+  const chip = document.querySelector(".group-chip");
+  assert.equal(chip.querySelector(".group-chip-label").textContent, "Untitled group");
+  assert.equal(chip.querySelector(".group-chip-meta").textContent, "in 2 groups");
+  chip.querySelector(".group-chip-remove").click();
+  await settle();
+  const update = lastMessageOfType(messages, "lens-update");
+  assert.deepEqual(clone(update.patch.groupSelectors), []);
+});
+
 function lensCard(document, lensId = "lens_work") {
   return document.querySelector(`.lens-card[data-lens-id="${lensId}"]`);
 }
