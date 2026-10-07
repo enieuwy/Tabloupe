@@ -65,7 +65,7 @@ Selector and calendar-pattern edits commit in order. A failed write leaves the l
 
 ### Calendar subscriptions
 
-In Options → Automation, enter up to five HTTPS or `webcal` ICS URLs, one per line. Save grants access only to their hosts. Loopback HTTP URLs also work for local feeds. Add calendar-title patterns to the desired lens. The browser checks active events every minute and fetches feeds every 15 minutes; **Refresh calendars** fetches immediately. Configured subscriptions replace the daemon's calendar source, not its Focus source.
+In Options → Automation, enter up to five HTTPS or `webcal` ICS URLs, one per line. Save requests access to their hosts. Firefox does not prompt when the Tab Search page access already covers a host. Loopback HTTP URLs also work for local feeds. Add calendar-title patterns to the desired lens. The browser checks active events every minute and fetches feeds every 15 minutes; **Refresh calendars** fetches immediately. Configured subscriptions replace the daemon's calendar source, not its Focus source.
 
 Feeds must include `VTIMEZONE` definitions for named time zones. A failed source shows an error while other sources continue. Known events expire at their recorded end, even when a feed remains unavailable. Editing subscriptions drops queued events from the old sources and refreshes the current sources. Subscription URLs can contain private tokens; the extension stores them locally.
 
@@ -97,7 +97,7 @@ Pair the two by running `mac-command-centre pairing-token` and pasting the token
 
 ## Privacy
 
-No telemetry, analytics, or accounts. Calendar subscriptions download from the hosts you explicitly allow. A configured remote AI endpoint receives tab titles and hostnames for the requested grouping. Other data stays on your machine, apart from opt-in browser Sync. Backup export excludes API keys. The permissions rationale is in [`docs/amo-listing.md`](docs/amo-listing.md).
+No telemetry, analytics, or accounts. Calendar subscriptions download only from the hosts you configure. A configured remote AI endpoint receives tab titles and hostnames for the requested grouping. Other data stays on your machine, apart from opt-in browser Sync. Backup export excludes API keys. The permissions rationale is in [`docs/amo-listing.md`](docs/amo-listing.md).
 
 Tab Search uses local generic icons instead of loading other tabs' favicon URLs into the current page.
 
