@@ -6354,6 +6354,33 @@ test("snapshots restore missing safe URLs and merge groups without changing exis
   assert.deepEqual(clone(again), { ok: true, restored: 0, skipped: 3 });
 });
 
+test("snapshot restore keeps separate untitled groups selected by color", async () => {
+  const harness = createHarness({
+    storage: { lenses: [lens("a", "Blue groups", [{ type: "color", value: "blue" }])] },
+    groups: [
+      { id: 1, windowId: 1, title: "", color: "blue" },
+      { id: 2, windowId: 1, title: "", color: "blue" },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, url: "https://example.test/one" },
+      { id: 11, windowId: 1, groupId: 1, url: "https://example.test/two" },
+      { id: 12, windowId: 1, groupId: 2, url: "https://example.test/three" },
+    ],
+  });
+  await settle();
+  await harness.request({ type: "lens-snapshot-save", lensId: "a", windowId: 1 });
+  harness.tabState.length = 0;
+  harness.groupState.length = 0;
+  const result = await harness.request({ type: "lens-snapshot-restore", lensId: "a", windowId: 1 });
+  assert.equal(result.ok, true);
+  const [one, two, three] = ["one", "two", "three"].map((path) =>
+    harness.tabState.find((tab) => tab.url === `https://example.test/${path}`));
+  assert.equal(one.groupId, two.groupId);
+  assert.notEqual(one.groupId, three.groupId);
+  assert.equal(harness.groupState.length, 2);
+  assert.ok(harness.groupState.every((group) => group.title === "" && group.color === "blue"));
+});
+
 test("a second snapshot restore does not duplicate tabs whose navigation is still pending", async () => {
   const harness = createHarness({
     storage: {
@@ -6460,47 +6487,6 @@ test("explicit timed cancellation leaves the current lens visible and ends timed
   assert.equal(harness.storageData.focusSessionHistory.at(-1).trigger, "timed");
 });
 
-test("AI re-clustering revalidates pinned and privileged tabs on apply", async () => {
-  const harness = createHarness({
-    storage: { aiGroupingEnabled: true, aiProvider: { kind: "custom", baseURL: "https://api.example.test/v1", model: "model" } },
-    groups: [{ id: 1, windowId: 1, title: "Old" }],
-    tabs: [
-      { id: 10, windowId: 1, groupId: 1, url: "https://example.test/a" },
-      { id: 11, windowId: 1, groupId: 1, url: "https://example.test/b" },
-      { id: 12, windowId: 1, groupId: 1, url: "https://example.test/c" },
-      { id: 13, windowId: 1, groupId: 1, url: "about:config" },
-    ],
-    fetchHandler: async () => chatCompletion([{ topic: "New", tabIndices: [0, 1, 2] }]),
-  });
-  await settle();
-  assert.equal((await harness.request({ type: "ai-group-state", windowId: 1 })).groupableCount, 0);
-  assert.equal((await harness.request({ type: "ai-group-state", windowId: 1, includeExistingGroups: true })).groupableCount, 3);
-  const preview = await harness.request({ type: "ai-group-preview", windowId: 1, includeExistingGroups: true });
-  harness.tabState.find((tab) => tab.id === 11).pinned = true;
-  harness.tabState.find((tab) => tab.id === 12).url = "about:config";
-  const result = await harness.request({ type: "ai-group-apply", windowId: 1, groups: preview.groups, includeExistingGroups: true });
-  assert.equal(result.ok, true);
-  assert.notEqual(harness.tabState.find((tab) => tab.id === 10).groupId, 1);
-  for (const id of [11, 12, 13]) assert.equal(harness.tabState.find((tab) => tab.id === id).groupId, 1);
-});
-
-test("AI lens suggestions use the configured provider without saving or regrouping", async () => {
-  const harness = createHarness({
-    storage: { aiGroupingEnabled: true, aiProvider: { kind: "custom", baseURL: "https://api.example.test/v1", model: "model" } },
-    groups: [{ id: 1, windowId: 1, title: "Existing Work" }],
-    tabs: [
-      { id: 10, windowId: 1, groupId: 1, url: "https://example.test/a", title: "Design" },
-      { id: 11, windowId: 1, groupId: 1, url: "https://example.test/b", title: "Code" },
-    ],
-    fetchHandler: async () => chatCompletion([{ topic: "Project", tabIndices: [0, 1] }]),
-  });
-  await settle();
-  const result = await harness.request({ type: "ai-lens-suggest", windowId: 1 });
-  assert.deepEqual(clone(result), { ok: true, proposal: { name: "Project", groupTitles: ["Existing Work"] } });
-  assert.equal(harness.storageData.lenses, undefined);
-  assert.deepEqual(harness.groupCreations, []);
-  assert.equal(harness.sentMessages.filter((frame) => frame.type === "groupTabs").length, 0);
-});
 
 test("deleting a timed lens cancels the timer and records its completed span", async () => {
   const harness = createHarness({ storage: { lenses: [lens("a", "A", [])] } });
@@ -6515,74 +6501,3 @@ test("deleting a timed lens cancels the timer and records its completed span", a
   assert.deepEqual(harness.storageData.activeView, { kind: "all" });
 });
 
-test("AI re-clustering can swap topics after moving the last tab deletes a source group", async () => {
-  const harness = createHarness({
-    storage: { aiGroupingEnabled: true, aiProvider: { kind: "custom", baseURL: "https://api.example.test/v1", model: "model" } },
-    groups: [{ id: 1, windowId: 1, title: "A" }, { id: 2, windowId: 1, title: "B" }],
-    tabs: [
-      { id: 10, windowId: 1, groupId: 1, url: "https://example.test/a" },
-      { id: 11, windowId: 1, groupId: 2, url: "https://example.test/b" },
-    ],
-    fetchHandler: async () => chatCompletion([{ topic: "B", tabIndices: [0] }, { topic: "A", tabIndices: [1] }]),
-  });
-  await settle();
-  const nativeGroup = harness.browser.tabs.group;
-  harness.browser.tabs.group = async (request) => {
-    const result = await nativeGroup(request);
-    for (let index = harness.groupState.length - 1; index >= 0; index -= 1) {
-      if (!harness.tabState.some((tab) => tab.groupId === harness.groupState[index].id)) harness.groupState.splice(index, 1);
-    }
-    return result;
-  };
-  const preview = await harness.request({ type: "ai-group-preview", windowId: 1, includeExistingGroups: true });
-  const result = await harness.request({ type: "ai-group-apply", windowId: 1, groups: preview.groups, includeExistingGroups: true });
-  assert.equal(result.ok, true);
-  assert.deepEqual(Array.from(result.applied), ["B", "A"]);
-  assert.equal(harness.groupState.find((group) => group.id === harness.tabState.find((tab) => tab.id === 10).groupId).title, "B");
-  assert.equal(harness.groupState.find((group) => group.id === harness.tabState.find((tab) => tab.id === 11).groupId).title, "A");
-});
-
-test("Tab Search apply ignores an unrelated cached re-clustering preview", async () => {
-  const harness = createHarness({
-    storage: { aiGroupingEnabled: true, aiProvider: { kind: "custom", baseURL: "https://api.example.test/v1", model: "model" } },
-    groups: [{ id: 1, windowId: 1, title: "Existing" }],
-    tabs: [
-      { id: 10, windowId: 1, groupId: 1, url: "https://example.test/a" },
-      { id: 11, windowId: 1, groupId: 1, url: "https://example.test/b" },
-    ],
-    fetchHandler: async () => chatCompletion([{ topic: "Old preview", tabIndices: [0, 1] }]),
-  });
-  await settle();
-  await harness.request({ type: "ai-group-preview", windowId: 1, includeExistingGroups: true });
-  harness.tabState.push(
-    { id: 12, windowId: 1, groupId: -1, url: "https://example.test/c" },
-    { id: 13, windowId: 1, groupId: -1, url: "https://example.test/d" },
-  );
-  const result = await harness.request({
-    type: "ai-group-apply", windowId: 1,
-    groups: [{ topic: "Tab Search selection", color: "blue", tabs: [{ id: 12 }, { id: 13 }] }],
-  });
-  assert.equal(result.ok, true);
-  assert.deepEqual(Array.from(result.applied), ["Tab Search selection"]);
-  assert.equal(harness.tabState.find((tab) => tab.id === 10).groupId, 1);
-  assert.equal(harness.tabState.find((tab) => tab.id === 11).groupId, 1);
-  assert.notEqual(harness.tabState.find((tab) => tab.id === 12).groupId, -1);
-  assert.equal(harness.tabState.find((tab) => tab.id === 12).groupId, harness.tabState.find((tab) => tab.id === 13).groupId);
-});
-
-test("re-clustering apply without its reviewed preview leaves manual groups unchanged", async () => {
-  const harness = createHarness({
-    storage: { aiGroupingEnabled: true },
-    groups: [{ id: 1, windowId: 1, title: "Manual" }],
-    tabs: [{ id: 10, windowId: 1, groupId: 1, url: "https://example.test/a" }],
-  });
-  await settle();
-  const result = await harness.request({
-    type: "ai-group-apply", windowId: 1, includeExistingGroups: true,
-    groups: [{ topic: "Unreviewed", color: "blue", tabs: [{ id: 10 }] }],
-  });
-  assert.equal(result.ok, false);
-  assert.equal(result.error, "stale_preview");
-  assert.equal(harness.tabState[0].groupId, 1);
-  assert.deepEqual(harness.groupCreations, []);
-});

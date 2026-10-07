@@ -16,8 +16,6 @@ export default {
     ".demo-profile/**",
     "demo/**",
     "scripts/**",
-    "manifest.mv3.json",
-    "service-worker.js",
     "web-ext-artifacts",
     "web-ext-artifacts/**",
     ".antigravitycli",

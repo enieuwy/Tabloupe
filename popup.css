@@ -65,8 +65,7 @@ h1 {
   border-radius: var(--radius);
 }
 
-.timed-focus-panel,
-#ai-lens-preview {
+.timed-focus-panel {
   display: grid;
   gap: 8px;
   padding: 11px;
@@ -92,9 +91,7 @@ h1 {
 }
 
 .timed-focus-controls input,
-.timed-focus-controls select,
-#ai-lens-preview input,
-#ai-lens-preview textarea {
+.timed-focus-controls select {
   width: 100%;
   min-width: 0;
   padding: 6px;
@@ -105,10 +102,6 @@ h1 {
   font: inherit;
 }
 
-#ai-suggest-lens {
-  width: 100%;
-  margin: 10px 0;
-}
 
 .showing-line {
   margin: 0;

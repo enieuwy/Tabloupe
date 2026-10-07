@@ -12,7 +12,7 @@ const make = async (path, extra = {}) => {
     const listener = (id, change, currentTab) => {
       if (id === tab.id && currentTab.status === "complete" && currentTab.url === base + path) finish();
     };
-    const timer = setTimeout(() => { browser.tabs.onUpdated.removeListener(listener); reject(new Error("Fixture page did not load")); }, 10000);
+    const timer = setTimeout(() => { browser.tabs.onUpdated.removeListener(listener); reject(new Error("Fixture page did not load")); }, 45000);
     browser.tabs.onUpdated.addListener(listener);
     browser.tabs.get(tab.id).then((currentTab) => {
       if (currentTab.status === "complete" && currentTab.url === base + path) finish();
@@ -60,9 +60,16 @@ check(repeatRestore.ok && repeatRestore.restored === 0 && repeatRestore.skipped 
 evidence.snapshots = { saved: saved.snapshot.tabs.length, restored, repeatRestore, mergedGroupId: mergeId };
 await browser.storage.local.set({ demoEvidence: evidence });
 const closed = await make("/closed");
+const previousSessions = new Set((await send({ type: "tabsearch-recently-closed" })).sessions.map((row) => row.sessionId));
+const sessionChanged = new Promise((resolve, reject) => {
+  const finish = () => { clearTimeout(timer); browser.sessions.onChanged.removeListener(finish); resolve(); };
+  const timer = setTimeout(() => { browser.sessions.onChanged.removeListener(finish); reject(new Error("Native session change did not arrive")); }, 10000);
+  browser.sessions.onChanged.addListener(finish);
+});
 await browser.tabs.remove(closed.id);
+await sessionChanged;
 const recent = await send({ type: "tabsearch-recently-closed" });
-const closedRow = recent.sessions?.find((row) => row.url === base + "/closed");
+const closedRow = recent.sessions?.find((row) => !previousSessions.has(row.sessionId) && row.url === base + "/closed");
 check(closedRow, "Closed tab missing from native sessions");
 const reopened = await send({ type: "tabsearch-restore-session", sessionId: closedRow.sessionId });
 check(reopened.ok && reopened.list.some((tab) => tab.url === base + "/closed"), "Native session restore failed");
@@ -89,9 +96,7 @@ const calendarEnd = await send({ type: "calendar-feed-refresh" });
 const afterCalendar = await browser.storage.local.get("activeView");
 check(calendarEnd.ok && afterCalendar.activeView.kind === "all", "ICS event end did not revert");
 evidence.calendar = { start: calendarStart, during: duringCalendar, end: calendarEnd, after: afterCalendar };
-await browser.storage.local.set({ calendarSources: [], lensContextMenusEnabled: true, aiGroupingEnabled: true });
-const suggestion = await send({ type: "ai-lens-suggest", windowId });
-evidence.ai = { actualResultWithoutProvider: suggestion, blocked: "No live model or provider credentials in this fixture" };
+await browser.storage.local.set({ calendarSources: [], lensContextMenusEnabled: true });
 check((await browser.tabs.get(pinned.id)).pinned, "A pinned tab changed");
 await browser.storage.local.set({ demoEvidence: evidence });
 return evidence;

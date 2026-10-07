@@ -125,7 +125,7 @@
   }
   async function updateGroupMenus(tab) {
     const group = await groupForTab(tab);
-    for (const id of ids.slice(0, 2)) await menus.update(id, { enabled: Boolean(group?.title), ...(menus.onShown ? { visible: Boolean(group?.title) } : {}) });
+    for (const id of ids.slice(0, 2)) await menus.update(id, { enabled: Boolean(group), ...(menus.onShown ? { visible: Boolean(group) } : {}) });
     if (menus.refresh) await menus.refresh();
   }
   if (menus) {
@@ -142,10 +142,10 @@
         const current = await browser.tabs.get(tab.id);
         const group = await groupForTab(current);
         let result;
-        if (info.menuItemId === "lens-save-group" && group?.title) {
-          result = await handleLensSave({ source: "group", groupTitle: group.title, name: group.title, color: group.color, windowId: tab.windowId });
-        } else if (info.menuItemId === "lens-show-group" && group?.title) {
-          result = await handleLensActivate(tab.windowId, { kind: "transient", label: group.title, selectors: [{ type: "title", value: group.title }] });
+        if (info.menuItemId === "lens-save-group" && group) {
+          result = await handleLensSave({ source: "group", groupTitle: group.title || "", name: group.title || "Untitled group", color: group.color, windowId: tab.windowId });
+        } else if (info.menuItemId === "lens-show-group" && group) {
+          result = await handleLensActivate(tab.windowId, { kind: "transient", label: group.title || "Untitled group", selectors: [{ type: "title", value: group.title || "" }] });
         } else if (info.menuItemId === "lens-save-window") {
           result = await handleLensSave({ source: "window", name: (tab.title || "Workspace").slice(0, 80), windowId: tab.windowId });
         } else if (info.menuItemId === "lens-organize-selected") {

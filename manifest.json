@@ -91,7 +91,6 @@
         "<all_urls>"
       ],
       "js": [
-        "browser-compat.js",
         "tabsearch.js"
       ],
       "run_at": "document_idle",
@@ -115,7 +114,6 @@
   },
   "background": {
     "scripts": [
-      "browser-compat.js",
       "vendor/ical.js",
       "calendar.js",
       "background.js",

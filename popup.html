@@ -3,7 +3,6 @@
 <head>
   <meta charset="utf-8">
   <link rel="stylesheet" href="popup.css">
-  <script src="browser-compat.js"></script>
   <script defer src="popup.js"></script>
 </head>
 <body>
@@ -76,22 +75,7 @@
     <p id="popup-connection" class="conn" role="status"></p>
 
     <p id="ai-summary" class="summary"></p>
-    <label class="toggle" id="ai-existing-row">
-      <input id="ai-include-existing" type="checkbox">
-      <span>Include existing groups in the next preview</span>
-    </label>
     <p class="muted">Pinned tabs and non-web tabs stay unchanged. Review the proposal before Apply.</p>
-    <button id="ai-suggest-lens" type="button" class="secondary">Suggest a lens from current groups</button>
-    <section id="ai-lens-preview" class="panel" aria-label="Suggested lens" hidden>
-      <label for="ai-lens-name">Lens name</label>
-      <input id="ai-lens-name" type="text" maxlength="200">
-      <label for="ai-lens-titles">Matching group titles (one per line)</label>
-      <textarea id="ai-lens-titles" rows="4"></textarea>
-      <div class="actions">
-        <button id="ai-lens-save" type="button">Save suggested lens</button>
-        <button id="ai-lens-dismiss" type="button" class="secondary">Dismiss suggestion</button>
-      </div>
-    </section>
 
     <label id="ai-pin-row" class="toggle pin-toggle" hidden>
       <input id="ai-pin" type="checkbox">

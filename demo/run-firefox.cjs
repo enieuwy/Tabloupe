@@ -77,7 +77,7 @@ const { randomUUID } = require("node:crypto");
     const target = (await event((message) => message.target?.url?.endsWith("/options.html"))).target;
     console.log("Exercising actual extension APIs");
     await run(target.consoleActor, 'const current=await browser.tabs.getCurrent();await browser.tabs.remove((await browser.tabs.query({})).filter(tab=>tab.id!==current.id).map(tab=>tab.id));for(const lens of (await browser.storage.local.get("lenses")).lenses||[])await browser.runtime.sendMessage({type:"lens-delete",lensId:lens.id});await browser.storage.local.set({focusSessionHistory:[]});return current.id;');
-    const evidence = await run(target.consoleActor, await fs.readFile(path.join(__dirname, "exercise.js"), "utf8"));
+    const evidence = await run(target.consoleActor, await fs.readFile(path.join(__dirname, "exercise.js"), "utf8"), 180000);
     await fs.mkdir(path.join(__dirname, "evidence"), { recursive: true });
     await fs.writeFile(path.join(__dirname, "evidence", "firefox-api.json"), JSON.stringify({ ok: true, value: evidence }, null, 2) + "\n");
     console.log(JSON.stringify(evidence, null, 2));

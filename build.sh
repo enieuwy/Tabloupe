@@ -3,7 +3,7 @@ set -euo pipefail
 # Automatically bumps version, loads API keys, and signs the Firefox extension.
 
 usage() {
-  echo "Usage: $0 [unlisted|listed|firefox|chromium|both]" >&2
+  echo "Usage: $0 [unlisted|listed|firefox]" >&2
   exit 2
 }
 
@@ -14,7 +14,7 @@ fi
 
 case "$CHANNEL" in
   unlisted|listed) ;;
-  firefox|chromium|both)
+  firefox)
     node scripts/package.cjs "$CHANNEL"
     exit
     ;;
