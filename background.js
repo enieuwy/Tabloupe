@@ -79,6 +79,25 @@ const LENS_MIGRATION_MAX_ATTEMPTS = 3;
 // stale same-id replay on reconnect, is still handled correctly.
 const LAST_APPLIED_APPLE_FOCUS_KEY = "lastAppliedAppleFocusId";
 const LAST_APPLIED_CALENDAR_TRIGGER_KEY = "lastAppliedCalendarTriggerId";
+// A persisted view change is two steps: the storage commit, then the physical
+// expand/collapse. Where the two cannot be one transaction (a Sync pull that
+// resets an orphaned activeView), the commit also records the physical work
+// still owed, so an interrupted or failed expansion is resumed instead of
+// leaving groups collapsed under an "All groups" label forever.
+const PENDING_VIEW_RECONCILE_KEY = "pendingViewReconcile";
+// Metadata for a tab group that Firefox has already created but that never
+// received its title/color. Recorded before tabs.group so an interruption
+// anywhere in the transaction leaves a resumable record of the orphan. Tab and
+// group ids are only stable within one browser session, so the record lives in
+// storage.session (memory-only where that is missing): a record that outlived
+// its session would name unrelated tabs and groups.
+const PENDING_GROUP_METADATA_KEY = "pendingGroupMetadata";
+const MAX_PENDING_GROUP_METADATA = 8;
+// Records whose transaction is still running in this page. Recovery skips them
+// so it never races the grouping call that owns them.
+const inFlightGroupMetadataTokens = new Set();
+let pendingGroupMetadataMemory = [];
+let pendingGroupMetadataQueue = Promise.resolve();
 let focusBadge = { text: "", color: null, title: "Tabloupe" };
 const transientViewsByWindow = new Map();
 let lastError = null;
@@ -91,11 +110,18 @@ let connectionStateUpdateQueue = Promise.resolve();
 let messageQueue = Promise.resolve();
 // Resolves once the one-time legacy->v2 lens migration has finished (or been
 // determined unnecessary). Every lens read/write awaits it so a lens mutation
-// racing startup can't be silently overwritten by migration's full replace.
+// racing startup can't land between the migration's read and its write.
 let resolveLensMigrationReady;
 let lensMigrationReady = new Promise((resolve) => {
   resolveLensMigrationReady = resolve;
 });
+// Non-null while the legacy->v2 migration is still owed because every attempt
+// failed. schemaVersion is then still < 2 and `lenses` lacks the legacy-derived
+// lenses, so lens access stays closed (and retries the migration) until it
+// lands or proves unnecessary, rather than letting callers edit or mirror an
+// inventory that the resumed migration still has to extend.
+let lensMigrationError = null;
+let lensMigrationRetry = null;
 let groupingRequestSeq = 0;
 const pendingGroupingRequests = new Map();
 let socketAuthState = BUS_AUTH_STATES.UNAUTHENTICATED;
@@ -784,7 +810,15 @@ async function handleCreateTabGroupEnvelope(msg) {
     sendCreateTabGroupResult(normalized.requestId, await createTabGroupFromRequest(normalized.request));
   } catch (error) {
     console.error("createTabGroup failed:", error);
-    sendCreateTabGroupResult(normalized.requestId, { ok: false, error: "group_failed" });
+    // A metadata failure leaves a real, untitled group behind. Name it in the
+    // reply so the peer can identify the orphan instead of guessing whether
+    // anything happened at all.
+    sendCreateTabGroupResult(normalized.requestId, {
+      ok: false,
+      error: "group_failed",
+      groupId: error && typeof error.groupId === "number" ? error.groupId : null,
+      windowId: error && typeof error.windowId === "number" ? error.windowId : null,
+    });
   }
 }
 
@@ -1005,14 +1039,43 @@ function normalizeLens(lens) {
   };
 }
 
-async function getLenses() {
+// Resolves once the lens model is safe to read and write. When startup migration
+// failed outright, storage may have recovered since: retry it here (once per
+// caller wave) and refuse the access if it still cannot complete.
+async function ensureLensMigration() {
   await lensMigrationReady;
+  if (lensMigrationError === null) {
+    return;
+  }
+  if (lensMigrationRetry === null) {
+    lensMigrationRetry = (async () => {
+      try {
+        await migrateToLensesV2();
+        lensMigrationError = null;
+      } catch (error) {
+        lensMigrationError = error;
+      } finally {
+        lensMigrationRetry = null;
+      }
+    })();
+  }
+  await lensMigrationRetry;
+  if (lensMigrationError !== null) {
+    const failure = new Error("Lens migration has not completed; lenses are unavailable.");
+    failure.code = "migration_pending";
+    failure.cause = lensMigrationError;
+    throw failure;
+  }
+}
+
+async function getLenses() {
+  await ensureLensMigration();
   const stored = await browser.storage.local.get("lenses");
   return Array.isArray(stored.lenses) ? stored.lenses.map(normalizeLens).filter(Boolean) : [];
 }
 
 async function saveLenses(arr) {
-  await lensMigrationReady;
+  await ensureLensMigration();
   await browser.storage.local.set({ lenses: Array.isArray(arr) ? arr.map(normalizeLens).filter(Boolean) : [] });
 }
 
@@ -1566,6 +1629,10 @@ async function pullLensSyncQueued() {
   if (!lensSyncEnabled || applyingInboundLensSync || !syncStorageArea()) {
     return false;
   }
+  // An earlier pull may have committed an activeView reset whose expansion never
+  // ran. Queue it now: this pull can legitimately return early with "nothing
+  // changed" and would otherwise never retry the physical work.
+  reconcilePendingViewActivation().catch((error) => console.error("Pending view reconcile failed:", error));
   const remote = await safeSyncGet(null);
   if (!remote) {
     return false;
@@ -1694,6 +1761,10 @@ async function pullLensSyncQueued() {
     values[TIMED_SESSION_KEY] = null;
     values.lastActivation = { trigger: "external", at: Date.now() };
     values[FOCUS_SESSION_HISTORY_KEY] = activationSessionHistory({ kind: "all" }, values.lastActivation, stored);
+    // Expanding the deleted lens's groups happens after this commit. Record the
+    // intent in the same write: once activeView says All, no later pull detects
+    // an orphan, so without this the groups stay collapsed permanently.
+    values[PENDING_VIEW_RECONCILE_KEY] = { view: { kind: "all" }, at: values.lastActivation.at };
   }
   if (fallbackOrphaned) {
     values.automationFallback = { kind: "all" };
@@ -1758,13 +1829,58 @@ async function pullLensSyncQueued() {
   pendingInboundLensSyncApply = false;
   inboundLensSyncRetryAttempts = 0;
   if (activeViewOrphaned) {
-    try {
-      await activateView({ kind: "all" }, { trigger: "external" });
-    } catch (error) {
-      console.error("Lens sync active-view reset failed:", error);
-    }
+    reconcilePendingViewActivation().catch((error) => console.error("Pending view reconcile failed:", error));
   }
   return true;
+}
+
+// Consumes the physical-view work recorded by an interrupted or failed view
+// commit. Runs at startup and at the head of every Sync pull, so a crash or a
+// rejected tabGroups.query during expansion is retried by the next healthy pass
+// instead of being swallowed by "nothing changed". It runs on the activation
+// queue, so the supersede check and the activation it guards cannot interleave
+// with a manual or automation switch.
+function reconcilePendingViewActivation() {
+  return enqueueFocusWork(async () => {
+    let stored;
+    try {
+      stored = await browser.storage.local.get([PENDING_VIEW_RECONCILE_KEY, "activeView", "lastActivation", "lenses"]);
+    } catch (error) {
+      console.error("Pending view reconcile read failed:", error);
+      return;
+    }
+    const pending = stored[PENDING_VIEW_RECONCILE_KEY];
+    if (!isRecord(pending) || !isPersistedView(pending.view)) {
+      return;
+    }
+    // Anything the user or automation activated since supersedes the owed work:
+    // that activation did its own expand/collapse, and re-applying the reset
+    // would overwrite its trigger (and with it the manual-override guards).
+    const current = resolvableView(stored.activeView, stored.lenses);
+    const lastTrigger = isRecord(stored.lastActivation) ? stored.lastActivation.trigger : null;
+    if (viewKey(current) !== viewKey(pending.view) || lastTrigger !== "external") {
+      await clearPendingViewActivation();
+      return;
+    }
+    try {
+      const applied = await activateView(pending.view, { trigger: "external" });
+      if (applied === false) {
+        return;
+      }
+    } catch (error) {
+      console.error("Pending view reconcile failed:", error);
+      return;
+    }
+    await clearPendingViewActivation();
+  });
+}
+
+async function clearPendingViewActivation() {
+  try {
+    await browser.storage.local.set({ [PENDING_VIEW_RECONCILE_KEY]: null });
+  } catch (error) {
+    console.error("Pending view reconcile clear failed:", error);
+  }
 }
 
 async function reconcileLensSync() {
@@ -1980,10 +2096,18 @@ async function migrateToLensesV2Once() {
   const now = Date.now();
   const legacy = isRecord(stored[LEGACY_MAP_KEY]) ? stored[LEGACY_MAP_KEY] : {};
   const catalog = isRecord(stored.focusCatalog) ? stored.focusCatalog : {};
+  // Lenses can reach storage while this migration is still owed: a Firefox Sync
+  // pull and an Options settings import write `lenses` directly. Keep them, and
+  // leave a legacy Focus id to the lens that already claims it.
+  const existing = normalizeLensesFromStorageChange(stored.lenses);
+  const claimedFocusIds = new Set(existing.flatMap((lens) => lens.triggers.appleFocusIds));
   const merged = new Map();
   const ignoredAppleFocusIds = [];
 
   for (const [id, value] of Object.entries(legacy)) {
+    if (claimedFocusIds.has(id)) {
+      continue;
+    }
     const titles = normalizeTitles(value);
     if (titles.length === 0) {
       if (Array.isArray(value) && value.length === 0) {
@@ -2014,7 +2138,7 @@ async function migrateToLensesV2Once() {
   }
 
   await browser.storage.local.set({
-    lenses: [...merged.values()],
+    lenses: [...existing, ...merged.values()],
     ignoredAppleFocusIds,
     legacyFocusMappingsBackup: stored[LEGACY_MAP_KEY],
     schemaVersion: 2,
@@ -2124,12 +2248,6 @@ async function notifyUnboundAppleFocus(rawId) {
   }, UNBOUND_APPLE_FOCUS_NOTIFICATION_ID);
 }
 
-async function getLastAppliedAppleFocusId() {
-  const stored = await browser.storage.local.get(LAST_APPLIED_APPLE_FOCUS_KEY);
-  const value = stored[LAST_APPLIED_APPLE_FOCUS_KEY];
-  return typeof value === "string" ? value : null;
-}
-
 // Ownership markers are what a later focus-off / event-gone envelope matches
 // against, so losing one strands automation. The visible activation has already
 // happened by the time we get here: retry once, then record the failure rather
@@ -2148,13 +2266,43 @@ async function persistTriggerMarker(key, value) {
   return false;
 }
 
+// The ownership marker is written after the activation it describes, so a crash
+// or a storage failure in between leaves the marker missing (or still naming the
+// previous trigger) while activeView and lastActivation are already durable.
+// lastActivation then names the real owner, so it stands in for the marker and
+// automation can still hand the view back instead of stranding the user in a
+// collapsed lens. A finished hand-back also leaves lastActivation naming the
+// trigger, but with the view already at the automation fallback: nothing is
+// owed then, so a replayed off-envelope must not re-apply the fallback and a
+// returning calendar event must still activate its lens again.
+function ownedTriggerId(marker, stored, trigger) {
+  const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
+  if (lastActivation.trigger !== trigger ||
+      typeof lastActivation.triggerId !== "string" ||
+      lastActivation.triggerId === marker) {
+    return marker;
+  }
+  const handedBack = viewKey(resolvableView(stored.activeView, stored.lenses)) ===
+    viewKey(resolvableView(stored.automationFallback, stored.lenses));
+  return handedBack ? marker : lastActivation.triggerId;
+}
+
 async function handleAppleFocusOff() {
-  const triggerId = await getLastAppliedAppleFocusId();
+  const stored = await browser.storage.local.get([
+    "activeView",
+    "lastActivation",
+    "automationFallback",
+    "lenses",
+    LAST_APPLIED_APPLE_FOCUS_KEY,
+  ]);
+  const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
+  const marker = typeof stored[LAST_APPLIED_APPLE_FOCUS_KEY] === "string"
+    ? stored[LAST_APPLIED_APPLE_FOCUS_KEY]
+    : null;
+  const triggerId = ownedTriggerId(marker, stored, "appleFocus");
   if (typeof triggerId !== "string") {
     return;
   }
-  const stored = await browser.storage.local.get(["activeView", "lastActivation"]);
-  const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
   if (lastActivation.trigger !== "appleFocus" || lastActivation.triggerId !== triggerId) {
     await persistTriggerMarker(LAST_APPLIED_APPLE_FOCUS_KEY, null);
     return;
@@ -2239,15 +2387,27 @@ async function handleCalendarEvents(payload) {
   }
   const [lenses, stored] = await Promise.all([
     getLenses(),
-    browser.storage.local.get(["lastActivation", LAST_APPLIED_CALENDAR_TRIGGER_KEY]),
+    browser.storage.local.get([
+      "activeView",
+      "lastActivation",
+      "automationFallback",
+      LAST_APPLIED_CALENDAR_TRIGGER_KEY,
+    ]),
   ]);
   const lastActivation = isRecord(stored.lastActivation) ? stored.lastActivation : {};
-  const previousTriggerId = typeof stored[LAST_APPLIED_CALENDAR_TRIGGER_KEY] === "string"
+  const marker = typeof stored[LAST_APPLIED_CALENDAR_TRIGGER_KEY] === "string"
     ? stored[LAST_APPLIED_CALENDAR_TRIGGER_KEY]
     : null;
+  // Same recovery as the Apple Focus path: a lost marker write must not strand
+  // the view, so the durable lastActivation stands in for it.
+  const previousTriggerId = ownedTriggerId(marker, { ...stored, lenses }, "calendar");
   const match = calendarLensMatch(events, lenses);
   if (match) {
     if (match.event.triggerId === previousTriggerId) {
+      if (marker !== previousTriggerId) {
+        // Heal the marker so later envelopes do not have to re-derive it.
+        await persistTriggerMarker(LAST_APPLIED_CALENDAR_TRIGGER_KEY, previousTriggerId);
+      }
       return;
     }
     const applied = await activateView(
@@ -3012,7 +3172,14 @@ function start() {
     .catch((error) => console.error("Lens sync init error:", error));
   syncScheduleAlarm().catch((error) => console.error("Schedule alarm init error:", error));
   migrateToLensesV2()
+    .then(() => {
+      lensMigrationError = null;
+    })
     .catch((error) => {
+      // Record the failure as well as logging it: the legacy key and the old
+      // schemaVersion are still in storage, so lens mutations must stay closed
+      // (see ensureLensMigration) until a retry lands.
+      lensMigrationError = error;
       console.error("Lens migration error:", error);
     })
     .finally(() => {
@@ -3020,10 +3187,15 @@ function start() {
       // before reconcileLensSync (which reads lenses through getLenses).
       resolveLensMigrationReady();
       enqueueFocusWork(() => restoreTimedAlarm()).catch((error) => console.error("Timed alarm init error:", error));
+      reconcilePendingGroupMetadata().catch((error) => console.error("Pending group metadata init error:", error));
+      reconcilePendingViewActivation().catch((error) => console.error("Pending view reconcile init error:", error));
       connect();
       lensSyncInit
         .then(() => {
-          if (lensSyncEnabled) {
+          // A failed migration leaves `lenses` without the legacy-derived
+          // lenses; a full reconcile from that inventory could remove synced
+          // lenses on other devices.
+          if (lensSyncEnabled && lensMigrationError === null) {
             return reconcileLensSync();
           }
           return undefined;
@@ -4276,6 +4448,175 @@ async function tabGroupsByTitle(windowId) {
   return existingByTitle;
 }
 
+function normalizePendingGroupMetadata(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((entry) => isRecord(entry) &&
+    typeof entry.token === "string" && entry.token !== "" &&
+    typeof entry.title === "string" && entry.title !== "" &&
+    Array.isArray(entry.tabIds) &&
+    entry.tabIds.length > 0 &&
+    entry.tabIds.every((id) => typeof id === "number"));
+}
+
+async function readPendingGroupMetadata() {
+  if (!sessionStore) {
+    return pendingGroupMetadataMemory;
+  }
+  const stored = await sessionStore.get(PENDING_GROUP_METADATA_KEY);
+  return normalizePendingGroupMetadata(stored[PENDING_GROUP_METADATA_KEY]);
+}
+
+// Every change is a read-modify-write of one list, so serialize them: two
+// grouping calls in different windows must not drop each other's records.
+function updatePendingGroupMetadata(change) {
+  const update = pendingGroupMetadataQueue.then(async () => {
+    const next = change(await readPendingGroupMetadata());
+    if (!sessionStore) {
+      pendingGroupMetadataMemory = next;
+      return;
+    }
+    await sessionStore.set({ [PENDING_GROUP_METADATA_KEY]: next });
+  });
+  pendingGroupMetadataQueue = update.catch(() => {});
+  return update;
+}
+
+// Recorded before tabs.group, so an interruption at any point in the
+// create-then-title transaction leaves enough to find the orphan group again:
+// the intended metadata plus the tab ids that tabs.group moves into it.
+async function beginPendingGroupMetadata(record) {
+  const token = `pgm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  inFlightGroupMetadataTokens.add(token);
+  try {
+    await updatePendingGroupMetadata((entries) =>
+      [...entries, { token, ...record }].slice(-MAX_PENDING_GROUP_METADATA));
+    return token;
+  } catch (error) {
+    // Best effort: losing the record only costs resumability, so the grouping
+    // itself must still go ahead.
+    inFlightGroupMetadataTokens.delete(token);
+    console.error("Pending tab-group metadata record failed:", error);
+    return null;
+  }
+}
+
+async function clearPendingGroupMetadata(token) {
+  if (token === null) {
+    return;
+  }
+  inFlightGroupMetadataTokens.delete(token);
+  try {
+    await updatePendingGroupMetadata((entries) => entries.filter((entry) => entry.token !== token));
+  } catch (error) {
+    console.error("Pending tab-group metadata clear failed:", error);
+  }
+}
+
+// The title write failed after Firefox created the group: pin the record to that
+// exact group and hand it to recovery.
+async function releasePendingGroupMetadata(token, groupId) {
+  if (token === null) {
+    return;
+  }
+  inFlightGroupMetadataTokens.delete(token);
+  try {
+    await updatePendingGroupMetadata((entries) =>
+      entries.map((entry) => (entry.token === token ? { ...entry, groupId } : entry)));
+  } catch (error) {
+    console.error("Pending tab-group metadata update failed:", error);
+  }
+}
+
+// Which untitled group, if any, a record may finish. Recovery must never rename
+// a group someone else owns, so only two groups qualify: the exact group a
+// failed title write recorded, or, when the page died before learning the id,
+// an untitled group holding exactly the recorded tabs that are still open (the
+// group tabs.group produces). A titled group is finished or someone else's.
+function pendingGroupOrphanId(entry, groupsById, groupIdByTab) {
+  const untitled = (groupId) => {
+    const group = groupsById.get(groupId);
+    return Boolean(group) && (typeof group.title !== "string" || group.title === "");
+  };
+  if (typeof entry.groupId === "number") {
+    return untitled(entry.groupId) ? entry.groupId : null;
+  }
+  const recorded = [...new Set(entry.tabIds)].filter((tabId) => groupIdByTab.has(tabId));
+  if (recorded.length === 0) {
+    return null;
+  }
+  const groupId = groupIdByTab.get(recorded[0]);
+  if (typeof groupId !== "number" || !untitled(groupId)) {
+    return null;
+  }
+  let members = 0;
+  for (const memberGroupId of groupIdByTab.values()) {
+    if (memberGroupId === groupId) members += 1;
+  }
+  const exact = members === recorded.length && recorded.every((tabId) => groupIdByTab.get(tabId) === groupId);
+  return exact ? groupId : null;
+}
+
+// Finishes tab groups that Firefox created but that never got their title. Runs
+// at startup and at the head of every grouping entry point, so a retried bus
+// request or AI apply sees a properly titled group to merge into instead of
+// classifying its own tabs as already_grouped_elsewhere.
+async function reconcilePendingGroupMetadata() {
+  let entries;
+  try {
+    entries = (await readPendingGroupMetadata())
+      .filter((entry) => !inFlightGroupMetadataTokens.has(entry.token));
+  } catch (error) {
+    console.error("Pending tab-group metadata read failed:", error);
+    return;
+  }
+  if (entries.length === 0) {
+    return;
+  }
+  let groupIdByTab;
+  let groupsById;
+  try {
+    const tabs = await browser.tabs.query({});
+    const groups = await browser.tabGroups.query({});
+    groupIdByTab = new Map(tabs.map((tab) => [tab.id, tab.groupId]));
+    groupsById = new Map(groups.map((group) => [group.id, group]));
+  } catch (error) {
+    // Without a trustworthy inventory we cannot tell a finished group from an
+    // orphan; keep every record and try again on the next pass.
+    console.error("Pending tab-group metadata reconciliation failed:", error);
+    return;
+  }
+  const settled = new Set();
+  for (const entry of entries) {
+    const orphanId = pendingGroupOrphanId(entry, groupsById, groupIdByTab);
+    if (orphanId === null) {
+      // Finished earlier, never created, or no longer provably ours. Dropping
+      // the record keeps it from retitling an unrelated group later.
+      settled.add(entry.token);
+      continue;
+    }
+    const update = { title: entry.title };
+    if (typeof entry.color === "string" && entry.color) {
+      update.color = entry.color;
+    }
+    try {
+      await browser.tabGroups.update(orphanId, update);
+      settled.add(entry.token);
+    } catch (error) {
+      console.error("Completing an orphaned tab group failed:", orphanId, error);
+    }
+  }
+  if (settled.size === 0) {
+    return;
+  }
+  try {
+    await updatePendingGroupMetadata((current) => current.filter((entry) => !settled.has(entry.token)));
+  } catch (error) {
+    console.error("Pending tab-group metadata prune failed:", error);
+  }
+}
+
 async function createOrMergeTabGroup({ title, color, tabIds, windowId, existingByTitle, defaultColor = null }) {
   const existing = existingByTitle.get(title);
   if (existing) {
@@ -4284,28 +4625,45 @@ async function createOrMergeTabGroup({ title, color, tabIds, windowId, existingB
     return existing;
   }
 
-  const groupId = await browser.tabs.group({ tabIds });
   const update = { title };
   const normalizedColor = normalizeTabGroupColor(color, defaultColor);
   if (normalizedColor) {
     update.color = normalizedColor;
+  }
+  const pendingToken = await beginPendingGroupMetadata({
+    title,
+    color: normalizedColor,
+    tabIds: tabIds.filter((id) => typeof id === "number"),
+  });
+  let groupId;
+  try {
+    groupId = await browser.tabs.group({ tabIds });
+  } catch (error) {
+    // No group was created, so nothing is owed. A record left behind would let
+    // recovery retitle whatever untitled group those tabs still sit in.
+    await clearPendingGroupMetadata(pendingToken);
+    throw error;
   }
   try {
     await browser.tabGroups.update(groupId, update);
   } catch (error) {
     // Firefox already created the group and moved the tabs in. Retry the
     // metadata once; if it still fails, report the failure with the orphan's id
-    // rather than pretending nothing happened. We deliberately do not ungroup
-    // the tabs: Tab Search grouping can include tabs that belonged to another
-    // group, and undoing membership would destroy that state.
+    // rather than pretending nothing happened, and hand the pending record to
+    // recovery so the next grouping pass or wake completes it. We deliberately do
+    // not ungroup the tabs: Tab Search grouping can include tabs that belonged
+    // to another group, and undoing membership would destroy that state.
     try {
       await browser.tabGroups.update(groupId, update);
     } catch (retryError) {
       retryError.groupId = groupId;
+      retryError.windowId = typeof windowId === "number" ? windowId : null;
       console.error("Tab group metadata update failed; group left untitled:", groupId, retryError);
+      await releasePendingGroupMetadata(pendingToken, groupId);
       throw retryError;
     }
   }
+  await clearPendingGroupMetadata(pendingToken);
   return { id: groupId, windowId, title, color: normalizedColor };
 }
 
@@ -4394,6 +4752,10 @@ async function createTabGroupFromRequest(request) {
   }
 
   return withGroupingLock(targetWindowId, async () => {
+    // Finish any group a previous attempt created but never titled, so a retry
+    // of this very request merges into it instead of reporting its own tabs as
+    // already_grouped_elsewhere.
+    await reconcilePendingGroupMetadata();
     const tabs = await collectNormalWindowTabs();
     const { matchedTabs, skipped } = matchCreateTabGroupTabs(request.urls, tabs);
     if (matchedTabs.length === 0) {
@@ -4472,6 +4834,9 @@ async function applyTabGrouping(groups, windowId, { groupableOnly = false } = {}
     // our query and create.
     let existingByTitle;
     try {
+      // Title an orphan from an interrupted run first, so the snapshot below
+      // sees it and merges instead of creating a duplicate.
+      await reconcilePendingGroupMetadata();
       existingByTitle = await tabGroupsByTitle(windowId);
     } catch (error) {
       // Without a trustworthy snapshot we would create duplicate same-title

@@ -423,13 +423,24 @@ function createHarness({
           return groupId;
         }
         const id = groupState.reduce((max, group) => Math.max(max, group.id), 0) + 1;
+        let groupWindowId;
         for (const tabId of tabIds) {
           const tab = tabState.find((candidate) => candidate.id === tabId);
           if (tab) {
             tab.groupId = id;
+            if (groupWindowId === undefined) {
+              groupWindowId = typeof tab.windowId === "number" ? tab.windowId : currentWindowId;
+            }
           }
         }
-        groupState.push({ id, title: "", collapsed: false });
+        // Real Firefox tab groups are window-scoped and always report a
+        // windowId; window-filtered tabGroups.query must find a new group.
+        groupState.push({
+          id,
+          title: "",
+          collapsed: false,
+          windowId: groupWindowId === undefined ? currentWindowId : groupWindowId,
+        });
         groupCreations.push({ id, tabIds: clone(tabIds) });
         return id;
       },
@@ -6501,3 +6512,564 @@ test("deleting a timed lens cancels the timer and records its completed span", a
   assert.deepEqual(harness.storageData.activeView, { kind: "all" });
 });
 
+test("a failed legacy migration refuses lens writes until it completes (0197a974)", async () => {
+  const harness = createHarness({
+    storage: { [LEGACY_KEY]: { "com.apple.focus.work": ["Work"] } },
+  });
+  const originalSet = harness.browser.storage.local.set;
+  let migrationBlocked = true;
+  let migrationWrites = 0;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "schemaVersion")) {
+      migrationWrites += 1;
+      if (migrationBlocked) {
+        throw new Error("migration storage unavailable");
+      }
+    }
+    return originalSet(values);
+  };
+
+  await settle();
+
+  // Startup migration exhausted its retries: the legacy map and the old schema
+  // version are still on disk, so migration is still owed.
+  assert.ok(migrationWrites >= 1);
+  assert.notEqual(harness.storageData.schemaVersion, 2);
+  assert.equal(harness.storageData.lenses, undefined);
+
+  // Lens access stays closed while the migration is still owed.
+  await assert.rejects(
+    harness.request({ type: "lens-save", source: "empty", name: "New lens" }),
+    (error) => error.code === "migration_pending",
+  );
+  assert.equal(harness.storageData.lenses, undefined);
+
+  // Storage recovers: the deferred migration lands and the save is accepted.
+  migrationBlocked = false;
+  const saved = await harness.request({ type: "lens-save", source: "empty", name: "New lens" });
+  assert.equal(saved.ok, true);
+  assert.equal(harness.storageData.schemaVersion, 2);
+  assert.deepEqual(
+    harness.storageData.lenses.map((entry) => entry.name).sort(),
+    ["New lens", "Work"],
+  );
+
+  // The next event-page wake must not re-run migration over the new lens.
+  const reloaded = createHarness({ storage: harness.storageData });
+  await settle();
+  assert.deepEqual(
+    reloaded.storageData.lenses.map((entry) => entry.name).sort(),
+    ["New lens", "Work"],
+  );
+});
+
+test("a migration that lands late keeps lenses already in storage (0197a974)", async () => {
+  // A Firefox Sync pull or an Options settings import writes `lenses` directly,
+  // so lenses can be on disk before a failed migration finally lands.
+  const synced = lens("lens_synced", "Synced", [{ type: "title", value: "Work" }], ["com.apple.focus.work"]);
+  const harness = createHarness({
+    storage: {
+      [LEGACY_KEY]: {
+        "com.apple.focus.work": ["Work"],
+        "com.apple.focus.personal": ["Personal"],
+      },
+      lenses: [synced],
+    },
+  });
+  await settle();
+
+  assert.equal(harness.storageData.schemaVersion, 2);
+  assert.deepEqual(harness.storageData.lenses.map((entry) => entry.name), ["Synced", "Personal"]);
+  // The Focus id the stored lens already claims is not given a second lens.
+  assert.deepEqual(harness.storageData.lenses[0].triggers.appleFocusIds, ["com.apple.focus.work"]);
+  assert.deepEqual(harness.storageData.lenses[1].triggers.appleFocusIds, ["com.apple.focus.personal"]);
+});
+
+test("a failed migration does not mirror the empty inventory to Sync (0197a974)", async () => {
+  const harness = createHarness({
+    storage: {
+      syncLenses: true,
+      [LEGACY_KEY]: { "com.apple.focus.work": ["Work"] },
+    },
+    storageSync: {},
+  });
+  const originalSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "schemaVersion")) {
+      throw new Error("migration storage unavailable");
+    }
+    return originalSet(values);
+  };
+
+  await settle();
+  await settle();
+
+  assert.deepEqual(harness.syncSets, []);
+  assert.deepEqual(harness.syncData, {});
+});
+
+test("Focus-off falls back when the ownership marker write never landed (4bab1746)", async () => {
+  const harness = createHarness({
+    storage: {
+      automationFallback: { kind: "all" },
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["focus.work"])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: false },
+    ],
+  });
+  await settle();
+
+  const originalSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "lastAppliedAppleFocusId")) {
+      throw new Error("storage unavailable");
+    }
+    return originalSet(values);
+  };
+
+  await harness.context.handleAppleFocus("focus.work");
+  await settle();
+
+  // The activation is durable; both marker writes were rejected.
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_work" });
+  assert.equal(harness.storageData.lastActivation.triggerId, "focus.work");
+  assert.equal(harness.storageData.lastAppliedAppleFocusId, undefined);
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
+
+  // Focus-off arrives with no marker to match against. lastActivation still
+  // proves appleFocus owns the view, so the fallback must be applied.
+  harness.browser.storage.local.set = originalSet;
+  await harness.context.handleAppleFocus(null);
+  await settle();
+
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+  assert.equal(harness.storageData.lastAppliedAppleFocusId, null);
+  assert.ok(harness.groupState.every((group) => group.collapsed === false));
+});
+
+test("a restarted background still recovers Focus ownership from lastActivation (4bab1746)", async () => {
+  const storage = {
+    automationFallback: { kind: "all" },
+    lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["focus.work"])],
+    activeView: { kind: "lens", lensId: "lens_work" },
+    lastActivation: { trigger: "appleFocus", triggerId: "focus.work", at: 1000 },
+  };
+  // Killed after the activation commit, before the ownership write: Firefox
+  // still holds the collapsed groups.
+  const harness = createHarness({
+    storage,
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: false },
+      { id: 2, windowId: 1, title: "Other", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: false },
+    ],
+  });
+  await settle();
+  assert.equal(harness.storageData.lastAppliedAppleFocusId, undefined);
+
+  await harness.context.handleAppleFocus(null);
+  await settle();
+
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, false);
+});
+
+test("calendar event-gone falls back when the ownership marker write never landed (4bab1746)", async () => {
+  const start = "2026-07-07T13:00:00.000Z";
+  const harness = createHarness({
+    storage: {
+      automationFallback: { kind: "all" },
+      lenses: [lens("lens_cal", "Cal", [{ type: "title", value: "Work" }], [], ["Standup"])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: false },
+    ],
+  });
+  await settle();
+
+  const originalSet = harness.browser.storage.local.set;
+  harness.browser.storage.local.set = async (values) => {
+    if (Object.prototype.hasOwnProperty.call(values, "lastAppliedCalendarTriggerId")) {
+      throw new Error("storage unavailable");
+    }
+    return originalSet(values);
+  };
+
+  await harness.context.handleCalendarEvents({ events: [{ id: "evt", title: "Standup", start }] });
+  await settle();
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_cal" });
+  assert.equal(harness.storageData.lastAppliedCalendarTriggerId, undefined);
+
+  harness.browser.storage.local.set = originalSet;
+  await harness.context.handleCalendarEvents({ events: [] });
+  await settle();
+
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+  assert.equal(harness.storageData.lastAppliedCalendarTriggerId, null);
+  assert.ok(harness.groupState.every((group) => group.collapsed === false));
+});
+
+test("a lost calendar marker is healed by the next matching envelope (4bab1746)", async () => {
+  const start = "2026-07-07T13:00:00.000Z";
+  const harness = createHarness({
+    storage: {
+      lenses: [lens("lens_cal", "Cal", [{ type: "title", value: "Work" }], [], ["Standup"])],
+      activeView: { kind: "lens", lensId: "lens_cal" },
+      lastActivation: { trigger: "calendar", triggerId: `evt|${start}`, at: 1000 },
+    },
+    ...twoGroups(),
+  });
+  await settle();
+
+  await harness.context.handleCalendarEvents({ events: [{ id: "evt", title: "Standup", start }] });
+  await settle();
+
+  assert.equal(harness.storageData.lastAppliedCalendarTriggerId, `evt|${start}`);
+  assert.equal(harness.storageData.lastActivation.at, 1000, "no redundant re-activation");
+});
+
+test("a finished Focus hand-back is not re-applied by a replayed Focus-off (4bab1746)", async () => {
+  const harness = createHarness({
+    storage: {
+      automationFallback: { kind: "all" },
+      lenses: [lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["focus.work"])],
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: true },
+      { id: 2, windowId: 1, title: "Other", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: false },
+    ],
+  });
+  await settle();
+  await harness.context.handleAppleFocus("focus.work");
+  await harness.context.handleAppleFocus(null);
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+  assert.equal(harness.storageData.lastAppliedAppleFocusId, null);
+
+  // The user collapses a group by hand; a reconnect then replays Focus-off.
+  harness.groupState.find((group) => group.title === "Other").collapsed = true;
+  await harness.context.handleAppleFocus(null);
+
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
+});
+
+test("Focus-off recovers ownership when the marker still names the previous Focus (4bab1746)", async () => {
+  // Focus switched from work to personal; the personal marker write was lost.
+  const harness = createHarness({
+    storage: {
+      automationFallback: { kind: "all" },
+      lenses: [
+        lens("lens_work", "Work", [{ type: "title", value: "Work" }], ["focus.work"]),
+        lens("lens_personal", "Personal", [{ type: "title", value: "Personal" }], ["focus.personal"]),
+      ],
+      activeView: { kind: "lens", lensId: "lens_personal" },
+      lastActivation: { trigger: "appleFocus", triggerId: "focus.personal", at: 1000 },
+      lastAppliedAppleFocusId: "focus.work",
+    },
+    ...twoGroups(),
+  });
+  await settle();
+
+  await harness.context.handleAppleFocus(null);
+
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+  assert.equal(harness.storageData.lastAppliedAppleFocusId, null);
+});
+
+test("a calendar event that returns after its hand-back activates its lens again (4bab1746)", async () => {
+  const start = "2026-07-07T13:00:00.000Z";
+  const event = { id: "evt", title: "Standup", start };
+  const harness = createHarness({
+    storage: {
+      automationFallback: { kind: "all" },
+      lenses: [lens("lens_cal", "Cal", [{ type: "title", value: "Work" }], [], ["Standup"])],
+    },
+    ...twoGroups(),
+  });
+  await settle();
+
+  await harness.context.handleCalendarEvents({ events: [event] });
+  await harness.context.handleCalendarEvents({ events: [] });
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+
+  // A feed glitch dropped the event for one refresh; it is back with the same id.
+  await harness.context.handleCalendarEvents({ events: [event] });
+
+  assert.deepEqual(harness.storageData.activeView, { kind: "lens", lensId: "lens_cal" });
+  assert.equal(harness.storageData.lastAppliedCalendarTriggerId, `evt|${start}`);
+});
+
+function syncDeletionHarness() {
+  const localLens = { ...lens("lens_work", "Work", [{ type: "title", value: "Work" }]), updatedAt: 1000 };
+  return createHarness({
+    storage: {
+      syncLenses: true,
+      lenses: [localLens],
+      lensSyncMeta: { lensOrderUpdatedAt: 1000 },
+      activeView: { kind: "lens", lensId: "lens_work" },
+      lastActivation: { trigger: "manual", at: 1000 },
+    },
+    storageSync: {
+      "lens/lens_work": { lens: localLens, schedule: null },
+      lensOrder: { ids: ["lens_work"], updatedAt: 1000 },
+    },
+    groups: [
+      { id: 1, windowId: 1, title: "Work", collapsed: false },
+      { id: 2, windowId: 1, title: "Other", collapsed: true },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, groupId: 1, active: false },
+      { id: 20, windowId: 1, groupId: 2, active: false },
+    ],
+  });
+}
+
+// Drives a remote deletion of the active lens while every tabGroups.query is
+// rejected, so the view commit lands but the expansion that should follow does
+// not. Returns the lensOrder stamp so a caller can re-fire the same pull.
+async function applyInterruptedSyncDeletion(harness) {
+  const originalQuery = harness.browser.tabGroups.query;
+  let rejectQueries = true;
+  harness.browser.tabGroups.query = async (query) => {
+    if (rejectQueries) {
+      throw new Error("tabGroups unavailable");
+    }
+    return originalQuery(query);
+  };
+  const orderUpdatedAt = Date.now() + 600000;
+  await harness.browser.storage.sync.set({ lensOrder: { ids: [], updatedAt: orderUpdatedAt } });
+  await waitFor(() => assert.deepEqual(harness.storageData.lenses, []));
+  await settle();
+
+  // The deletion is committed and the label says All groups, but Firefox still
+  // holds the deleted lens's collapsed group.
+  assert.deepEqual(harness.storageData.activeView, { kind: "all" });
+  assert.ok(isRecordLike(harness.storageData.pendingViewReconcile), "expansion is still owed");
+  assert.equal(harness.groupState.find((group) => group.title === "Other").collapsed, true);
+  return {
+    orderUpdatedAt,
+    allowQueries() {
+      rejectQueries = false;
+    },
+  };
+}
+
+function isRecordLike(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+test("an interrupted Sync-deletion expansion is finished on the next startup (be6edc41)", async () => {
+  const harness = syncDeletionHarness();
+  await settle();
+  await applyInterruptedSyncDeletion(harness);
+
+  // Event page dies before the expansion; state is reused verbatim on wake.
+  const reloaded = createHarness({
+    storage: harness.storageData,
+    storageSync: harness.syncData,
+    groups: harness.groupState,
+    tabs: harness.tabState,
+  });
+  await waitFor(() => assert.ok(reloaded.groupState.every((group) => group.collapsed === false)));
+  assert.equal(reloaded.storageData.pendingViewReconcile, null);
+});
+
+test("a rejected Sync-deletion expansion is retried by the next pull (be6edc41)", async () => {
+  const harness = syncDeletionHarness();
+  await settle();
+  const interrupted = await applyInterruptedSyncDeletion(harness);
+
+  // The next pull merges to "nothing changed" and used to return before any
+  // physical reconciliation; the owed expansion must still be applied.
+  interrupted.allowQueries();
+  await harness.browser.storage.sync.set({ lensOrder: { ids: [], updatedAt: interrupted.orderUpdatedAt } });
+  await waitFor(() => assert.ok(harness.groupState.every((group) => group.collapsed === false)));
+  assert.equal(harness.storageData.pendingViewReconcile, null);
+});
+
+test("a manual switch after an interrupted deletion is not overridden (be6edc41)", async () => {
+  const harness = syncDeletionHarness();
+  await settle();
+  await applyInterruptedSyncDeletion(harness);
+
+  const reloaded = createHarness({
+    storage: {
+      ...harness.storageData,
+      lenses: [lens("lens_new", "New", [{ type: "title", value: "Work" }])],
+      activeView: { kind: "lens", lensId: "lens_new" },
+      lastActivation: { trigger: "manual", at: Date.now() },
+    },
+    groups: harness.groupState,
+    tabs: harness.tabState,
+  });
+  await waitFor(() => assert.equal(reloaded.storageData.pendingViewReconcile, null));
+  assert.deepEqual(reloaded.storageData.activeView, { kind: "lens", lensId: "lens_new" });
+  assert.equal(reloaded.groupState.find((group) => group.title === "Other").collapsed, true);
+});
+
+test("a manual All after an interrupted deletion keeps its manual trigger (be6edc41)", async () => {
+  const harness = syncDeletionHarness();
+  await settle();
+  await applyInterruptedSyncDeletion(harness);
+
+  // The user picked All groups by hand, which expanded everything itself.
+  const reloaded = createHarness({
+    storage: { ...harness.storageData, lastActivation: { trigger: "manual", at: Date.now() } },
+    groups: harness.groupState.map((group) => ({ ...group, collapsed: false })),
+    tabs: harness.tabState,
+  });
+  await waitFor(() => assert.equal(reloaded.storageData.pendingViewReconcile, null));
+  assert.equal(reloaded.storageData.lastActivation.trigger, "manual");
+});
+
+test("an untitled group left by a failed metadata write is completed on wake (9a2a99ac)", async () => {
+  const harness = createHarness({
+    storage: { aiGroupingEnabled: true },
+    tabs: [
+      { id: 10, windowId: 1, url: "https://a.com", title: "Alpha", groupId: -1 },
+      { id: 11, windowId: 1, url: "https://b.com", title: "Beta", groupId: -1 },
+    ],
+  });
+  await settle();
+  harness.browser.tabGroups.update = async () => { throw new Error("group vanished"); };
+
+  const result = await harness.request({
+    type: "ai-group-apply",
+    windowId: 1,
+    groups: [{ topic: "Work", color: "blue", tabs: [{ id: 10 }, { id: 11 }] }],
+  });
+  assert.equal(result.ok, false);
+
+  // Firefox kept the group and its members; the metadata is still owed.
+  const orphan = harness.groupState.find((group) => group.title === "");
+  assert.ok(orphan, "an untitled group was left behind");
+  assert.equal(harness.sessionData.pendingGroupMetadata.length, 1);
+  assert.equal(harness.sessionData.pendingGroupMetadata[0].title, "Work");
+  assert.equal(harness.sessionData.pendingGroupMetadata[0].groupId, orphan.id);
+  assert.deepEqual(harness.sessionData.pendingGroupMetadata[0].tabIds, [10, 11]);
+
+  // Same browser session, new event page: storage.session survives.
+  const reloaded = createHarness({
+    storage: harness.storageData,
+    sessionData: harness.sessionData,
+    groups: harness.groupState,
+    tabs: harness.tabState,
+  });
+  await waitFor(() => assert.equal(
+    reloaded.groupState.find((group) => group.id === orphan.id).title,
+    "Work",
+  ));
+  assert.equal(reloaded.groupState.find((group) => group.id === orphan.id).color, "blue");
+  assert.deepEqual(reloaded.sessionData.pendingGroupMetadata, []);
+  assert.deepEqual(reloaded.groupCreations, [], "no duplicate group was created");
+});
+
+test("a retried createTabGroup completes its own orphan instead of skipping it (9a2a99ac)", async () => {
+  const harness = createHarness({
+    storage: { busToken: BUS_TOKEN },
+    tabs: [
+      { id: 10, windowId: 1, url: "https://example.test/", groupId: -1 },
+      { id: 11, windowId: 1, url: "https://second.test/", groupId: -1 },
+    ],
+  });
+  await settle();
+  const socket = await authenticatedCreateTabGroupSocket(harness);
+  const payload = createTabGroupPayload({
+    match: { urls: ["https://example.test/", "https://second.test/"] },
+  });
+
+  const originalUpdate = harness.browser.tabGroups.update;
+  harness.browser.tabGroups.update = async () => { throw new Error("group vanished"); };
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const failure = lastCreateTabGroupResultPayload(harness);
+  assert.equal(failure.ok, false);
+  assert.equal(failure.error, "group_failed");
+  const orphan = harness.groupState.find((group) => group.title === "");
+  assert.ok(orphan, "an untitled group was left behind");
+  // The peer must be able to identify the orphan it now owns.
+  assert.equal(failure.groupId, orphan.id);
+  assert.equal(failure.windowId, 1);
+
+  // Retrying the same request must finish the orphan, not report its own tabs
+  // as already_grouped_elsewhere and not create a duplicate.
+  harness.browser.tabGroups.update = originalUpdate;
+  await sendCreateTabGroupEnvelope(socket, payload);
+
+  const retry = lastCreateTabGroupResultPayload(harness);
+  assert.equal(retry.ok, true);
+  assert.equal(retry.groupId, orphan.id);
+  assert.deepEqual(retry.grouped.sort(), ["https://example.test/", "https://second.test/"]);
+  assert.deepEqual(retry.skipped, []);
+  assert.equal(harness.groupState.find((group) => group.id === orphan.id).title, "Bus Group");
+  assert.equal(harness.groupState.filter((group) => group.title === "Bus Group").length, 1);
+  assert.equal(harness.groupCreations.length, 1, "no duplicate group was created");
+  assert.deepEqual(harness.sessionData.pendingGroupMetadata, []);
+});
+
+test("a rejected tabs.group leaves no record that could rename another group (9a2a99ac)", async () => {
+  const harness = createHarness({
+    groups: [{ id: 5, windowId: 1, title: "", collapsed: false }],
+    tabs: [
+      { id: 10, windowId: 1, url: "https://a.com", groupId: 5 },
+      { id: 11, windowId: 1, url: "https://b.com", groupId: 5 },
+    ],
+    groupFailTabIds: [10],
+  });
+  await settle();
+
+  const result = await harness.context.applyTabGrouping(
+    [{ topic: "Work", color: "blue", tabs: [{ id: 10 }, { id: 11 }] }],
+    1,
+  );
+  assert.deepEqual(clone(result.failures), ["Work"]);
+  assert.deepEqual(harness.sessionData.pendingGroupMetadata, []);
+
+  await harness.context.reconcilePendingGroupMetadata();
+  assert.equal(harness.groupState.find((group) => group.id === 5).title, "");
+});
+
+test("recovery without a group id only finishes a group holding exactly its tabs (9a2a99ac)", async () => {
+  // The page died after recording the intent but before learning the group id.
+  const harness = createHarness({
+    sessionData: {
+      pendingGroupMetadata: [
+        { token: "pgm_mixed", title: "Work", color: "blue", tabIds: [10] },
+        { token: "pgm_exact", title: "Docs", color: "green", tabIds: [20, 21] },
+      ],
+    },
+    groups: [
+      { id: 5, windowId: 1, title: "", collapsed: false },
+      { id: 6, windowId: 1, title: "", collapsed: false },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, url: "https://a.com", groupId: 5 },
+      { id: 12, windowId: 1, url: "https://c.com", groupId: 5 },
+      { id: 20, windowId: 1, url: "https://d.com", groupId: 6 },
+      { id: 21, windowId: 1, url: "https://e.com", groupId: 6 },
+    ],
+  });
+  await waitFor(() => assert.deepEqual(harness.sessionData.pendingGroupMetadata, []));
+
+  // Group 5 also holds a tab the record never moved, so it is not provably ours.
+  assert.equal(harness.groupState.find((group) => group.id === 5).title, "");
+  assert.equal(harness.groupState.find((group) => group.id === 6).title, "Docs");
+  assert.equal(harness.groupState.find((group) => group.id === 6).color, "green");
+});

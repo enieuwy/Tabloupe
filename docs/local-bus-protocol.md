@@ -107,7 +107,7 @@ Stable `error` codes:
 
 - `invalid_payload`: the frame had a usable `requestId` but failed validation.
 - `no_tabs_matched`: no requested tab could be placed in the target group.
-- `group_failed`: Firefox rejected the tab-group operation (including a failure to enumerate normal windows or existing groups — Tabloupe fails closed rather than widening the search).
+- `group_failed`: Firefox rejected the tab-group operation (including a failure to enumerate normal windows or existing groups — Tabloupe fails closed rather than widening the search). When Firefox created the group but rejected its title/color, `groupId` and `windowId` name the orphaned group so the peer can identify it; Tabloupe does not ungroup its tabs. Tabloupe records the owed metadata for the rest of the browser session and completes that exact group on its next wake or grouping request, so retrying the same `createTabGroup` returns `ok:true` for the same `groupId` rather than reporting its own tabs as `already_grouped_elsewhere`. After a browser restart the record is gone and the untitled group stays as Firefox left it.
 - `busy`: Tabloupe's inbound bus queue was saturated and the request was not run. Safe to retry.
 
 ## `calendarEvents`

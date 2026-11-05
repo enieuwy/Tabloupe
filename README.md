@@ -33,6 +33,10 @@ Then `about:addons` → gear menu → *Install Add-on From File…* and pick the
 
 `./build.sh listed` can succeed while AMO signing is still pending. The accepted submission keeps its version reserved. Install only when the script reports a matching artifact. `deploy.sh` checks the XPI's embedded version against `manifest.json` before taking a Firefox session snapshot or showing install instructions.
 
+`./deploy.sh --dry-run` previews a deploy without consuming a version: it runs the checks, builds the local unsigned package (as `./build.sh firefox` below), and takes the usual session snapshot, but never bumps the version or submits to AMO. A plain `./deploy.sh` runs the signing build, which does both.
+
+Only one build runs at a time. If a build is killed mid-flight (SIGKILL, OOM, power loss), the next one recovers the leftover `.build.lock` itself — no manual `rmdir`. It rolls `manifest.json` back when the version was never submitted, and keeps the bumped version when submission had already started, since AMO never releases a submitted version. Check AMO before rebuilding when it says so. Only two cases need a hand, and the next build prints the `rmdir` that clears each: a recovery that was itself killed, and a lock without an owner record, which only an older `build.sh` leaves.
+
 For development, run it in a throwaway profile instead:
 
 ```sh

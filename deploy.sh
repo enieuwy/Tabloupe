@@ -37,7 +37,8 @@ for arg in "$@"; do
     --help|-h)
       echo "Usage: $0 [--dry-run] [--skip-build]"
       echo ""
-      echo "  --dry-run     Run pre-flight checks and build only (no install/restart)"
+      echo "  --dry-run     Pre-flight checks plus a local unsigned package only."
+      echo "                Never bumps the version, submits to AMO, or installs."
       echo "  --skip-build  Skip build step; use the latest existing XPI"
       exit 0
       ;;
@@ -324,6 +325,7 @@ snapshot_session() {
 # ─── Step 3: Build & sign ──────────────────────────────────────────────────────
 
 XPI_PATH=""
+PACKAGE_PATH=""
 NEW_VERSION=""
 
 build_and_sign() {
@@ -331,6 +333,13 @@ build_and_sign() {
 
   if $SKIP_BUILD; then
     info "  --skip-build: skipping build step"
+  elif $DRY_RUN; then
+    # A dry run has to stay reversible. ./build.sh bumps manifest.json and
+    # submits to AMO, which permanently consumes a version number, so previewing
+    # a deploy builds the local unsigned package instead.
+    info "  --dry-run: packaging locally (no version bump, no AMO submission) …"
+    (cd "$REPO_DIR" && bash ./build.sh firefox)
+    success "  ✓ Unsigned package built"
   else
     info "  Running ./build.sh …"
     (cd "$REPO_DIR" && bash ./build.sh)
@@ -346,6 +355,16 @@ with Path(sys.argv[1]).open() as handle:
     print(json.load(handle)["version"])
 PY
 )"
+
+  if $DRY_RUN && ! $SKIP_BUILD; then
+    PACKAGE_PATH="$REPO_DIR/dist/tabloupe-firefox-$NEW_VERSION.zip"
+    if [[ ! -f "$PACKAGE_PATH" ]]; then
+      die "Local package for version $NEW_VERSION not found at $PACKAGE_PATH"
+    fi
+    info "  Package: $PACKAGE_PATH"
+    info "  Version: $NEW_VERSION"
+    return
+  fi
 
   # Select by the embedded version, not just the newest artifact's mtime.
   XPI_PATH="$(python3 - "$XPI_DIR" "$NEW_VERSION" <<'PY'
@@ -383,12 +402,17 @@ print_summary() {
 
   echo ""
   echo -e "  ${BOLD}Version:${NC}        ${NEW_VERSION}"
-  echo -e "  ${BOLD}XPI:${NC}            ${XPI_PATH}"
+  if [[ -n "$XPI_PATH" ]]; then
+    echo -e "  ${BOLD}XPI:${NC}            ${XPI_PATH}"
+  else
+    echo -e "  ${BOLD}Package:${NC}        ${PACKAGE_PATH}"
+    echo -e "  ${BOLD}Signing:${NC}        skipped — a dry run never submits to AMO"
+  fi
   echo -e "  ${BOLD}Session backup:${NC} ${SNAPSHOT_DIR}"
   echo -e "  ${BOLD}Tabs snapshot:${NC}  ${PRE_WINDOWS} window(s), ${PRE_TABS} tab(s)"
   echo ""
 
-  success "  ✅ Dry run complete — no changes deployed"
+  success "  ✅ Dry run complete — nothing deployed, no version consumed"
 }
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
@@ -398,7 +422,7 @@ main() {
   echo -e "${BLUE}$(date)${NC}"
 
   if $DRY_RUN; then
-    info "Mode: --dry-run (checks + build only, no manual-install prompt)"
+    info "Mode: --dry-run (checks + local unsigned package; no version bump, no AMO, no install)"
   fi
   if $SKIP_BUILD; then
     info "Mode: --skip-build (using latest existing XPI)"

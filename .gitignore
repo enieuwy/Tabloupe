@@ -1,6 +1,10 @@
 .env
 web-ext-artifacts/
 .build.lock/
+# Recovery lock, plus claim staging and release dirs that only a killed build leaves.
+.build.lock.*/
+# Staging files for atomic manifest writes; only a killed build leaves one.
+manifest.json.*.part
 node_modules/
 .web-ext-profile/
 dist/
